@@ -34,7 +34,9 @@ class EnfuseConfig:
     timeout_seconds: float | None = 60 * 60
     jpeg_quality: int = 100
     full_resolution_focus_masks: bool = True
-    focus_blend_levels: int = 5
+    # Focus masks already choose the sharp frame per pixel. Extra pyramid
+    # levels mix coarse content from defocused frames across silhouettes.
+    focus_blend_levels: int = 1
 
     def __post_init__(self):
         if not 1 <= self.focus_blend_levels <= 29:
@@ -170,7 +172,10 @@ class Enfuser:
             from ..utils.image_io import load_rgb
 
             with stage("focus_masks_inclusive", frames=len(paths)):
-                labels = build_focus_labels(len(paths), lambda i: load_rgb(paths[i]), cancel_event=cancel_event)
+                labels = build_focus_labels(
+                    len(paths), lambda i: load_rgb(paths[i]), cancel_event=cancel_event,
+                    protect_chromatic_edges=True,
+                )
                 digits = len(str(len(paths)))
                 for index in range(len(paths)):
                     if cancel_event is not None and cancel_event.is_set():

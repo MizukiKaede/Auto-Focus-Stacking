@@ -55,6 +55,28 @@ def test_focus_masks_reject_defocused_silhouette_fringe():
     assert np.mean(labels[35:145, 145:153] == 0) > .99
 
 
+def test_chromatic_edge_guard_keeps_shifted_blur_outside_subject():
+    rng = np.random.default_rng(8)
+    background = np.clip(35 + rng.normal(0, 15, (220, 320, 1)), 0, 255).astype(np.uint8)
+    background = np.repeat(background, 3, axis=2)
+    near = cv2.GaussianBlur(background, (0, 0), 2.5)
+    near[45:175, 85:215] = 220
+    near[51:169, 91:209] = (180, 30, 30)
+    blurred = np.roll(cv2.GaussianBlur(near, (0, 0), 6), 13, axis=1)
+    alpha = np.zeros((220, 320), np.float32)
+    alpha[45:175, 85:215] = 1
+    alpha = np.roll(cv2.GaussianBlur(alpha, (0, 0), 6), 13, axis=1)
+    far = np.clip(background * (1 - alpha[..., None]) + blurred * alpha[..., None], 0, 255).astype(np.uint8)
+    frames = (near, far)
+    regular = build_focus_labels(2, lambda i: frames[i])
+    guarded = build_focus_labels(2, lambda i: frames[i], protect_chromatic_edges=True)
+    fringe = np.s_[70:150, 216:237]
+    assert np.mean(guarded[fringe] == 0) > .99
+    assert np.mean(regular[fringe] == 0) < .9
+    np.testing.assert_array_equal(guarded[70:150, 110:190], regular[70:150, 110:190])
+    assert np.mean(guarded[70:150, 305:315] == 1) > .99
+
+
 @pytest.mark.parametrize('background,foreground', [(35, 220), (220, 35)])
 def test_default_focus_blend_does_not_add_silhouette_overshoot(background, foreground):
     sharp = np.full((240, 320, 3), background, np.uint8)
@@ -102,7 +124,7 @@ def test_real_enfuse_uses_padded_full_resolution_masks(tmp_path):
     )
     assert result.ok
     assert '--load-masks' in result.command_result.command
-    assert '--levels=5' in result.command_result.command
+    assert '--levels=1' in result.command_result.command
     assert (tmp_path / 'work/hardmask-01.tif').is_file()
     assert (tmp_path / 'work/hardmask-12.tif').is_file()
     actual = np.asarray(Image.open(result.output_path).convert('RGB')).astype(float)
@@ -131,5 +153,5 @@ def test_enfuse_explicit_fusion_settings_bypass_generated_masks(tmp_path, monkey
             Image.new('RGB', (32, 24)).save(command[command.index('-o') + 1])
             return CommandResult(tuple(command), 0)
     result = Enfuser('enfuse', config=config, runner=Runner()).fuse(paths, tmp_path/'result.tif', work_dir=tmp_path/'work')
-    assert '--levels=5' not in result.command_result.command
+    assert '--levels=1' not in result.command_result.command
 
