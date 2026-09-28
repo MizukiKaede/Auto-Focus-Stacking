@@ -1,31 +1,66 @@
 # Focus Stack Assistant
 
-Memory-safe metadata, grouping, and focus-stack workflow helpers built with Python and PySide6.
+Focus Stack Assistant 是一个用于焦点堆栈摄影的桌面工具，帮助整理照片、分析焦点覆盖范围、完成图像对齐，并生成焦点合成结果。
 
-## Requirements
+项目使用 Python 和 PySide6 编写，重点关注大批量照片处理时的内存占用、任务并发和过程恢复能力。
 
-- Python 3.11+
-- OpenCV, NumPy, Pillow, psutil, and PySide6
+## 主要功能
 
-## Setup
+- 扫描和整理照片元数据
+- 自动检测场景并分组
+- 分析焦点区域与覆盖范围
+- 图像对齐、质量评估和焦点融合
+- 支持 Hugin / Enfuse 工作流
+- 本地缓存、任务队列和资源保护
+- 提供较完整的单元测试与并发测试
+
+## 环境要求
+
+- Python 3.11 或更高版本
+- Windows 环境建议使用 PowerShell 7
+
+主要依赖：NumPy、OpenCV、Pillow、psutil、PySide6。
+
+## 安装
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-pip install -e .[dev]
+pip install -e ".[dev]"
 ```
 
-## Run
+## 运行
 
 ```powershell
 python main.py
 ```
 
-## Test
+也可以使用安装后的命令：
+
+```powershell
+focus-stack
+```
+
+## 测试
 
 ```powershell
 pytest
 ```
 
-Local photo sets, generated output, diagnostics, caches, and runtime dependencies are intentionally excluded from version control.
+## 项目结构
+
+```text
+focus_stack_app/
+├── core/       核心分析、分组、质量和选帧逻辑
+├── files/      文件归档与命名冲突处理
+├── fusion/     图像融合与焦点蒙版
+├── hugin/      Hugin / Enfuse 集成
+├── pipeline/   任务队列、工作线程和流程控制
+├── storage/    数据库、清单和缓存
+├── ui/         PySide6 图形界面
+└── utils/      图像、EXIF、日志和资源工具
+tests/          自动化测试
+```
+
+本地照片、生成结果、诊断日志、缓存、虚拟环境和运行时依赖不会提交到 Git。
