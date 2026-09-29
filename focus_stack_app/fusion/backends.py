@@ -80,9 +80,11 @@ class HuginEnfuseBackend(FusionBackend):
     def _threshold(self, name: str, default: float) -> float:
         return float(_value(self.runtime_config, name, default))
 
-    def _validate_alignment(self, alignment: AlignmentResult, anchor: Path) -> tuple[float, list[str]]:
+    def _validate_alignment(
+        self, alignment: AlignmentResult, anchor: Path, *, aligned_cache=None,
+    ) -> tuple[float, list[str]]:
         from ..core.group_detector import subject_feature, subject_changed
-        from .alignment_quality import colour_subject_mask, colour_subject_mismatch
+        from .alignment_quality import colour_subject_mask, colour_subject_mismatch, defocus_geometry_consistent
 
         input_paths = tuple(getattr(alignment, "input_paths", ()))
         if input_paths and len(alignment.aligned_paths) != len(input_paths):
@@ -90,6 +92,8 @@ class HuginEnfuseBackend(FusionBackend):
         dimensions = []
         subject_anchor = None
         colour_anchor = None
+        anchor_preview = None
+        defocus_confirmations = 0
         have_anchor = False
         for path in alignment.aligned_paths:
             minimum_bytes = int(self._threshold("min_alignment_tiff_bytes", 128)) if isinstance(self.aligner, AlignImageStack) else 1
@@ -100,16 +104,25 @@ class HuginEnfuseBackend(FusionBackend):
                     dimensions.append(_image_info(path)[:2])
                 except Exception as exc:
                     raise AlignmentError(f"aligned TIFF is unreadable: {path}: {exc}", alignment) from exc
-                preview = load_rgb(path, 1280)
+                if aligned_cache is None:
+                    preview = load_rgb(path, 1280)
+                    small_preview = load_rgb(path, 640)
+                else:
+                    previews = aligned_cache.validation_previews(path)
+                    preview, small_preview = previews[1280], previews[640]
                 colour = colour_subject_mask(preview)
                 if have_anchor:
                     mismatch = colour_subject_mismatch(colour_anchor, colour)
+                    if mismatch and defocus_geometry_consistent(anchor_preview, preview, colour_anchor, colour):
+                        defocus_confirmations += 1
+                        mismatch = None
                     if mismatch:
                         raise AlignmentError(f"主体对齐检查未通过，可能存在转面或重影：{path}: {mismatch}", alignment)
                 else:
                     colour_anchor = colour
+                    anchor_preview = preview
                     have_anchor = True
-                subject = subject_feature(load_rgb(path, 640))
+                subject = subject_feature(small_preview)
                 if subject_anchor is None:
                     subject_anchor = subject
                 elif subject_changed(subject_anchor, subject):
@@ -129,6 +142,8 @@ class HuginEnfuseBackend(FusionBackend):
         if crop_ratio < fail or crop_ratio > self._threshold("crop_ratio_max", 1.75):
             raise AlignmentError(f"alignment crop ratio {crop_ratio:.3f} is outside safe bounds", alignment)
         diagnostics = [f"CROP_RATIO_WARNING:{crop_ratio:.3f}"] if crop_ratio < warn else []
+        if defocus_confirmations:
+            diagnostics.append(f"DEFOCUS_GEOMETRY_CONFIRMED:{defocus_confirmations}")
         return crop_ratio, diagnostics
 
     @staticmethod
@@ -141,6 +156,26 @@ class HuginEnfuseBackend(FusionBackend):
         result = getattr(exc, "result", None)
         command = getattr(result, "command_result", None)
         return not bool(getattr(command, "cancelled", False) or getattr(command, "timed_out", False))
+
+    def _release_superseded_tiffs(self, alignment, work_dir):
+        """Keep the latest retry's TIFFs, with prior failures recorded in logs."""
+        if alignment is None or not isinstance(self.aligner, AlignImageStack):
+            return
+        root = Path(work_dir).resolve()
+        attempt = Path(alignment.work_dir).resolve()
+        if attempt.parent != root or (root / ".keep").exists() or (attempt / ".keep").exists():
+            return
+        for path in alignment.aligned_paths:
+            path = Path(path)
+            # Only remove TIFFs returned by our previous attempt, directly
+            # inside this group's private attempt directory. Never follow
+            # symlinks to an original or touch unrelated diagnostic files.
+            if path.resolve().parent != attempt or path.suffix.lower() not in {".tif", ".tiff"}:
+                continue
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                self.logger.warning("Unable to release superseded alignment TIFF %s", path)
 
     def fuse(self, group, analysis, output_path, work_dir, output_config, cancel_event) -> FusionResult:
         ordered = [Path(path) for path in _value(analysis, "alignment_order", ())]
@@ -155,11 +190,42 @@ class HuginEnfuseBackend(FusionBackend):
             (("-d", "--corr=0.8"), False),
             (("-d", "--corr=0.8"), True),
         )
+        # A sparse registration tour can jump between focus planes. Above
+        # 20 selected frames, prefer capture order on the first attempt.
+        # Smaller stacks retry capture order before flexible lens parameters.
+        # Never infer chronology from
+        # filenames (camera numbering can wrap), or add/drop selected frames.
+        selected_keys = {path.resolve() for path in paths}
+        capture_paths = [Path(path) for path in _value(analysis, "capture_order", ())
+                         if Path(path).resolve() in selected_keys]
+        capture_order_complete = (len(capture_paths) == len(paths)
+                                  and {path.resolve() for path in capture_paths} == selected_keys)
+        prefer_capture_order = len(paths) > 20 and capture_order_complete
+        if prefer_capture_order:
+            paths = capture_paths
+        use_capture_retry = capture_order_complete and capture_paths != paths
+        if use_capture_retry:
+            levels = (((), False), ((), False), (("--corr=0.8",), False),
+                      (("-d", "--corr=0.8"), False))
+        from .aligned_cache import AlignedTIFFImageCache, DEFAULT_ALIGNED_TIFF_CACHE_BYTES
+
+        aligned_cache = AlignedTIFFImageCache(
+            max_bytes=int(_value(
+                self.runtime_config, "aligned_tiff_cache_bytes",
+                DEFAULT_ALIGNED_TIFF_CACHE_BYTES,
+            )),
+        )
         diagnostics: list[str] = []
+        if prefer_capture_order:
+            diagnostics.append("ALIGNMENT_CAPTURE_ORDER_PRIMARY")
         alignment = None
         crop_ratio = None
         level = 0
+        previous_attempt = None
         for level, (extra, centre) in enumerate(levels, 1):
+            if level == 2 and use_capture_retry:
+                paths = capture_paths
+                diagnostics.append("ALIGNMENT_CAPTURE_ORDER_RETRY")
             attempt_dir = Path(work_dir) / f"alignment_level_{level}"
             self.logger.info("Hugin alignment attempt level=%s input_order=%s work_dir=%s", level, paths, attempt_dir)
             try:
@@ -178,19 +244,37 @@ class HuginEnfuseBackend(FusionBackend):
                     alignment = self.aligner.align(paths, work_dir=attempt_dir, cancel_event=cancel_event)
                     if len(tuple(alignment.aligned_paths)) != len(paths):
                         raise AlignmentError("aligned TIFF count does not match input count", alignment)
-                crop_ratio, warnings = self._validate_alignment(alignment, anchor)
+                # A complete replacement now exists. Retain it if validation
+                # fails, but do not accumulate all earlier TIFF sets on HDD.
+                self._release_superseded_tiffs(previous_attempt, work_dir)
+                previous_attempt = alignment
+                crop_ratio, warnings = self._validate_alignment(
+                    alignment, anchor, aligned_cache=aligned_cache,
+                )
                 diagnostics.extend(warnings)
                 self.logger.info("Hugin alignment validated level=%s aligned_tiff_count=%s crop_ratio=%.4f", level, len(alignment.aligned_paths), crop_ratio)
                 break
             except Exception as exc:
+                aligned_cache.clear()
                 diagnostics.append(f"ALIGNMENT_LEVEL_{level}_FAILED:{exc}")
                 if level == len(levels) or not self._retryable(exc, cancel_event):
                     raise
         assert alignment is not None
-        fused = self.enfuser.fuse(
-            alignment.aligned_paths, output_path, work_dir=Path(work_dir) / "enfuse",
-            cancel_event=cancel_event, output_config=output_config,
-        )
+        try:
+            fuse_kwargs = {
+                "work_dir": Path(work_dir) / "enfuse",
+                "cancel_event": cancel_event,
+                "output_config": output_config,
+            }
+            if isinstance(self.enfuser, Enfuser):
+                fuse_kwargs["image_loader"] = (
+                    lambda index: aligned_cache.load(alignment.aligned_paths[index])
+                )
+            fused = self.enfuser.fuse(
+                alignment.aligned_paths, output_path, **fuse_kwargs,
+            )
+        finally:
+            aligned_cache.clear()
         final = Path(fused.output_path)
         minimum_output_bytes = int(self._threshold("min_fusion_output_bytes", 128)) if isinstance(self.enfuser, Enfuser) else 1
         if not final.is_file() or final.stat().st_size < minimum_output_bytes:

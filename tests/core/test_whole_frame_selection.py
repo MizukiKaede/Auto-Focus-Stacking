@@ -266,3 +266,46 @@ def test_selection_plan_cache_rerun_uses_zero_image_decodes_and_file_change_inva
     assert changed_calls
     database.close()
 
+
+def test_cached_selection_refreshes_only_outdated_order(tmp_path):
+    from focus_stack_app.core.plan_cache import SELECTION_PLAN_VERSION
+
+    pixels = _selection_fixture()
+    paths = [tmp_path / f"{name}.jpg" for name in pixels]
+    for path, image in zip(paths, pixels.values()):
+        Image.fromarray(image).save(path, quality=100, subsampling=0)
+    group = SceneGroup(1, [
+        ImageRecord.from_path(path, sequence_index=index)
+        for index, path in enumerate(paths)
+    ])
+    database = Database(tmp_path / "plans.sqlite")
+    first = GroupAnalyzer(plan_cache=database).analyze_group(group)
+    row = database._connection.execute(
+        "SELECT cache_key, payload_json FROM cached_plans WHERE kind = 'selection'"
+    ).fetchone()
+    import json
+    payload = json.loads(row["payload_json"])
+    payload.pop("ordering_version")
+    database.upsert_cached_plan("selection", row["cache_key"], SELECTION_PLAN_VERSION, payload)
+
+    order_loads = []
+
+    def order_only_loader(item, max_long_edge=None):
+        assert max_long_edge == 512
+        order_loads.append(item.path)
+        return load_rgb(item.path, max_long_edge)
+
+    refreshed = GroupAnalyzer(plan_cache=database, loader=order_only_loader).analyze_group(group)
+    assert refreshed["selection_plan_cache_hit"] is True
+    assert refreshed["selected_indices"] == first["selected_indices"]
+    assert len(order_loads) == len(first["selected_indices"])
+    assert database.get_cached_plan(
+        "selection", row["cache_key"], algorithm_version=SELECTION_PLAN_VERSION,
+    )["ordering_version"] == "local-hubs-v2"
+    again = GroupAnalyzer(
+        plan_cache=database,
+        loader=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("decoded a current plan")),
+    ).analyze_group(group)
+    assert again["selection_plan_cache_hit"] is True
+    database.close()
+

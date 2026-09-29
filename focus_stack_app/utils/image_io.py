@@ -237,6 +237,34 @@ def load_rgb(path: str | Path, long_edge: int | None = None) -> Any:
         return np.asarray(image)
 
 
+def load_rgb_with_previews(
+    path: str | Path,
+    long_edges: tuple[int, ...] = (1280, 640),
+) -> tuple[Any, dict[int, Any]]:
+    """Decode RGB once and make each preview independently from the source.
+
+    ``thumbnail`` is applied to a fresh copy for every requested edge, keeping
+    the same Pillow conversion and resize behavior as separate ``load_rgb``
+    calls while avoiding repeated TIFF/JPEG decoding.
+    """
+    try:
+        from PIL import Image  # type: ignore[import-not-found]
+        import numpy as np  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise ImageIOError("RGB preview decoding requires Pillow + NumPy") from exc
+
+    with Image.open(path) as image:
+        source = image.convert("RGB")
+        full_resolution = np.asarray(source)
+        previews: dict[int, Any] = {}
+        for edge in dict.fromkeys(int(value) for value in long_edges):
+            preview = source.copy()
+            if edge:
+                preview.thumbnail((edge, edge))
+            previews[edge] = np.asarray(preview)
+        return full_resolution, previews
+
+
 # Compatibility aliases for worker code and small scripts.
 get_image_size = read_image_size
 get_jpeg_size = read_jpeg_size
@@ -255,5 +283,6 @@ __all__ = [
     "load_preview",
     "load_analysis_image",
     "load_rgb",
+    "load_rgb_with_previews",
 ]
 

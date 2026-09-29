@@ -1,5 +1,5 @@
-Warning: truncated output (original token count: 21576)
-Total output lines: 1872
+Warning: truncated output (original token count: 21908)
+Total output lines: 1885
 
 """Production group-level analysis orchestration.
 
@@ -86,7 +86,7 @@ class GroupAnalyzerConfig:
     focus_threshold: float = 0.95
     coverage_mode: str = "balanced"
     cache_focus_maps: bool = True
-    selection_frame_cache_bytes: int = 128 * 1024**2
+    selection_frame_cache_bytes: int = 400 * 1024**2
     # Standalone/library callers retain serial behavior unless they opt in.
     # The desktop AppConfig uses RuntimeConfig's automatic value instead.
     focus_analysis_workers: int = 1
@@ -614,7 +614,682 @@ class GroupAnalyzer:
             raise ValueError("focus_analysis_workers must be between 1 and 8")
         if focus_analysis_workers_requested is not None and not 0 <= int(focus_analysis_workers_requested) <= 8:
             raise ValueError("focus_analysis_workers_requested must be between 0 and 8")
-        self.focus_analysis_workers = None if focus_analysis_workers…9576 tokens truncated…e = self._minimum_stack_group_size()
+        self.focus_analysis_workers = None if focus_analysis_workers is None else int(focus_analysis_workers)
+        self.focus_analysis_workers_requested = (
+            None
+            if focus_analysis_workers_requested is None
+            else int(focus_analysis_workers_requested)
+        )
+        self.registration_config = registration_config if registration_config is not None else self.config
+        self.focus_map_config = focus_map_config if focus_map_config is not None else self.config
+        self.quality_config = quality_config if quality_config is not None else self.config
+        self.cluster_config = cluster_config if cluster_config is not None else self.config
+        self.coverage_config = coverage_config if coverage_config is not None else self.config
+
+    def _load_analysis(self, item: Any) -> Any:
+        source_path = _path_for_item(item)
+        edge = int(
+            _setting(self.config, "focus_analysis_long_edge", 1600, "analysis_long_edge")
+        )
+        if self.loader is not None:
+            try:
+                image = self.loader(item, max_long_edge=edge)
+            except TypeError:
+                image = self.loader(item)
+            from .registration import resize_for_analysis
+            return resize_for_analysis(image, edge)
+        if source_path is not None:
+            return load_image(source_path, max_long_edge=edge)
+        from .registration import resize_for_analysis
+        return resize_for_analysis(item, edge)
+
+    # Public stage boundaries make the unified analysis pipeline independently
+    # testable without reintroducing mode-specific analyzers.
+    def analyze_pairwise_registration(self, previews: Sequence[Any]) -> list[Any]:
+        from .alignment_order import analyze_pairwise_registration
+        return analyze_pairwise_registration(previews, config=self._registration_config())
+
+    def choose_preview_reference(self, previews: Sequence[Any]) -> tuple[int, dict[str, Any]]:
+        from .alignment_order import choose_preview_reference
+        edges = self.analyze_pairwise_registration(previews)
+        return choose_preview_reference(len(previews), edges)
+
+    def align_preview(self, reference: Any, image: Any) -> RegistrationResult:
+        return register_images(reference, image, self._registration_config())
+
+    def build_focus_maps(self, images: Sequence[Any]) -> list[Any]:
+        return [compute_focus_map(image, self._focus_config()) for image in images]
+
+    def score_frames(self, images: Sequence[Any], focus_maps: Sequence[Any],
+                     registrations: Sequence[RegistrationResult]) -> list[ImageQuality]:
+        return [
+            score_image(image, focus_map, registration, self._quality_config())
+            for image, focus_map, registration in zip(images, focus_maps, registrations)
+        ]
+
+    def remove_duplicate_focus(self, focus_maps: Sequence[Any], quality_scores: Sequence[float]) -> Any:
+        return deduplicate_focus_maps(focus_maps, quality_scores, self._cluster_config())
+
+    def select_frames(self, focus_maps: Sequence[Any], quality_scores: Sequence[float],
+                      *, candidate_indices: Sequence[int] | None = None) -> Any:
+        return select_focus_images(
+            focus_maps, quality_scores, self._coverage_config(), candidate_indices=candidate_indices,
+        )
+
+    @timed("ordering_registration")
+    def build_alignment_order(self, selected_previews: Sequence[Any],
+                              *, capture_order: Sequence[int] | None = None) -> dict[str, Any]:
+        from .alignment_order import build_alignment_order
+        return build_alignment_order(
+            selected_previews, config=self._registration_config(), capture_order=capture_order,
+        )
+
+    @staticmethod
+    def evaluate_analysis(result: Mapping[str, Any]) -> str:
+        if bool(result.get("cancelled")):
+            return "CANCELLED"
+        return "READY_FOR_MERGE" if len(result.get("selected_indices", ())) > 1 else "NO_MERGE"
+
+    def _focus_config(self) -> Any:
+        if self.focus_map_config is not self.config:
+            return self.focus_map_config
+        return FocusMapConfig(
+            analysis_long_edge=int(_setting(self.config, "focus_analysis_long_edge", 1600, "analysis_long_edge")),
+            output_long_edge=int(_setting(self.config, "focus_cache_long_edge", 512, "output_long_edge")),
+            output_dtype=str(_setting(self.config, "focus_map_dtype", "float16", "output_dtype")),
+        )
+
+    def _registration_config(self) -> Any:
+        if self.registration_config is not self.config:
+            return self.registration_config
+        return RegistrationConfig(
+            analysis_long_edge=int(_setting(self.config, "focus_analysis_long_edge", 1600, "analysis_long_edge")),
+        )
+
+    def _quality_config(self) -> Any:
+        if self.quality_config is not self.config:
+            return self.quality_config
+        return QualityConfig(
+            analysis_long_edge=int(_setting(self.config, "focus_analysis_long_edge", 1600, "analysis_long_edge")),
+        )
+
+    def _cluster_config(self) -> Any:
+        if self.cluster_config is not self.config:
+            return self.cluster_config
+        return FocusClusterConfig(
+            similarity_threshold=float(_setting(self.config, "duplicate_focus_threshold", 0.995)),
+        )
+
+    def _coverage_config(self) -> Any:
+        if self.coverage_config is not self.config:
+            return self.coverage_config
+        mode = str(_setting(self.config, "coverage_mode", "balanced", "mode"))
+        target = _setting(self.config, "coverage_target", None)
+        values: dict[str, Any] = {
+            "mode": mode,
+            "min_coverage_gain": float(_setting(self.config, "min_coverage_gain", 0.002)),
+            "focus_threshold": float(_setting(self.config, "focus_threshold", 0.95)),
+        }
+        # Leaving the target unset preserves the sparse/balanced/extreme
+        # preset selected by the caller/UI.
+        if target is not None:
+            values["coverage_target"] = float(target)
+        return CoverageConfig(**values)
+
+    def _minimum_stack_images(self) -> int:
+        """Return the smallest selected set allowed for a confirmed scene."""
+
+        value = _setting(
+            self.config,
+            "minimum_stack_images",
+            1,
+            "minimum_merge_images",
+        )
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return 1
+
+    def _minimum_stack_group_size(self) -> int:
+        """Return the smallest scene cardinality eligible for fusion."""
+
+        value = _setting(
+            self.config,
+            "minimum_stack_group_size",
+            3,
+            "minimum_merge_group_size",
+        )
+        try:
+            return max(2, int(value))
+        except (TypeError, ValueError):
+            return 3
+
+    def _minimum_stack_stability(self) -> float:
+        """Return the adjacent-frame similarity required before fusion."""
+
+        value = _setting(
+            self.config,
+            "minimum_stack_stability",
+            0.0,
+            "stack_stability_threshold",
+        )
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _requested_focus_analysis_workers(self) -> int:
+        if self.focus_analysis_workers_requested is not None:
+            return int(self.focus_analysis_workers_requested)
+        runtime = (
+            self.config.get("runtime")
+            if isinstance(self.config, Mapping)
+            else getattr(self.config, "runtime", None)
+        )
+        for source in (runtime, self.config):
+            if source is None:
+                continue
+            value = (
+                source.get("focus_analysis_workers")
+                if isinstance(source, Mapping)
+                else getattr(source, "focus_analysis_workers", None)
+            )
+            if value is not None:
+                return int(value)
+        return 1
+
+    def _effective_focus_analysis_workers(self, image_count: int) -> tuple[int, int]:
+        requested = self._requested_focus_analysis_workers()
+        if self.focus_analysis_workers is not None:
+            return requested, max(1, min(int(image_count), int(self.focus_analysis_workers)))
+        runtime = (
+            self.config.get("runtime")
+            if isinstance(self.config, Mapping)
+            else getattr(self.config, "runtime", None)
+        )
+        budget = resolve_focus_analysis_budget(
+            requested,
+            image_count=image_count,
+            merge_workers=int(
+                getattr(runtime, "max_hugin_workers", 1)
+                if runtime is not None and not isinstance(runtime, Mapping)
+                else (runtime or {}).get("max_hugin_workers", 1)
+            ),
+            parallel_pipeline=bool(
+                getattr(runtime, "parallel_pipeline", True)
+                if runtime is not None and not isinstance(runtime, Mapping)
+                else (runtime or {}).get("parallel_pipeline", True)
+            ),
+            minimum_available_bytes=int(
+                getattr(runtime, "min_available_memory_bytes", 2 * 1024**3)
+                if runtime is not None and not isinstance(runtime, Mapping)
+                else (runtime or {}).get("min_available_memory_bytes", 2 * 1024**3)
+            ),
+            minimum_available_fraction=float(
+                getattr(runtime, "min_available_memory_fraction", 0.10)
+                if runtime is not None and not isinstance(runtime, Mapping)
+                else (runtime or {}).get("min_available_memory_fraction", 0.10)
+            ),
+        )
+        return requested, budget.workers
+
+    @staticmethod
+    def _group_minimum_scene_similarity(group: Any) -> float | None:
+        """Return the weakest consecutive scene comparison, if available."""
+
+        values: list[float] = []
+        for comparison in list(_group_value(group, "comparisons", default=()) or ()):
+            value = _item_value(
+                comparison,
+                "low_frequency_similarity",
+                "blur_similarity",
+                default=None,
+            )
+            try:
+                if value is not None:
+                    values.append(float(value))
+            except (TypeError, ValueError):
+                continue
+        return min(values) if values else None
+
+    def _persist_status(self, group: Any, status: str, **values: Any) -> None:
+        repository = self.database
+        gid = _group_id(group)
+        if repository is None or gid is None:
+            return
+        setter = getattr(repository, "set_group_status", None)
+        if callable(setter):
+            try:
+                setter(int(gid), status, **values)
+                return
+            except Exception:
+                try:
+                    setter(gid, status)
+                    return
+                except Exception:
+                    self.logger.debug("Unable to persist group state %s", gid, exc_info=True)
+        updater = getattr(repository, "update_group", None)
+        if callable(updater):
+            try:
+                if isinstance(group, Mapping):
+                    group["status"] = status
+                    group.update(values)
+                else:
+                    for name, value in values.items():
+                        if hasattr(group, name):
+                            setattr(group, name, value)
+                    if hasattr(group, "status"):
+                        setattr(group, "status", status)
+                updater(group)
+            except Exception:
+                self.logger.debug("Unable to persist group state", exc_info=True)
+
+    def _persist_image(self, group: Any, item: Any, result: Mapping[str, Any]) -> None:
+        repository = self.database
+        image_id = _item_value(item, "id", default=None)
+        gid = _group_id(group)
+        if repository is None or image_id is None:
+            return
+        selected = bool(result.get("selected", False))
+        status = "SELECTED" if selected else "REJECTED"
+        set_group = getattr(repository, "set_image_group", None)
+        if callable(set_group) and gid is not None:
+            try:
+                set_group(int(image_id), int(gid), status=status)
+            except Exception:
+                try:
+                    set_group(image_id, gid, status=status)
+                except Exception:
+                    self.logger.debug("Unable to persist image group", exc_info=True)
+        try:
+            from ..storage.models import AnalysisRecord
+            record = AnalysisRecord(
+                image_id=int(image_id),
+                scene_hash=result.get("scene_hash"),
+                scene_score=result.get("scene_score"),
+                sharpness_score=result.get("sharpness_score"),
+                focus_map_path=result.get("focus_map_path"),
+                transform=result.get("transform"),
+                selected=selected,
+                selection_reason=result.get("selection_reason"),
+                coverage_gain=result.get("coverage_gain"),
+                quality_score=result.get("quality_score"),
+            )
+        except (TypeError, ValueError):
+            record = dict(result)
+            record["image_id"] = image_id
+        saver = getattr(repository, "upsert_analysis", getattr(repository, "save_analysis", None))
+        if callable(saver):
+            try:
+                saver(record)
+            except Exception:
+                if not isinstance(record, dict):
+                    try:
+                        saver(record.to_mapping())
+                    except Exception:
+                        self.logger.debug("Unable to persist analysis record", exc_info=True)
+                else:
+                    self.logger.debug("Unable to persist analysis record", exc_info=True)
+
+    def _emit_progress(self, callback: Callable[..., Any] | None, group: Any,
+                       path: Path | None, index: int, total: int) -> None:
+        if callback is None:
+            return
+        gid = _group_id(group)
+        try:
+            # PipelineCoordinator expects its normal immutable event object;
+            # importing lazily keeps core imports headless and lightweight.
+            from ..pipeline.events import PipelineEvent, PipelineStage
+            callback(PipelineEvent(
+                stage=PipelineStage.ANALYSIS,
+                current_file=str(path or ""), current_group=gid,
+                completed=index + 1, total=total,
+                groups_found=1, message=f"焦点分析 {index + 1}/{total}",
+                analysis_completed=index + 1, analysis_total=total,
+            ))
+        except ImportError:
+            try:
+                callback({
+                    "stage": "analysis", "current_file": str(path or ""),
+                    "current_group": gid, "completed": index + 1,
+                    "total": total, "analysis_completed": index + 1,
+                    "analysis_total": total,
+                    "message": f"焦点分析 {index + 1}/{total}",
+                })
+            except Exception:
+                self.logger.debug("Progress callback failed", exc_info=True)
+        except Exception:
+            self.logger.debug("Progress callback failed", exc_info=True)
+
+    def _analyze_established_scene_selection(
+        self, group: Any, items: list[Any], cancel_event: threading.Event,
+        progress_callback: Callable[..., Any] | None,
+    ) -> dict[str, Any]:
+        """Run the calibrated whole-frame selection under the current API."""
+        import cv2
+    …1908 tokens truncated…n cache write failed group_id=%s", gid, exc_info=True,
+                )
+        assert plan is not None and order_result is not None
+        selected_indices = list(plan["selected_indices"])
+        selected_set = set(selected_indices)
+        selected_paths = [str(paths[index]) for index in selected_indices]
+
+        # The established ECC matrices use inverse-warp convention. Publish
+        # source -> reference matrices for the generic experimental backend.
+        transforms: list[Any] = []
+        for matrix in plan["matrices"]:
+            affine = cv2.invertAffineTransform(np.asarray(matrix, np.float32))
+            homogeneous = np.eye(3, dtype=np.float32)
+            homogeneous[:2] = affine
+            transforms.append(homogeneous.tolist())
+
+        alignment_order_indices = list(order_result["alignment_order"])
+        alignment_order = [str(paths[index]) for index in alignment_order_indices]
+
+        reasons: dict[int, str] = {}
+        gains: dict[int, float] = {}
+        per_image: list[dict[str, Any]] = []
+        for index, item in enumerate(items):
+            if index in plan["errors"]:
+                reason = "whole-frame alignment failed: " + plan["errors"][index]
+            elif index == plan["reference_index"]:
+                reason = "highest whole-frame focus score; preview reference"
+            elif index in selected_set:
+                reason = f"adds whole-frame sharp coverage {plan['gains'].get(index, 0.0):.2%}"
+            else:
+                reason = "sharp regions are already covered by selected frames"
+            reasons[index] = reason
+            gains[index] = float(plan["gains"].get(index, 0.0))
+            row = {
+                "index": index,
+                "image": item,
+                "path": str(paths[index]),
+                "selected": index in selected_set,
+                "selection_reason": reason,
+                "reason": reason,
+                "quality_score": float(plan["qualities"][index]),
+                "quality": float(plan["qualities"][index]),
+                "sharpness_score": float(plan["qualities"][index]),
+                "coverage_gain": gains[index],
+                "gain": gains[index],
+                "focus_map_path": None,
+                "transform": transforms[index],
+                "error": plan["errors"].get(index),
+            }
+            per_image.append(row)
+            self._persist_image(group, item, row)
+
+        first_item = items[0]
+        first_original = _item_value(first_item, "original_path", default=paths[0])
+        cancelled = cancel_event.is_set()
+        if len(items) <= 1:
+            merge_status = "NO_MERGE_SINGLE"
+        elif len(selected_indices) <= 1:
+            merge_status = "NO_MERGE_REPEATED"
+        elif len(items) - len(plan["errors"]) < self._minimum_stack_group_size():
+            merge_status = "NO_MERGE_TOO_SMALL"
+        else:
+            merge_status = "READY_FOR_MERGE"
+        confidence = min((plan["correlations"][index] for index in selected_indices), default=0.0)
+        preview_reference = str(paths[plan["reference_index"]])
+        result = {
+            "group_id": gid,
+            "all_images": list(items), "items": list(items), "image_records": list(items),
+            "selected_indices": selected_indices, "selected_paths": selected_paths,
+            "selected_images": selected_paths,
+            "first_original_image": first_item, "first_original_path": str(first_original),
+            "selected_count": len(selected_indices), "image_count": len(items),
+            "coverage": float(plan["coverage"]), "confidence": float(confidence),
+            "needs_merge": not cancelled and merge_status == "READY_FOR_MERGE",
+            "status": "CANCELLED" if cancelled else merge_status,
+            "merge_status": merge_status, "cancelled": cancelled,
+            "quality_scores": list(plan["qualities"]), "qualities": list(plan["qualities"]),
+            "coverage_gains": gains, "gains": gains,
+            "selection_reasons": reasons, "reasons": reasons,
+            "per_image": per_image, "analysis_records": per_image,
+            "errors": dict(plan["errors"]), "focus_map_paths": [None] * len(items),
+            "capture_order": capture_order,
+            "preview_reference": preview_reference,
+            "preview_reference_index": int(plan["reference_index"]),
+            "pairwise_analysis_summary": {"strategy": "established_whole_frame_ecc"},
+            "alignment_order": alignment_order,
+            "alignment_order_indices": alignment_order_indices,
+            "alignment_order_confidence": order_result["alignment_order_confidence"],
+            "alignment_order_diagnostics": order_result["alignment_order_diagnostics"],
+            "alignment_order_fallback_used": order_result["alignment_order_fallback_used"],
+            "preview_transforms": transforms,
+            "analysis_shapes": [list(plan["preview_shape"])] * len(items),
+            "reference_analysis_shape": list(plan["preview_shape"]),
+            "selection_plan_cache_hit": cache_hit,
+            "selection_decode_count": 0 if cache_hit else int(plan.get("decode_count", 0)),
+            "selection_frame_cache_peak_bytes": (
+                0 if cache_hit else int(plan.get("frame_cache_peak_bytes", 0))
+            ),
+            "analysis_workers_requested": int(
+                plan.get("analysis_workers_requested", requested_workers)
+            ),
+            "analysis_workers_effective": int(
+                plan.get("analysis_workers_effective", 0 if cache_hit else effective_workers)
+            ),
+            "opencv_threads": int(plan.get("opencv_threads", cv2.getNumThreads())),
+            "quality_scan_seconds": float(plan.get("quality_scan_seconds", 0.0)),
+            "registration_seconds": float(plan.get("registration_seconds", 0.0)),
+        }
+        self._persist_status(
+            group, "CANCELLED" if cancelled else ("SELECTED" if result["needs_merge"] else "CLASSIFIED"),
+            confidence=result["confidence"], coverage=result["coverage"],
+            selected_count=len(selected_indices), image_count=len(items),
+            preview_reference=preview_reference, alignment_order=alignment_order,
+            alignment_order_confidence=result["alignment_order_confidence"],
+            alignment_order_fallback_used=result["alignment_order_fallback_used"],
+            pairwise_analysis_summary=result["pairwise_analysis_summary"],
+            start_index=_group_value(group, "start_index", default=0),
+            end_index=_group_value(group, "end_index", default=max(0, len(items) - 1)),
+        )
+        return result
+
+    @staticmethod
+    def _restore_selection_plan(
+        payload: Any, image_count: int,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Validate and normalise a path-free JSON selection cache record."""
+
+        if not isinstance(payload, Mapping):
+            return None
+        raw_plan = payload.get("plan")
+        raw_order = payload.get("order")
+        if not isinstance(raw_plan, Mapping) or not isinstance(raw_order, Mapping):
+            return None
+        try:
+            selected = [int(value) for value in raw_plan["selected_indices"]]
+            reference = int(raw_plan["reference_index"])
+            matrices = [
+                [[float(value) for value in row] for row in matrix]
+                for matrix in raw_plan["matrices"]
+            ]
+            correlations = [float(value) for value in raw_plan["correlations"]]
+            qualities = [float(value) for value in raw_plan["qualities"]]
+            preview_shape = [int(value) for value in raw_plan["preview_shape"]]
+            errors = {int(key): str(value) for key, value in dict(raw_plan["errors"]).items()}
+            gains = {int(key): float(value) for key, value in dict(raw_plan["gains"]).items()}
+            alignment_order = [int(value) for value in raw_order["alignment_order"]]
+            coverage = float(raw_plan["coverage"])
+            order_confidence = float(raw_order["alignment_order_confidence"])
+            if (
+                image_count < 1
+                or len(matrices) != image_count
+                or any(len(matrix) != 2 or any(len(row) != 3 for row in matrix) for matrix in matrices)
+                or any(not math.isfinite(value) for matrix in matrices for row in matrix for value in row)
+                or len(correlations) != image_count
+                or any(not math.isfinite(value) for value in correlations)
+                or len(qualities) != image_count
+                or any(not math.isfinite(value) for value in qualities)
+                or len(preview_shape) != 2
+                or any(value < 1 for value in preview_shape)
+                or not 0 <= reference < image_count
+                or any(not 0 <= value < image_count for value in selected)
+                or len(set(selected)) != len(selected)
+                or reference not in selected
+                or any(not 0 <= value < image_count for value in errors)
+                or any(not 0 <= value < image_count for value in gains)
+                or any(not math.isfinite(value) for value in gains.values())
+                or not math.isfinite(coverage)
+                or not 0.0 <= coverage <= 1.0
+                or set(alignment_order) != set(selected)
+                or len(set(alignment_order)) != len(alignment_order)
+                or not math.isfinite(order_confidence)
+            ):
+                return None
+            plan = dict(raw_plan)
+            plan.update({
+                "selected_indices": selected,
+                "reference_index": reference,
+                "matrices": matrices,
+                "correlations": correlations,
+                "qualities": qualities,
+                "preview_shape": preview_shape,
+                "errors": errors,
+                "gains": gains,
+                "coverage": coverage,
+            })
+            order = dict(raw_order)
+            order["alignment_order"] = alignment_order
+            order["alignment_order_confidence"] = order_confidence
+            order["alignment_order_fallback_used"] = bool(
+                raw_order["alignment_order_fallback_used"]
+            )
+            if not isinstance(order.get("alignment_order_diagnostics"), Mapping):
+                return None
+            return plan, order
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+
+    def _classify_without_focus(
+        self,
+        group: Any,
+        items: list[Any],
+        *,
+        reason: str,
+        merge_status: str,
+    ) -> dict[str, Any]:
+        """Return a complete no-merge result without decoding image pixels."""
+
+        gid = _group_id(group)
+        total = len(items)
+        paths: list[Path | None] = [_path_for_item(item) for item in items]
+        confidence = float(_group_value(group, "confidence", default=0.0) or 0.0)
+        per_image = [
+            {
+                "index": index,
+                "image": item,
+                "path": str(paths[index]) if paths[index] is not None else "",
+                "selected": False,
+                "selection_reason": reason,
+                "reason": reason,
+                "quality_score": 0.0,
+                "quality": 0.0,
+                "sharpness_score": 0.0,
+                "coverage_gain": 0.0,
+                "gain": 0.0,
+                "scene_score": confidence,
+                "scene_hash": _item_value(item, "scene_hash", default=None),
+                "focus_map_path": None,
+                "transform": None,
+                "error": None,
+            }
+            for index, item in enumerate(items)
+        ]
+        for item, row in zip(items, per_image):
+            self._persist_image(group, item, row)
+
+        first_item = items[0]
+        first_path = paths[0]
+        first_original = _item_value(first_item, "original_path", default=first_path)
+        result = {
+            "group_id": gid,
+            "all_images": list(items),
+            "items": list(items),
+            "image_records": list(items),
+            "selected_indices": [],
+            "selected_paths": [],
+            "selected_images": [],
+            "capture_order": [str(path) for path in paths if path is not None],
+            "preview_reference": str(first_path) if first_path is not None else 0,
+            "preview_reference_index": 0,
+            "alignment_order": [],
+            "alignment_order_indices": [],
+            "alignment_order_confidence": 1.0,
+            "alignment_order_diagnostics": {"code": "NO_MERGE"},
+            "alignment_order_fallback_used": False,
+            "pairwise_analysis_summary": {
+                "edge_count": 0,
+                "strategy": "skipped_before_focus_analysis",
+            },
+            "first_original_image": first_item,
+            "first_original_path": str(first_original) if first_original is not None else "",
+            "selected_count": 0,
+            "image_count": total,
+            "coverage": 0.0,
+            "confidence": confidence,
+            "merge_status": merge_status,
+            "needs_merge": False,
+            "status": merge_status,
+            "cancelled": False,
+            "quality_scores": [0.0] * total,
+            "qualities": [0.0] * total,
+            "coverage_gains": {index: 0.0 for index in range(total)},
+            "gains": {index: 0.0 for index in range(total)},
+            "selection_reasons": {index: reason for index in range(total)},
+            "reasons": {index: reason for index in range(total)},
+            "per_image": per_image,
+            "analysis_records": per_image,
+            "errors": {},
+            "focus_map_paths": [None] * total,
+            "preview_transforms": [None] * total,
+            "analysis_shapes": [None] * total,
+            "reference_analysis_shape": None,
+            "selection_plan_cache_hit": False,
+            "selection_decode_count": 0,
+            "selection_frame_cache_peak_bytes": 0,
+            "analysis_workers_requested": self._requested_focus_analysis_workers(),
+            "analysis_workers_effective": 0,
+            "opencv_threads": 0,
+            "quality_scan_seconds": 0.0,
+            "registration_seconds": 0.0,
+            "analysis_skipped": True,
+            "analysis_skip_reason": merge_status,
+        }
+        self.logger.info(
+            "focus analysis skipped group_id=%s image_count=%s status=%s reason=%s",
+            gid, total, merge_status, reason,
+        )
+        self._persist_status(
+            group,
+            "CLASSIFIED",
+            confidence=confidence,
+            coverage=0.0,
+            selected_count=0,
+            image_count=total,
+            start_index=_group_value(group, "start_index", default=0),
+            end_index=_group_value(group, "end_index", default=max(0, total - 1)),
+        )
+        return result
+
+    @timed("selection_inclusive")
+    def analyze_group(self, group: Any, *, cancel_event: threading.Event | None = None,
+                      progress_callback: Callable[..., Any] | None = None,
+                      progress: Callable[..., Any] | None = None) -> dict[str, Any]:
+        """Analyze and select one group, returning a merge-compatible mapping."""
+
+        cancel_event = cancel_event or threading.Event()
+        if progress_callback is None:
+            progress_callback = progress
+        items = _items_for_group(group, self.database)
+        gid = _group_id(group)
+        if not items:
+            raise ValueError(f"group {gid!r} contains no images")
+        total = len(items)
+        minimum_group_size = self._minimum_stack_group_size()
         if total < minimum_group_size:
             if total == 1:
                 reason = (
