@@ -85,9 +85,9 @@ def test_cached_partial_and_uncached_outputs_are_identical_without_previews_or_t
     monkeypatch.setattr(backends, 'load_rgb', load)
     payloads = []
     frame_bytes = 80 * 160 * 3
-    for limit, expected_reads in ((0, 4), (frame_bytes, 3), (frame_bytes * 2, 2)):
+    for limit, expected_reads in ((0, 5), (frame_bytes, 3), (frame_bytes * 2, 2)):
         loads.clear()
-        result = backends.OpenCVFusionBackend(aligned_cache_bytes=limit).fuse(
+        result = backends.QualityFusionBackend(aligned_cache_bytes=limit).fuse(
             {}, analysis, tmp_path / f'{limit}.jpg', tmp_path / f'work-{limit}', OutputConfig(), threading.Event(),
         )
         payloads.append(result.output_path.read_bytes())
@@ -114,7 +114,7 @@ def test_failed_or_cancelled_fusion_releases_retained_frames(tmp_path, monkeypat
         raise RuntimeError(failure)
     monkeypatch.setattr(focus_masks, 'blend_focus_pyramid', stop)
     with pytest.raises(RuntimeError, match=failure):
-        backends.OpenCVFusionBackend().fuse({}, analysis, tmp_path/'out.jpg', tmp_path/'work', OutputConfig(), threading.Event())
+        backends.QualityFusionBackend().fuse({}, analysis, tmp_path/'out.jpg', tmp_path/'work', OutputConfig(), threading.Event())
     assert not created[0].frames
     assert created[0].bytes_used == 0
     assert not (tmp_path/'out.jpg').exists()
@@ -125,15 +125,15 @@ def test_direct_fusion_cannot_overwrite_any_selected_source(tmp_path):
     target = analysis['selected_paths'][1]
     before = target.read_bytes()
     with pytest.raises(OutputCollisionError, match='input image'):
-        backends.OpenCVFusionBackend().fuse({}, analysis, target, tmp_path/'work', OutputConfig(overwrite=True), threading.Event())
+        backends.QualityFusionBackend().fuse({}, analysis, target, tmp_path/'work', OutputConfig(overwrite=True), threading.Event())
     assert target.read_bytes() == before
 
 
-def test_runtime_cache_limit_reaches_fast_backend_and_roundtrips(tmp_path):
+def test_runtime_cache_limit_reaches_quality_backend_and_roundtrips(tmp_path):
     config = AppConfig(runtime=RuntimeConfig(opencv_aligned_cache_bytes=0))
     config.save(tmp_path/'config.json')
     loaded = AppConfig.load(tmp_path/'config.json')
-    service = StackMergeService(tmp_path/'out', fusion_backend='opencv', runtime=loaded)
+    service = StackMergeService(tmp_path/'out', fusion_backend='quality', runtime=loaded)
     assert service.backend.aligned_cache_bytes == 0
     with pytest.raises(ValueError, match='opencv_aligned_cache_bytes'):
         RuntimeConfig(opencv_aligned_cache_bytes=-1)

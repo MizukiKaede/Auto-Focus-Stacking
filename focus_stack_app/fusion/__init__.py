@@ -1,6 +1,6 @@
 """Fusion backend abstractions."""
 
-from .backends import FusionBackend, FusionResult, HuginEnfuseBackend, OpenCVFusionBackend, LegacyWholeFrameBackend
+from .backends import FusionBackend, FusionResult, HuginEnfuseBackend, QualityFusionBackend
 
-__all__ = ["FusionBackend", "FusionResult", "HuginEnfuseBackend", "OpenCVFusionBackend", "LegacyWholeFrameBackend"]
+__all__ = ["FusionBackend", "FusionResult", "HuginEnfuseBackend", "QualityFusionBackend"]
 

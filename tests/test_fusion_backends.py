@@ -5,7 +5,7 @@ from PIL import Image
 import numpy as np
 import pytest
 
-from focus_stack_app.fusion.backends import HuginEnfuseBackend, OpenCVFusionBackend
+from focus_stack_app.fusion.backends import HuginEnfuseBackend, QualityFusionBackend
 from focus_stack_app.hugin.align import AlignImageStack
 from focus_stack_app.hugin.align import AlignmentError
 from focus_stack_app.hugin.process import CommandResult
@@ -138,7 +138,7 @@ def test_hugin_backend_retries_in_isolated_dirs_and_preserves_order(tmp_path):
     assert any(item.startswith("CROP_RATIO_WARNING") for item in result.diagnostics)
 
 
-def test_experimental_opencv_backend_uses_generic_analysis_data(tmp_path):
+def test_quality_backend_uses_generic_analysis_data(tmp_path):
     import cv2
     import numpy as np
     import threading
@@ -153,19 +153,19 @@ def test_experimental_opencv_backend_uses_generic_analysis_data(tmp_path):
     for path, pixels in zip(paths, (near, far)):
         Image.fromarray(pixels).save(path, quality=100)
     identity = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
-    result = OpenCVFusionBackend().fuse(
+    result = QualityFusionBackend().fuse(
         {},
         {"selected_paths": list(map(str, paths)), "selected_indices": [0, 1],
          "preview_reference": str(paths[0]), "preview_reference_index": 0,
          "preview_transforms": [identity, identity], "analysis_shapes": [[120, 180], [120, 180]],
          "reference_analysis_shape": [120, 180]},
-        tmp_path / "stack.jpg", tmp_path / "work-opencv", OutputConfig(), threading.Event(),
+        tmp_path / "stack.jpg", tmp_path / "work-quality", OutputConfig(), threading.Event(),
     )
-    assert result.actual_backend == "opencv"
+    assert result.actual_backend == "quality"
     assert result.output_path.is_file()
 
 
-def test_opencv_recovered_metadata_preserves_full_frame(tmp_path):
+def test_quality_recovered_metadata_preserves_full_frame(tmp_path):
     """Large recovered inputs must not magnify the upper-left background."""
     import threading
     import numpy as np
@@ -176,7 +176,7 @@ def test_opencv_recovered_metadata_preserves_full_frame(tmp_path):
     paths = [tmp_path / "a.png", tmp_path / "b.png"]
     for path in paths:
         Image.fromarray(pixels).save(path)
-    result = OpenCVFusionBackend().fuse(
+    result = QualityFusionBackend().fuse(
         {}, {"selected_paths": list(map(str, paths)), "selected_indices": [1, 3],
              "preview_reference": str(paths[1])},
         tmp_path / "recovered.jpg", tmp_path / "work", OutputConfig(), threading.Event(),
@@ -187,7 +187,7 @@ def test_opencv_recovered_metadata_preserves_full_frame(tmp_path):
     assert "PREVIEW_REGISTRATION_REBUILT" in result.diagnostics
 
 
-def test_opencv_known_preview_transform_preserves_full_frame(tmp_path):
+def test_quality_known_preview_transform_preserves_full_frame(tmp_path):
     import threading
     import cv2
     import numpy as np
@@ -199,7 +199,7 @@ def test_opencv_known_preview_transform_preserves_full_frame(tmp_path):
     paths = [tmp_path / "a.png", tmp_path / "b.png"]
     for path, value in zip(paths, (pixels, shifted)):
         Image.fromarray(value).save(path)
-    result = OpenCVFusionBackend().fuse(
+    result = QualityFusionBackend().fuse(
         {}, {"selected_paths": list(map(str, paths)), "selected_indices": [0, 1],
              "preview_reference": str(paths[0]), "reference_analysis_shape": [300, 400],
              "analysis_shapes": [[300, 400], [300, 400]],

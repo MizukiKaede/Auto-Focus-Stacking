@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 21908)
-Total output lines: 1885
-
 """Production group-level analysis orchestration.
 
 ``GroupAnalyzer`` is the bridge between scene grouping and the bounded
@@ -967,7 +964,158 @@ class GroupAnalyzer:
     ) -> dict[str, Any]:
         """Run the calibrated whole-frame selection under the current API."""
         import cv2
-    …1908 tokens truncated…n cache write failed group_id=%s", gid, exc_info=True,
+        import numpy as np
+        from .plan_cache import (
+            SELECTION_PLAN_VERSION, build_plan_key, json_compatible,
+        )
+        from .whole_frame_selection import select_whole_frame
+        from .alignment_order import ORDERING_PLAN_VERSION
+        from ..utils.image_io import load_rgb
+
+        paths = [_path_for_item(item) for item in items]
+        if any(path is None for path in paths):
+            raise ValueError("every group image must expose a path")
+        requested_workers, effective_workers = self._effective_focus_analysis_workers(len(paths))
+        path_items = {os.path.normcase(os.path.abspath(str(path))): item for path, item in zip(paths, items)}
+
+        def load_path(path: Any, edge: int) -> Any:
+            item = path_items.get(os.path.normcase(os.path.abspath(str(path))), path)
+            if self.loader is not None:
+                try:
+                    return self.loader(item, max_long_edge=edge)
+                except TypeError:
+                    return self.loader(item)
+            return load_rgb(path, edge)
+
+        gid = _group_id(group)
+        self._persist_status(group, "ANALYZING_FOCUS", image_count=len(items))
+        if cancel_event.is_set():
+            raise RuntimeError("selection cancelled")
+
+        capture_indices = sorted(range(len(items)), key=lambda index: (
+            _item_value(items[index], "sequence_index", default=index) is None,
+            _item_value(items[index], "sequence_index", default=index), index,
+        ))
+        capture_order = [str(paths[index]) for index in capture_indices]
+
+        cache_key: str | None = None
+        cache_hit = False
+        plan: dict[str, Any] | None = None
+        order_result: dict[str, Any] | None = None
+        order_refresh_needed = False
+        if self.plan_cache is not None:
+            try:
+                cache_key = build_plan_key(
+                    "selection",
+                    SELECTION_PLAN_VERSION,
+                    paths,
+                    {
+                        "selection_edge": 1280,
+                        "ordering_preview_edge": 512,
+                        "registration": self._registration_config(),
+                        "capture_indices": capture_indices,
+                    },
+                )
+                payload = self.plan_cache.get_cached_plan(
+                    "selection", cache_key, algorithm_version=SELECTION_PLAN_VERSION,
+                )
+                restored = self._restore_selection_plan(payload, len(items))
+                if restored is not None:
+                    plan, order_result = restored
+                    cache_hit = True
+                    order_refresh_needed = payload.get("ordering_version") != ORDERING_PLAN_VERSION
+            except Exception:
+                self.logger.warning(
+                    "selection plan cache read failed group_id=%s", gid, exc_info=True,
+                )
+                cache_key = None
+
+        if cache_hit:
+            assert plan is not None
+            plan.update({
+                "analysis_workers_requested": requested_workers,
+                "analysis_workers_effective": 0,
+                "opencv_threads": int(cv2.getNumThreads()),
+                "quality_scan_seconds": 0.0,
+                "registration_seconds": 0.0,
+            })
+            for index, path in enumerate(paths):
+                if cancel_event.is_set():
+                    raise RuntimeError("selection cancelled")
+                self._emit_progress(progress_callback, group, path, index, len(paths))
+            ordering_preview_decodes = 0
+            if order_refresh_needed:
+                selected_set_for_order = set(plan["selected_indices"])
+                selected_capture = [index for index in capture_indices if index in selected_set_for_order]
+                selected_previews = [load_path(paths[index], 512) for index in selected_capture]
+                ordering_preview_decodes = len(selected_previews)
+                order_result = self.build_alignment_order(
+                    selected_previews, capture_order=selected_capture,
+                )
+            self.logger.info(
+                "selection plan cache status=hit group_id=%s key=%s decode_count=0 "
+                "ordering_preview_decodes=%s frame_cache_peak_bytes=0 "
+                "requested_workers=%s effective_workers=0 opencv_threads=%s",
+                gid, cache_key, ordering_preview_decodes, requested_workers,
+                cv2.getNumThreads(),
+            )
+        else:
+            plan = select_whole_frame(
+                paths,
+                cancel_event=cancel_event,
+                loader=load_path,
+                frame_cache_bytes=int(_setting(
+                    self.config, "selection_frame_cache_bytes", 400 * 1024**2,
+                )),
+                workers=effective_workers,
+                requested_workers=requested_workers,
+                progress=lambda current, total: self._emit_progress(
+                    progress_callback, group, paths[current - 1], current - 1, total,
+                ),
+            )
+            selected_set_for_order = set(plan["selected_indices"])
+            selected_capture = [index for index in capture_indices if index in selected_set_for_order]
+            selected_previews = [load_path(paths[index], 512) for index in selected_capture]
+            order_result = self.build_alignment_order(
+                selected_previews, capture_order=selected_capture,
+            )
+            self.logger.info(
+                "selection plan cache status=miss group_id=%s key=%s decode_count=%s "
+                "frame_cache_enabled=%s frame_cache_peak_bytes=%s requested_workers=%s "
+                "effective_workers=%s opencv_threads=%s quality_scan_seconds=%.6f "
+                "registration_seconds=%.6f",
+                gid, cache_key, plan.get("decode_count", 0),
+                plan.get("frame_cache_enabled", False), plan.get("frame_cache_peak_bytes", 0),
+                plan.get("analysis_workers_requested", requested_workers),
+                plan.get("analysis_workers_effective", effective_workers),
+                plan.get("opencv_threads", cv2.getNumThreads()),
+                plan.get("quality_scan_seconds", 0.0),
+                plan.get("registration_seconds", 0.0),
+            )
+        if (not cache_hit or order_refresh_needed) and self.plan_cache is not None and cache_key is not None and not cancel_event.is_set():
+            try:
+                self.plan_cache.upsert_cached_plan(
+                    "selection", cache_key, SELECTION_PLAN_VERSION,
+                    {
+                        "plan": {
+                            key: json_compatible(value)
+                            for key, value in plan.items()
+                            if key not in {
+                                "paths",
+                                "analysis_workers_requested",
+                                "analysis_workers_effective",
+                                "opencv_threads",
+                                "quality_scan_seconds",
+                                "registration_seconds",
+                            }
+                        },
+                        "order": json_compatible(order_result),
+                        "ordering_version": ORDERING_PLAN_VERSION,
+                    },
+                )
+            except Exception:
+                self.logger.warning(
+                    "selection plan cache write failed group_id=%s", gid, exc_info=True,
                 )
         assert plan is not None and order_result is not None
         selected_indices = list(plan["selected_indices"])
@@ -975,7 +1123,7 @@ class GroupAnalyzer:
         selected_paths = [str(paths[index]) for index in selected_indices]
 
         # The established ECC matrices use inverse-warp convention. Publish
-        # source -> reference matrices for the generic experimental backend.
+        # source-to-reference matrices for the quality backend.
         transforms: list[Any] = []
         for matrix in plan["matrices"]:
             affine = cv2.invertAffineTransform(np.asarray(matrix, np.float32))
@@ -1353,7 +1501,7 @@ class GroupAnalyzer:
         scene_scores: list[float | None] = [None] * total
         # Reference choice is a separate whole-group pre-registration stage.
         # It deliberately precedes focus-map construction and is not reused as
-        # the later Hugin input-order decision.
+        # the later fusion input-order decision.
         from .alignment_order import choose_preview_reference
         preview_edge = int(_setting(self.config, "scene_preview_long_edge", 512, "preview_long_edge"))
         preview_images: list[Any | None] = []
@@ -1626,7 +1774,7 @@ class GroupAnalyzer:
         }
         alignment_order_indices = list(order_result["alignment_order"])
         # Any selected image whose preview failed remains eligible and is
-        # appended in SQLite capture order; Hugin can still attempt it.
+        # appended in SQLite capture order; the selected backend can still attempt it.
         missing_order = [index for index in selected_indices if index not in alignment_order_indices]
         missing_order.sort(key=lambda index: (
             _item_value(items[index], "sequence_index", default=index) is None,

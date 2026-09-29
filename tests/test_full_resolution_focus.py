@@ -7,8 +7,10 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from focus_stack_app.fusion.backends import OpenCVFusionBackend
-from focus_stack_app.fusion.focus_masks import build_focus_labels, focus_weight, blend_focus_pyramid
+from focus_stack_app.fusion.backends import QualityFusionBackend
+from focus_stack_app.fusion.focus_masks import (
+    _CoherentNeutralEdges, build_focus_labels, focus_weight, blend_focus_pyramid,
+)
 from focus_stack_app.hugin.output_encoder import OutputConfig
 from focus_stack_app.hugin.enfuse import Enfuser, EnfuseConfig
 
@@ -25,12 +27,12 @@ def thin_details():
     return truth, left, right
 
 
-def test_opencv_preserves_thin_details_at_adjacent_focus_depths(tmp_path):
+def test_quality_preserves_thin_details_at_adjacent_focus_depths(tmp_path):
     truth, left, right = thin_details()
     paths = [tmp_path / 'near.png', tmp_path / 'far.png']
     for path, pixels in zip(paths, (left, right)):
         Image.fromarray(pixels).save(path)
-    result = OpenCVFusionBackend().fuse(
+    result = QualityFusionBackend().fuse(
         {}, {'selected_paths': paths, 'selected_indices': [0, 1],
              'preview_reference': paths[0], 'preview_reference_index': 0,
              'preview_transforms': [np.eye(3), np.eye(3)],
@@ -323,4 +325,63 @@ def test_chromatic_guard_cannot_defocus_dark_metal_rim(reverse):
     # the far frame still must not override an already sharp dark metal rim.
     # Without the local edge check, this band selected the far frame entirely.
     assert np.mean(labels[72:90, 130:370] == int(reverse)) > .99
+
+
+def test_dark_body_and_pale_rim_keep_separate_sharp_focus_planes():
+    rng = np.random.default_rng(31)
+    truth = np.full((300, 600, 3), 240, np.uint8)
+    truth[125:145] = 185
+    truth[127:143, ::9] = 125
+    texture = rng.integers(-25, 26, (75, 600, 1), dtype=np.int16)
+    truth[145:220] = np.clip(65 + texture, 0, 255).astype(np.uint8)
+    blurred = cv2.GaussianBlur(truth, (0, 0), 5)
+    body = truth.copy()
+    body[115:145] = blurred[115:145]
+    rim = blurred.copy()
+    rim[115:145] = truth[115:145]
+    far = cv2.GaussianBlur(truth, (0, 0), 10)
+    frames = (body, rim, far)
+    guard = _CoherentNeutralEdges(body)
+    for frame in frames:
+        guard.observe(frame)
+    # Fragmented old winners selected an out-of-focus plane throughout.
+    labels = np.full(truth.shape[:2], 2, np.uint16)
+    guard.apply(labels, gray_frames={0: cv2.cvtColor(body, cv2.COLOR_RGB2GRAY)},
+                load_aligned=lambda i: frames[i])
+    assert np.mean(labels[165:200, 40:560] == 0) > .95
+    assert np.mean(labels[127:140, 40:560] == 1) > .95
+
+
+def test_translucent_lip_does_not_inherit_coloured_body_focus():
+    height, width = 520, 800
+    rng = np.random.default_rng(92)
+    yy = np.arange(height)[:, None]
+    xx = np.arange(width)[None, :]
+    top = 275 + np.rint(16 * np.sin(xx * 2 * np.pi / 125)).astype(int)
+    body = yy >= top
+    lip = (yy >= top - 35) & (yy < top - 3)
+    line = (yy >= top - 3) & (yy < top)
+    truth = np.full((height, width, 3), 240, np.uint8)
+    truth[body] = (20, 205, 210)
+    texture = rng.integers(-20, 21, (height, width), dtype=np.int16)
+    shade = np.uint8(np.clip(175 + texture, 0, 255))
+    truth[lip] = np.repeat(shade[:, :, None], 3, axis=2)[lip]
+    truth[line] = (85, 85, 85)
+    blurred = cv2.GaussianBlur(truth, (0, 0), 5)
+    body_frame = truth.copy()
+    body_frame[lip | line] = blurred[lip | line]
+    line_frame = blurred.copy()
+    line_frame[line] = truth[line]
+    lip_frame = blurred.copy()
+    lip_frame[lip] = truth[lip]
+    frames = (body_frame, line_frame, lip_frame)
+    guard = _CoherentNeutralEdges(body_frame)
+    assert guard.pale_rims
+    for frame in frames:
+        guard.observe(frame)
+    labels = np.zeros((height, width), np.uint16)
+    guard.apply(labels, load_aligned=lambda index: frames[index])
+    middle = slice(150, 650)
+    assert np.mean(labels[top[0, middle] - 2, np.arange(150, 650)] == 1) > .7
+    assert np.mean(labels[top[0, middle] - 30, np.arange(150, 650)] == 2) > .7
 
