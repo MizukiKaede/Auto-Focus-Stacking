@@ -65,30 +65,32 @@ class ApplicationOptions:
     """
 
     source_dir: str | Path
-    output_dir: str | Path
+    output_dir: str | Path | None = ""
     archive_mode: ArchiveMode | str = ArchiveMode.MOVE
     # Preserve originals unless the user explicitly opts into post-fusion
     # archiving.  This makes calibration runs and first passes reversible.
     archive_enabled: bool = False
-    minimum_stack_group_size: int = 3
+    minimum_stack_group_size: int = 4
     grouping_pause_seconds: int = 20
     fusion_backend: str = "quality"
     output_format: str = "jpg"
     parallel: bool = True
-    preserve_cache: bool = True
+    preserve_cache: bool = False
     hugin_bin: str | Path | None = None
     align_image_stack_path: str | Path | None = None
     enfuse_path: str | Path | None = None
     queue_size: int = 3
-    merge_workers: int = 1
+    merge_workers: int = 3
     recursive: bool = False
     include_hidden: bool = False
     archive_dir: str | Path | None = None
-    # Kept last for positional compatibility. 0 = automatic; 1..8 is a
+    # Kept last for positional compatibility. 0 = automatic; 1..10 is a
     # memory-safe upper bound for images analysed concurrently in one group.
     focus_analysis_workers: int = 0
 
     def __post_init__(self) -> None:
+        if self.output_dir is None or (isinstance(self.output_dir, str) and not self.output_dir.strip()):
+            self.output_dir = Path(self.source_dir) / "合成"
         self.archive_mode = _coerce_archive_mode(self.archive_mode)
         if isinstance(self.archive_enabled, str):
             self.archive_enabled = self.archive_enabled.strip().casefold() in {"1", "true", "yes", "on"}
@@ -106,10 +108,10 @@ class ApplicationOptions:
         if not 1 <= self.grouping_pause_seconds <= 3600:
             raise ValueError("grouping_pause_seconds must be between 1 and 3600")
         self.queue_size = max(1, int(self.queue_size))
-        self.merge_workers = max(1, min(2, int(self.merge_workers)))
+        self.merge_workers = max(1, min(6, int(self.merge_workers)))
         self.focus_analysis_workers = int(self.focus_analysis_workers)
-        if not 0 <= self.focus_analysis_workers <= 8:
-            raise ValueError("focus_analysis_workers must be between 0 and 8")
+        if not 0 <= self.focus_analysis_workers <= 10:
+            raise ValueError("focus_analysis_workers must be between 0 and 10")
 
 
 # Names used by early UI prototypes and external scripts.
@@ -541,8 +543,8 @@ class ApplicationController:
         for old, new in aliases.items():
             if old in data and new not in data:
                 data[new] = data[old]
-        if "source_dir" not in data or "output_dir" not in data:
-            raise ValueError("source_dir and output_dir are required")
+        if "source_dir" not in data:
+            raise ValueError("source_dir is required")
         allowed = set(ApplicationOptions.__dataclass_fields__)
         return ApplicationOptions(**{key: item for key, item in data.items() if key in allowed})
 

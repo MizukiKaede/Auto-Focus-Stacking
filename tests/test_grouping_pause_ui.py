@@ -46,6 +46,35 @@ def test_source_picker_defaults_output_folders_inside_source(tmp_path, monkeypat
         app.processEvents()
 
 
+def test_blank_output_uses_source_composite_folder(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    try:
+        window.source_edit.setText(str(tmp_path))
+        assert window.minimum_group_spin.value() == 4
+        assert window.merge_workers_spin.value() == 3
+        assert window.merge_workers_spin.maximum() == 6
+        assert window.focus_analysis_workers_spin.value() == 0
+        assert window.focus_analysis_workers_spin.maximum() == 10
+        assert not window.cache_check.isChecked()
+        assert window.output_directory == tmp_path / '合成'
+        controller = default_controller_factory(**window._settings())
+        try:
+            assert controller.options.output_dir == tmp_path / '合成'
+            assert controller._validate_paths()[1] == (tmp_path / '合成').resolve()
+            assert (tmp_path / '合成').is_dir()
+        finally:
+            controller.close()
+        controller = default_controller_factory(source_dir=tmp_path, output_dir='')
+        try:
+            assert controller.options.output_dir == tmp_path / '合成'
+        finally:
+            controller.close()
+    finally:
+        window.close()
+        app.processEvents()
+
+
 def test_experimental_picker_uses_hugin_backend(tmp_path):
     app = QApplication.instance() or QApplication([])
     window = MainWindow()

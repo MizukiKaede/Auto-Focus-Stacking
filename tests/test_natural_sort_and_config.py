@@ -20,7 +20,10 @@ class NaturalSortAndConfigTests(unittest.TestCase):
         self.assertEqual(config.analysis.scene_similarity_threshold, 0.82)
         self.assertEqual(config.analysis.duplicate_focus_threshold, 0.995)
         self.assertEqual(config.analysis.minimum_stack_images, 2)
-        self.assertEqual(config.analysis.minimum_stack_group_size, 3)
+        self.assertEqual(config.analysis.minimum_stack_group_size, 4)
+        self.assertEqual(config.runtime.max_hugin_workers, 3)
+        self.assertFalse(config.runtime.preserve_cache)
+        self.assertEqual(config.runtime.focus_analysis_workers, 0)
         self.assertEqual(config.analysis.minimum_stack_stability, 0.98)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"

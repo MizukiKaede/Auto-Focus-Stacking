@@ -32,7 +32,8 @@ def test_two_workers_failure_does_not_archive_and_retry_succeeds(tmp_path):
             return FusionResult(output_path, self.name)
     backend = Backend()
     archive = tmp_path / "archive"
-    merger = StackMergeService(tmp_path / "output", archiver=FileArchiver(archive, "copy"), fusion_backend=backend)
+    merger = StackMergeService(tmp_path / "output", archiver=FileArchiver(archive, "copy"), fusion_backend=backend,
+                               minimum_stack_group_size=3)
     def analyze(group):
         return dict(selected_paths=group["images"], needs_merge=True)
     def run(values):
@@ -82,7 +83,8 @@ def test_real_low_texture_alignment_failure_keeps_inputs(tmp_path, workers, repe
             Image.new("RGB", (128, 96), (50 + index * 50,) * 3).save(path)
         groups.append(dict(id=gid, images=paths))
     archive = tmp_path / "archive"
-    merger = StackMergeService(tmp_path / "output", archiver=FileArchiver(archive, "move"))
+    merger = StackMergeService(tmp_path / "output", archiver=FileArchiver(archive, "move"),
+                               minimum_stack_group_size=3)
     pipeline = PipelineCoordinator(
         config=PipelineConfig(merge_workers=workers), merger=merger,
         analyzer=lambda group: dict(selected_paths=group["images"], alignment_order=group["images"], needs_merge=True))

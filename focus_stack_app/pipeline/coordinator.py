@@ -18,14 +18,14 @@ from .merge_worker import MergeWorker
 @dataclass(frozen=True)
 class PipelineConfig:
     queue_size: int = 3
-    merge_workers: int = 1
+    merge_workers: int = 3
     parallel: bool = True
 
     def __post_init__(self) -> None:
         if int(self.queue_size) < 1:
             raise ValueError("queue_size must be at least one")
-        if not 1 <= int(self.merge_workers) <= 2:
-            raise ValueError("merge_workers must be 1 or 2")
+        if not 1 <= int(self.merge_workers) <= 6:
+            raise ValueError("merge_workers must be between 1 and 6")
 
 
 @dataclass
@@ -60,7 +60,7 @@ class PipelineSummary:
 
 
 class PipelineCoordinator:
-    """Run one analysis producer and one (or explicitly two) merge consumers.
+    """Run one analysis producer and a bounded number of merge consumers.
 
     In parallel mode the merge worker starts before analysis and consumes jobs
     as they become available.  With ``parallel=False`` analysis is fully
@@ -89,13 +89,13 @@ class PipelineCoordinator:
         if config is None:
             config = PipelineConfig(
                 queue_size=3 if queue_size is None else queue_size,
-                merge_workers=1 if merge_workers is None else merge_workers,
+                merge_workers=3 if merge_workers is None else merge_workers,
                 parallel=True if parallel is None else parallel,
             )
         else:
             config = PipelineConfig(
                 queue_size=getattr(config, "queue_size", getattr(config, "merge_queue_size", 3)) if queue_size is None else queue_size,
-                merge_workers=getattr(config, "merge_workers", getattr(config, "max_hugin_workers", 1)) if merge_workers is None else merge_workers,
+                merge_workers=getattr(config, "merge_workers", getattr(config, "max_hugin_workers", 3)) if merge_workers is None else merge_workers,
                 parallel=getattr(config, "parallel", getattr(config, "parallel_pipeline", True)) if parallel is None else parallel,
             )
         self.config = config

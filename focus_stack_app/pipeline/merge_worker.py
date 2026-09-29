@@ -321,7 +321,7 @@ class StackMergeService:
         enfuse_path: os.PathLike[str] | str | None = None,
         manifest_writer: Any | None = None,
         fusion_backend: str | FusionBackend = "quality",
-        minimum_stack_group_size: int = 3,
+        minimum_stack_group_size: int = 4,
         logger: logging.Logger | None = None,
     ):
         self.minimum_stack_group_size = max(2, int(minimum_stack_group_size))
