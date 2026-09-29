@@ -92,16 +92,26 @@ def focus_score(rgb):
     return cv2.GaussianBlur(laplacian * laplacian, (0, 0), 2.0)
 
 
-def register_whole_frame(reference, source):
+def _registration_pyramid(rgb, target_shape=None):
+    gray = (rgb if np.asarray(rgb).ndim == 2 else cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)).astype(np.float32) / 255
+    height, width = target_shape or rgb.shape[:2]
+    half_size = (round(width * 0.5), round(height * 0.5))
+    full_size = (round(width), round(height))
+    return {
+        0.5: cv2.resize(gray, half_size),
+        1.0: cv2.resize(gray, full_size),
+    }
+
+
+def register_whole_frame(reference, source, *, prepared_reference=None):
     """Coarse-to-fine affine ECC using the established scene thresholds."""
     warp = np.eye(2, 3, dtype=np.float32)
-    ref_gray = (reference if np.asarray(reference).ndim == 2 else cv2.cvtColor(reference, cv2.COLOR_RGB2GRAY)).astype(np.float32) / 255
-    src_gray = (source if np.asarray(source).ndim == 2 else cv2.cvtColor(source, cv2.COLOR_RGB2GRAY)).astype(np.float32) / 255
+    reference_pyramid = prepared_reference or _registration_pyramid(reference)
+    source_pyramid = _registration_pyramid(source, target_shape=reference.shape[:2])
     correlation = 0.0
     for scale, blur in ((0.5, 9), (1.0, 7), (1.0, 3)):
-        size = (round(reference.shape[1] * scale), round(reference.shape[0] * scale))
-        ref = cv2.resize(ref_gray, size)
-        src = cv2.resize(src_gray, size)
+        ref = reference_pyramid[scale]
+        src = source_pyramid[scale]
         scaled_warp = warp.copy()
         scaled_warp[:, 2] *= scale
         correlation, scaled_warp = cv2.findTransformECC(
@@ -148,7 +158,7 @@ def _estimated_rgb_cache_bytes(paths, edge):
 @timed("selection")
 def select_whole_frame(
     paths, *, cancel_event=None, progress=None, edge=1280, loader=load_rgb,
-    frame_cache_bytes=128 * 1024**2, workers=1, requested_workers=None,
+    frame_cache_bytes=400 * 1024**2, workers=1, requested_workers=None,
 ):
     """Return the calibrated selection plan with optional exact-pixel reuse."""
     cancel_event = cancel_event or threading.Event()
@@ -223,6 +233,7 @@ def select_whole_frame(
         raise ValueError("images in one group have inconsistent dimensions")
     reference_index = int(np.argmax(qualities))
     reference = frames[reference_index] if cache_enabled else decode(paths[reference_index])
+    reference_pyramid = _registration_pyramid(reference)
     scores, matrices, correlations, errors = [], [], [], {}
 
     def analyze_registered_frame(value):
@@ -232,7 +243,9 @@ def select_whole_frame(
             if index == reference_index:
                 matrix, correlation = np.eye(2, 3, dtype=np.float32), 1.0
             else:
-                matrix, correlation = register_whole_frame(reference, rgb)
+                matrix, correlation = register_whole_frame(
+                    reference, rgb, prepared_reference=reference_pyramid,
+                )
             aligned = warp_preview(rgb, matrix, reference.shape)
             score = focus_score(aligned)
         except (cv2.error, ValueError) as exc:

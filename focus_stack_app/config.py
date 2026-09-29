@@ -58,7 +58,7 @@ class AnalysisConfig:
     max_focus_cache_items: int = 4
     # Reuse the exact 1280px arrays across quality/reference/ECC stages when
     # the whole group fits.  Zero preserves the historical streaming path.
-    selection_frame_cache_bytes: int = 128 * 1024**2
+    selection_frame_cache_bytes: int = 400 * 1024**2
     scene_confirmation_window: int = 2
 
     @property
@@ -151,9 +151,10 @@ class RuntimeConfig:
     min_alignment_tiff_bytes: int = 128
     min_fusion_output_bytes: int = 128
     opencv_aligned_cache_bytes: int = 1024**3
-    # Kept last for positional compatibility with earlier RuntimeConfig
-    # callers. Zero selects an adaptive CPU/memory budget.
+    # Zero selects an adaptive CPU/memory budget.
     focus_analysis_workers: int = 0
+    # Appended to preserve positional compatibility with earlier callers.
+    aligned_tiff_cache_bytes: int = 512 * 1024**2
 
     def __post_init__(self) -> None:
         if not 1 <= int(self.max_hugin_workers) <= 2:
@@ -178,6 +179,8 @@ class RuntimeConfig:
             raise ValueError("output validation byte thresholds must be positive")
         if int(self.opencv_aligned_cache_bytes) < 0:
             raise ValueError("opencv_aligned_cache_bytes cannot be negative")
+        if int(self.aligned_tiff_cache_bytes) < 0:
+            raise ValueError("aligned_tiff_cache_bytes cannot be negative")
 
 
 @dataclass(slots=True)

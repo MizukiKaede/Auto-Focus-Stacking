@@ -34,13 +34,17 @@ class EnfuseConfig:
     timeout_seconds: float | None = 60 * 60
     jpeg_quality: int = 100
     full_resolution_focus_masks: bool = True
-    # Focus masks already choose the sharp frame per pixel. Extra pyramid
-    # levels mix coarse content from defocused frames across silhouettes.
-    focus_blend_levels: int = 1
+    # Auto keeps single-level silhouette protection for stable tones, and
+    # uses five levels when flat surfaces drift in colour between frames.
+    # An explicit integer overrides this choice.
+    focus_blend_levels: int | None = None
+    focus_gray_cache_bytes: int = 256 * 1024**2
 
     def __post_init__(self):
-        if not 1 <= self.focus_blend_levels <= 29:
+        if self.focus_blend_levels is not None and not 1 <= self.focus_blend_levels <= 29:
             raise ValueError("focus_blend_levels must be between 1 and 29")
+        if int(self.focus_gray_cache_bytes) < 0:
+            raise ValueError("focus_gray_cache_bytes cannot be negative")
 
 
 @dataclass
@@ -127,6 +131,7 @@ class Enfuser:
         cancel_event: threading.Event | None = None,
         cleanup_on_success: bool = True,
         output_config: OutputConfig | None = None,
+        image_loader=None,
     ) -> EnfuseResult:
         paths = tuple(Path(item) for item in aligned_paths)
         if not paths:
@@ -168,13 +173,22 @@ class Enfuser:
             and not any(arg.startswith(mask_options) for arg in self.config.extra_args)
         ):
             from PIL import Image
-            from ..fusion.focus_masks import build_focus_labels
+            from ..fusion.focus_masks import build_focus_labels, SurfaceToneMonitor
             from ..utils.image_io import load_rgb
 
             with stage("focus_masks_inclusive", frames=len(paths)):
+                aligned_loader = image_loader or (lambda i: load_rgb(paths[i]))
+                tone_monitor = SurfaceToneMonitor() if self.config.focus_blend_levels is None else None
                 labels = build_focus_labels(
-                    len(paths), lambda i: load_rgb(paths[i]), cancel_event=cancel_event,
+                    len(paths), aligned_loader, cancel_event=cancel_event,
                     protect_chromatic_edges=True,
+                    gray_cache_bytes=self.config.focus_gray_cache_bytes, tone_monitor=tone_monitor,
+                    # Five-level blending reaches beyond the old seven-pixel
+                    # ownership band and can mix a defocused white letter's
+                    # rim into red print. Cover an extra 32 source pixels.
+                    # A rectangular max filter keeps this linear-time without
+                    # storing another full-resolution score/label pyramid.
+                    focus_support_radius=7 if self.config.focus_blend_levels == 1 else 39,
                 )
                 digits = len(str(len(paths)))
                 for index in range(len(paths)):
@@ -188,7 +202,12 @@ class Enfuser:
             # mask numbers to the number of digits in the input count.
             options = ["--load-masks"]
             if not any(arg == "-l" or arg.startswith(("--levels", "-l")) for arg in self.config.extra_args):
-                options.append(f"--levels={self.config.focus_blend_levels}")
+                blend_levels = self.config.focus_blend_levels
+                if blend_levels is None:
+                    blend_levels = 5 if tone_monitor.needs_multiband else 1
+                options.append(f"--levels={blend_levels}")
+                self.logger.info("Focus blend levels=%s flat_surface_tone_drift=%s",
+                                 blend_levels, bool(tone_monitor and tone_monitor.needs_multiband))
             command[1:1] = options
             self.logger.info("Full-resolution focus masks generated for %s aligned frames", len(paths))
         # Mirror the runner audit here so custom/mock runners still publish

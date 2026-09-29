@@ -3,10 +3,13 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import math
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 from .registration import RegistrationResult, register_images
 from .registration_cache import preprocessing_cache
+
+
+ORDERING_PLAN_VERSION = "local-hubs-v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +59,7 @@ def _edge_from_result(left: int, right: int, result: RegistrationResult, shape: 
 
 def analyze_pairwise_registration(
     images: Sequence[Any], *, config: Any = None,
+    pairs: Iterable[tuple[int, int]] | None = None,
 ) -> list[PairwiseRegistration]:
     """Build an undirected registration graph from compact preview arrays."""
     count = len(images)
@@ -63,21 +67,24 @@ def analyze_pairwise_registration(
         return []
     # Full graphs are ideal for normal brackets. Large shoots use a connected
     # sparse graph (near neighbours plus evenly-spaced hubs) to stay bounded.
-    pairs: set[tuple[int, int]] = set()
-    if count <= 40:
-        pairs.update((i, j) for i in range(count) for j in range(i + 1, count))
-    else:
-        for i in range(count):
-            for j in range(i + 1, min(count, i + 5)):
-                pairs.add((i, j))
-        hubs = sorted({0, count // 4, count // 2, (3 * count) // 4, count - 1})
-        for hub in hubs:
+    if pairs is None:
+        candidate_pairs: set[tuple[int, int]] = set()
+        if count <= 40:
+            candidate_pairs.update((i, j) for i in range(count) for j in range(i + 1, count))
+        else:
             for i in range(count):
-                if i != hub:
-                    pairs.add(tuple(sorted((i, hub))))
+                for j in range(i + 1, min(count, i + 5)):
+                    candidate_pairs.add((i, j))
+            hubs = sorted({0, count // 4, count // 2, (3 * count) // 4, count - 1})
+            for hub in hubs:
+                for i in range(count):
+                    if i != hub:
+                        candidate_pairs.add(tuple(sorted((i, hub))))
+    else:
+        candidate_pairs = set(pairs)
     edges: list[PairwiseRegistration] = []
     with preprocessing_cache():
-        for left, right in sorted(pairs):
+        for left, right in sorted(candidate_pairs):
             try:
                 result = register_images(images[left], images[right], config)
                 edges.append(_edge_from_result(left, right, result, images[left].shape[:2]))
@@ -87,6 +94,21 @@ def analyze_pairwise_registration(
                     "failed", str(exc),
                 ))
     return edges
+
+
+def _ordering_pairs(count: int) -> set[tuple[int, int]]:
+    """Keep local overlap evidence and sample distant links for large stacks."""
+    pairs = {(i, j) for i in range(count)
+             for j in range(i + 1, min(count, i + 4))}
+    hubs = sorted({0, count // 2, count - 1})
+    for hub in hubs:
+        for i in range(0, count, 2):
+            if i != hub:
+                pairs.add((min(i, hub), max(i, hub)))
+    for index, left in enumerate(hubs):
+        for right in hubs[index + 1:]:
+            pairs.add((left, right))
+    return pairs
 
 
 def choose_preview_reference(count: int, edges: Sequence[PairwiseRegistration]) -> tuple[int, dict[str, Any]]:
@@ -130,7 +152,12 @@ def build_alignment_order(
         return {"alignment_order": capture, "alignment_order_confidence": 1.0,
                 "alignment_order_diagnostics": {"edges": []},
                 "alignment_order_fallback_used": False}
-    edges = analyze_pairwise_registration(selected_images, config=config)
+    if count <= 24:
+        edges = analyze_pairwise_registration(selected_images, config=config)
+    else:
+        edges = analyze_pairwise_registration(
+            selected_images, config=config, pairs=_ordering_pairs(count),
+        )
     lookup = _edge_map(edges)
     starts = sorted({0, count // 2, count - 1})
     candidates: list[list[int]] = []

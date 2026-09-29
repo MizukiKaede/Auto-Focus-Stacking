@@ -83,7 +83,7 @@ class GroupAnalyzerConfig:
     focus_threshold: float = 0.95
     coverage_mode: str = "balanced"
     cache_focus_maps: bool = True
-    selection_frame_cache_bytes: int = 128 * 1024**2
+    selection_frame_cache_bytes: int = 400 * 1024**2
     # Standalone/library callers retain serial behavior unless they opt in.
     # The desktop AppConfig uses RuntimeConfig's automatic value instead.
     focus_analysis_workers: int = 1
@@ -969,6 +969,7 @@ class GroupAnalyzer:
             SELECTION_PLAN_VERSION, build_plan_key, json_compatible,
         )
         from .whole_frame_selection import select_whole_frame
+        from .alignment_order import ORDERING_PLAN_VERSION
         from ..utils.image_io import load_rgb
 
         paths = [_path_for_item(item) for item in items]
@@ -1001,6 +1002,7 @@ class GroupAnalyzer:
         cache_hit = False
         plan: dict[str, Any] | None = None
         order_result: dict[str, Any] | None = None
+        order_refresh_needed = False
         if self.plan_cache is not None:
             try:
                 cache_key = build_plan_key(
@@ -1021,6 +1023,7 @@ class GroupAnalyzer:
                 if restored is not None:
                     plan, order_result = restored
                     cache_hit = True
+                    order_refresh_needed = payload.get("ordering_version") != ORDERING_PLAN_VERSION
             except Exception:
                 self.logger.warning(
                     "selection plan cache read failed group_id=%s", gid, exc_info=True,
@@ -1040,11 +1043,21 @@ class GroupAnalyzer:
                 if cancel_event.is_set():
                     raise RuntimeError("selection cancelled")
                 self._emit_progress(progress_callback, group, path, index, len(paths))
+            ordering_preview_decodes = 0
+            if order_refresh_needed:
+                selected_set_for_order = set(plan["selected_indices"])
+                selected_capture = [index for index in capture_indices if index in selected_set_for_order]
+                selected_previews = [load_path(paths[index], 512) for index in selected_capture]
+                ordering_preview_decodes = len(selected_previews)
+                order_result = self.build_alignment_order(
+                    selected_previews, capture_order=selected_capture,
+                )
             self.logger.info(
                 "selection plan cache status=hit group_id=%s key=%s decode_count=0 "
-                "frame_cache_peak_bytes=0 requested_workers=%s effective_workers=0 "
-                "opencv_threads=%s",
-                gid, cache_key, requested_workers, cv2.getNumThreads(),
+                "ordering_preview_decodes=%s frame_cache_peak_bytes=0 "
+                "requested_workers=%s effective_workers=0 opencv_threads=%s",
+                gid, cache_key, ordering_preview_decodes, requested_workers,
+                cv2.getNumThreads(),
             )
         else:
             plan = select_whole_frame(
@@ -1052,7 +1065,7 @@ class GroupAnalyzer:
                 cancel_event=cancel_event,
                 loader=load_path,
                 frame_cache_bytes=int(_setting(
-                    self.config, "selection_frame_cache_bytes", 128 * 1024**2,
+                    self.config, "selection_frame_cache_bytes", 400 * 1024**2,
                 )),
                 workers=effective_workers,
                 requested_workers=requested_workers,
@@ -1079,31 +1092,31 @@ class GroupAnalyzer:
                 plan.get("quality_scan_seconds", 0.0),
                 plan.get("registration_seconds", 0.0),
             )
-            if self.plan_cache is not None and cache_key is not None and not cancel_event.is_set():
-                try:
-                    self.plan_cache.upsert_cached_plan(
-                        "selection", cache_key, SELECTION_PLAN_VERSION,
-                        {
-                            "plan": {
-                                key: json_compatible(value)
-                                for key, value in plan.items()
-                                if key not in {
-                                    "paths",
-                                    "analysis_workers_requested",
-                                    "analysis_workers_effective",
-                                    "opencv_threads",
-                                    "quality_scan_seconds",
-                                    "registration_seconds",
-                                }
-                            },
-                            "order": json_compatible(order_result),
+        if (not cache_hit or order_refresh_needed) and self.plan_cache is not None and cache_key is not None and not cancel_event.is_set():
+            try:
+                self.plan_cache.upsert_cached_plan(
+                    "selection", cache_key, SELECTION_PLAN_VERSION,
+                    {
+                        "plan": {
+                            key: json_compatible(value)
+                            for key, value in plan.items()
+                            if key not in {
+                                "paths",
+                                "analysis_workers_requested",
+                                "analysis_workers_effective",
+                                "opencv_threads",
+                                "quality_scan_seconds",
+                                "registration_seconds",
+                            }
                         },
-                    )
-                except Exception:
-                    self.logger.warning(
-                        "selection plan cache write failed group_id=%s", gid, exc_info=True,
-                    )
-
+                        "order": json_compatible(order_result),
+                        "ordering_version": ORDERING_PLAN_VERSION,
+                    },
+                )
+            except Exception:
+                self.logger.warning(
+                    "selection plan cache write failed group_id=%s", gid, exc_info=True,
+                )
         assert plan is not None and order_result is not None
         selected_indices = list(plan["selected_indices"])
         selected_set = set(selected_indices)

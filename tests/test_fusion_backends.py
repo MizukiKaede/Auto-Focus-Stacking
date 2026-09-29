@@ -72,6 +72,11 @@ def test_invalid_colour_alignment_never_reaches_fusion(tmp_path):
         backend.fuse({}, {'selected_paths': paths}, output, tmp_path / 'work', OutputConfig(), threading.Event())
     assert runner.calls == 4
     assert not output.exists()
+    # Failed validation used to retain four full TIFF sets. The latest
+    # complete attempt remains available for diagnosis, plus the command log.
+    for level in (1, 2, 3):
+        assert not list((tmp_path / 'work' / f'alignment_level_{level}').glob('*.tif'))
+    assert len(list((tmp_path / 'work/alignment_level_4').glob('*.tif'))) == 2
 
 
 def test_alignment_validation_rejects_subject_ghost_despite_matching_dimensions(tmp_path):
@@ -205,3 +210,127 @@ def test_opencv_known_preview_transform_preserves_full_frame(tmp_path):
     assert actual.shape == pixels.shape
     assert np.abs(actual - pixels).mean() < 2
     assert "PREVIEW_REGISTRATION_REBUILT" not in result.diagnostics
+
+
+def test_superseded_tiff_release_respects_keep_marker_and_outside_paths(tmp_path):
+    work = tmp_path / 'work'
+    attempt = work / 'alignment_level_1'
+    attempt.mkdir(parents=True)
+    inside = attempt / 'aligned.tif'
+    outside = tmp_path / 'original.tif'
+    for path in (inside, outside):
+        Image.new('RGB', (16, 16)).save(path)
+    alignment = SimpleNamespace(work_dir=attempt, aligned_paths=[inside, outside])
+    backend = HuginEnfuseBackend()
+    marker = work / '.keep'
+    marker.touch()
+    backend._release_superseded_tiffs(alignment, work)
+    assert inside.exists() and outside.exists()
+    marker.unlink()
+    backend._release_superseded_tiffs(alignment, work)
+    assert not inside.exists() and outside.exists()
+
+
+def test_validation_rgb_cache_is_released_as_focus_pass_consumes_frames(tmp_path):
+    from focus_stack_app.fusion.aligned_cache import AlignedTIFFImageCache
+    cache = AlignedTIFFImageCache(max_bytes=1024 ** 2, snapshot_fn=lambda: SimpleNamespace(
+        total_bytes=32 * 1024 ** 3, available_bytes=16 * 1024 ** 3))
+    path = tmp_path / 'frame.tif'
+    Image.new('RGB', (32, 24), (180, 35, 35)).save(path)
+    cache.validation_previews(path)
+    assert cache.bytes_used == 32 * 24 * 3
+    first = cache.load(path)
+    assert cache.bytes_used == 0 and not cache.frames
+    np.testing.assert_array_equal(cache.load(path), first)
+
+
+@pytest.mark.parametrize('shift', [0, 12])
+def test_alignment_distinguishes_defocus_outline_changes_from_real_translation(tmp_path, shift):
+    import cv2
+    from focus_stack_app.fusion.alignment_quality import colour_subject_mask, colour_subject_mismatch
+    sharp = np.full((480, 640, 3), 220, np.uint8)
+    sharp[60:420, 250:330] = (150, 70, 70)
+    blurred = cv2.GaussianBlur(sharp, (0, 0), 8)
+    if shift:
+        blurred = cv2.warpAffine(blurred, np.float32([[1, 0, shift], [0, 1, 0]]),
+                                 (640, 480), borderValue=(220, 220, 220))
+    assert colour_subject_mismatch(colour_subject_mask(sharp), colour_subject_mask(blurred))
+    paths = [tmp_path / 'sharp.tif', tmp_path / 'blurred.tif']
+    for path, pixels in zip(paths, (sharp, blurred)):
+        Image.fromarray(pixels).save(path)
+    alignment = SimpleNamespace(input_paths=paths, aligned_paths=paths)
+    backend = HuginEnfuseBackend()
+    if shift:
+        with pytest.raises(AlignmentError, match='主体对齐检查未通过'):
+            backend._validate_alignment(alignment, paths[0])
+    else:
+        crop, notes = backend._validate_alignment(alignment, paths[0])
+        assert crop == 1.0
+        assert 'DEFOCUS_GEOMETRY_CONFIRMED:1' in notes
+
+
+def test_retry_uses_recorded_capture_order_before_lens_distortion(tmp_path):
+    import threading
+    paths = [tmp_path / name for name in ('DSC9999.jpg', 'DSC0001.jpg', 'DSC0003.jpg')]
+    for path in paths:
+        Image.new('RGB', (100, 100), 'white').save(path)
+    commands = []
+    class Runner:
+        def run(self, command, **kwargs):
+            commands.append(command)
+            if len(commands) == 1:
+                return CommandResult(tuple(command), 1, stderr='not enough control points')
+            prefix = command[command.index('-a') + 1]
+            for index in range(3):
+                Image.new('RGB', (100, 100), 'white').save(f'{prefix}{index:04d}.tif')
+            return CommandResult(tuple(command), 0)
+    class Fusion:
+        def fuse(self, paths, output_path, **kwargs):
+            Image.new('RGB', (100, 100), 'white').save(output_path)
+            return SimpleNamespace(output_path=Path(output_path))
+    backend = HuginEnfuseBackend(AlignImageStack('align.exe', runner=Runner()), Fusion())
+    tour = [paths[0], paths[2], paths[1]]
+    result = backend.fuse({}, {'selected_paths': paths, 'alignment_order': tour,
+                             'capture_order': paths}, tmp_path / 'result.jpg',
+                          tmp_path / 'work', OutputConfig(), threading.Event())
+    assert commands[0][-3:] == list(map(str, tour))
+    assert commands[1][-3:] == list(map(str, paths))
+    assert '--corr=0.8' not in commands[1] and '-d' not in commands[1]
+    assert result.actual_hugin_input_order == tuple(paths)
+    assert 'ALIGNMENT_CAPTURE_ORDER_RETRY' in result.diagnostics
+
+
+@pytest.mark.parametrize('count, capture_kind', [(20, 'complete'), (21, 'complete'),
+                                               (55, 'complete'), (21, 'missing'),
+                                               (21, 'incomplete'), (21, 'duplicate')])
+def test_large_stacks_prefer_complete_capture_order(tmp_path, count, capture_kind):
+    import threading
+    # Numbering wraps; recorded chronology, not a filename sort, is authoritative.
+    paths = [tmp_path / f'DSC{(9999 + index) % 10000:04d}.jpg' for index in range(count)]
+    for path in paths:
+        Image.new('RGB', (32, 32), 'white').save(path)
+    tour = paths[::2] + paths[1::2]
+    capture = [tmp_path / 'unselected.jpg', *paths]
+    if capture_kind == 'missing':
+        capture = []
+    elif capture_kind == 'incomplete':
+        capture = paths[:-1]
+    elif capture_kind == 'duplicate':
+        capture = paths[:-1] + [paths[0]]
+    calls = []
+    class Aligner:
+        def align(self, inputs, **kwargs):
+            calls.append(list(inputs))
+            return SimpleNamespace(input_paths=tuple(inputs), aligned_paths=tuple(inputs))
+    class Fusion:
+        def fuse(self, inputs, output_path, **kwargs):
+            Image.new('RGB', (32, 32), 'white').save(output_path)
+            return SimpleNamespace(output_path=Path(output_path))
+    result = HuginEnfuseBackend(Aligner(), Fusion()).fuse(
+        {}, {'selected_paths': paths, 'alignment_order': tour, 'capture_order': capture},
+        tmp_path / 'result.jpg', tmp_path / 'work', OutputConfig(), threading.Event())
+    primary = count > 20 and capture_kind == 'complete'
+    expected = paths if primary else tour
+    assert calls == [expected]
+    assert result.actual_hugin_input_order == tuple(expected)
+    assert ('ALIGNMENT_CAPTURE_ORDER_PRIMARY' in result.diagnostics) == primary
