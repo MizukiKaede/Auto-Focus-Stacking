@@ -74,7 +74,7 @@ class GroupAnalyzerConfig:
     duplicate_focus_threshold: float = 0.995
     minimum_stack_images: int = 2
     # Groups below this threshold are classified before any pixel decoding.
-    minimum_stack_group_size: int = 3
+    minimum_stack_group_size: int = 4
     # A zero threshold disables the application-level stability gate for
     # callers that use the core analyzer as a library.
     minimum_stack_stability: float = 0.0
@@ -607,10 +607,10 @@ class GroupAnalyzer:
         self.plan_cache = plan_cache
         self.logger = logger or logging.getLogger(__name__)
         self.loader = loader
-        if focus_analysis_workers is not None and not 1 <= int(focus_analysis_workers) <= 8:
-            raise ValueError("focus_analysis_workers must be between 1 and 8")
-        if focus_analysis_workers_requested is not None and not 0 <= int(focus_analysis_workers_requested) <= 8:
-            raise ValueError("focus_analysis_workers_requested must be between 0 and 8")
+        if focus_analysis_workers is not None and not 1 <= int(focus_analysis_workers) <= 10:
+            raise ValueError("focus_analysis_workers must be between 1 and 10")
+        if focus_analysis_workers_requested is not None and not 0 <= int(focus_analysis_workers_requested) <= 10:
+            raise ValueError("focus_analysis_workers_requested must be between 0 and 10")
         self.focus_analysis_workers = None if focus_analysis_workers is None else int(focus_analysis_workers)
         self.focus_analysis_workers_requested = (
             None

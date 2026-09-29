@@ -40,14 +40,14 @@ def test_manual_budget_is_an_upper_bound_and_low_memory_degrades_to_one():
 
 
 def test_focus_worker_options_validate_and_config_roundtrips(tmp_path):
-    options = ApplicationOptions("in", "out", focus_analysis_workers=6)
-    assert options.focus_analysis_workers == 6
+    options = ApplicationOptions("in", "out", focus_analysis_workers=10)
+    assert options.focus_analysis_workers == 10
     with pytest.raises(ValueError, match="focus_analysis_workers"):
-        ApplicationOptions("in", "out", focus_analysis_workers=9)
-    config = AppConfig(runtime=RuntimeConfig(focus_analysis_workers=7))
+        ApplicationOptions("in", "out", focus_analysis_workers=11)
+    config = AppConfig(runtime=RuntimeConfig(focus_analysis_workers=10))
     path = tmp_path / "config.json"
     config.save(path)
-    assert AppConfig.load(path).runtime.focus_analysis_workers == 7
+    assert AppConfig.load(path).runtime.focus_analysis_workers == 10
 
 
 def test_opencv_thread_budget_restores_previous_value():

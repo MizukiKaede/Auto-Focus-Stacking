@@ -43,7 +43,7 @@ class AnalysisConfig:
     minimum_stack_images: int = 2
     # Short bursts are more likely to be accidental duplicates than a full
     # focus bracket.  They remain classified but never invoke fusion.
-    minimum_stack_group_size: int = 3
+    minimum_stack_group_size: int = 4
     # Scene grouping can tolerate a brief interruption while discovering a
     # sequence.  Fusion cannot: every adjacent frame must remain this close
     # in low-frequency structure, otherwise the group is an action/change
@@ -135,9 +135,9 @@ class OutputConfig:
 class RuntimeConfig:
     """Concurrency, safety and external-tool settings."""
 
-    max_hugin_workers: int = 1
+    max_hugin_workers: int = 3
     parallel_pipeline: bool = True
-    preserve_cache: bool = True
+    preserve_cache: bool = False
     min_available_memory_bytes: int = 2 * 1024**3
     min_available_memory_fraction: float = 0.10
     disk_safety_margin_bytes: int = 2 * 1024**3
@@ -157,10 +157,10 @@ class RuntimeConfig:
     aligned_tiff_cache_bytes: int = 512 * 1024**2
 
     def __post_init__(self) -> None:
-        if not 1 <= int(self.max_hugin_workers) <= 2:
-            raise ValueError("max_hugin_workers must be 1 or 2")
-        if not 0 <= int(self.focus_analysis_workers) <= 8:
-            raise ValueError("focus_analysis_workers must be between 0 and 8")
+        if not 1 <= int(self.max_hugin_workers) <= 6:
+            raise ValueError("max_hugin_workers must be between 1 and 6")
+        if not 0 <= int(self.focus_analysis_workers) <= 10:
+            raise ValueError("focus_analysis_workers must be between 0 and 10")
         self.focus_analysis_workers = int(self.focus_analysis_workers)
         if self.min_available_memory_bytes < 0:
             raise ValueError("min_available_memory_bytes cannot be negative")

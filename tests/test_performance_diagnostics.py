@@ -72,15 +72,15 @@ def test_merge_workers_ui_reaches_controller(tmp_path):
     try:
         window.source_edit.setText(str(tmp_path))
         window.output_edit.setText(str(tmp_path / "out"))
-        assert window.merge_workers_spin.value() == 1
-        window.merge_workers_spin.setValue(2)
-        window.focus_analysis_workers_spin.setValue(6)
+        assert window.merge_workers_spin.value() == 3
+        window.merge_workers_spin.setValue(6)
+        window.focus_analysis_workers_spin.setValue(10)
         controller = default_controller_factory(**window._settings())
         try:
-            assert controller.options.merge_workers == 2
-            assert controller.options.focus_analysis_workers == 6
-            assert controller.config.runtime.max_hugin_workers == 2
-            assert controller.config.runtime.focus_analysis_workers == 6
+            assert controller.options.merge_workers == 6
+            assert controller.options.focus_analysis_workers == 10
+            assert controller.config.runtime.max_hugin_workers == 6
+            assert controller.config.runtime.focus_analysis_workers == 10
         finally:
             controller.close()
     finally:
