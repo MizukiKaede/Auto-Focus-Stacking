@@ -44,3 +44,24 @@ def test_source_picker_defaults_output_folders_inside_source(tmp_path, monkeypat
     finally:
         window.close()
         app.processEvents()
+
+
+def test_experimental_picker_uses_hugin_backend(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    try:
+        window.source_edit.setText(str(tmp_path))
+        window.output_edit.setText(str(tmp_path / 'out'))
+        assert window.backend_combo.currentData() == 'quality'
+        index = window.backend_combo.findData('hugin_enfuse')
+        assert index >= 0
+        assert '实验模式' in window.backend_combo.itemText(index)
+        window.backend_combo.setCurrentIndex(index)
+        controller = default_controller_factory(**window._settings())
+        try:
+            assert controller.options.fusion_backend == 'hugin_enfuse'
+        finally:
+            controller.close()
+    finally:
+        window.close()
+        app.processEvents()

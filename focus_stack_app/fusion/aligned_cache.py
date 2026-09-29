@@ -128,6 +128,12 @@ class AlignedFrameCache:
             self.peak_bytes = max(self.peak_bytes, self.bytes_used)
         return image
 
+    def peek(self, index):
+        """Read an aligned frame without consuming or duplicating a cached copy."""
+        self._check_memory()
+        image = self.frames.get(index)
+        return image if image is not None else self.loader(index)
+
     def for_blend(self, index):
         self._check_memory()
         image = self.frames.pop(index, None)

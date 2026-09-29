@@ -1,4 +1,4 @@
-"""Standard Hugin/Enfuse and experimental OpenCV fusion backends."""
+"""The production quality backend and the experimental Hugin backend."""
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -7,11 +7,11 @@ import logging
 import math
 from pathlib import Path
 import threading
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 from ..hugin.align import AlignConfig, AlignImageStack, AlignmentError, AlignmentResult
 from ..hugin.enfuse import Enfuser
-from ..hugin.output_encoder import encode_output, encode_image_output, OutputCollisionError, _same_path
+from ..hugin.output_encoder import encode_image_output, OutputCollisionError, _same_path
 from ..hugin.hugin_locator import HuginToolNotFound
 from ..utils.image_io import load_rgb
 
@@ -296,8 +296,7 @@ class HuginEnfuseBackend(FusionBackend):
         )
         return FusionResult(
             final, self.name, tuple(alignment.aligned_paths), level, "VALIDATED", crop_ratio,
-            # Alignment levels are retries inside the requested backend, not
-            # a silent backend fallback to OpenCV.
+            # Alignment levels are retries inside the requested backend.
             fallback_used=False, diagnostics=tuple(diagnostics),
             hugin_command=tuple(getattr(alignment_command, "command", ())),
             hugin_exit_code=getattr(alignment_command, "returncode", None),
@@ -307,9 +306,10 @@ class HuginEnfuseBackend(FusionBackend):
         )
 
 
-class OpenCVFusionBackend(FusionBackend):
-    """Fast experimental whole-frame focus fusion."""
-    name = "opencv"
+class QualityFusionBackend(FusionBackend):
+    """Full-resolution, in-memory focus fusion with coherent neutral edges."""
+
+    name = "quality"
 
     def __init__(self, *, aligned_cache_bytes=None):
         from .aligned_cache import DEFAULT_ALIGNED_CACHE_BYTES
@@ -328,9 +328,9 @@ class OpenCVFusionBackend(FusionBackend):
         analysis_shapes = list(_value(analysis, "analysis_shapes", ()))
         reference_index = int(_value(analysis, "preview_reference_index", indices[0] if indices else 0))
         if len(paths) < 2:
-            raise ValueError("OpenCV fusion requires at least two selected images")
+            raise ValueError("Quality fusion requires at least two selected images")
         if len(indices) != len(paths) or any(index < 0 for index in indices):
-            raise ValueError("OpenCV selected indices must match selected paths")
+            raise ValueError("Quality selected indices must match selected paths")
         reference_path = Path(_value(analysis, "preview_reference", paths[0]))
         destination = Path(output_path)
         if any(_same_path(path, destination) for path in [*paths, reference_path]):
@@ -357,7 +357,7 @@ class OpenCVFusionBackend(FusionBackend):
             reference_analysis_shape = ref.shape[:2]
             for index, path in zip(indices, paths):
                 if cancel_event.is_set():
-                    raise RuntimeError("OpenCV fusion cancelled")
+                    raise RuntimeError("Quality fusion cancelled")
                 if path.resolve() == reference_path.resolve():
                     preview = ref
                     matrix = np.eye(3, dtype=np.float32)
@@ -365,7 +365,7 @@ class OpenCVFusionBackend(FusionBackend):
                     preview = load_rgb(path, 640)
                     registration = register_images(ref, preview)
                     if not registration.valid:
-                        raise RuntimeError(f"OpenCV could not rebuild alignment for {path}: {registration.message}")
+                        raise RuntimeError(f"Quality fusion could not rebuild alignment for {path}: {registration.message}")
                     matrix = registration.matrix
                 transforms[index] = matrix
                 analysis_shapes[index] = preview.shape[:2]
@@ -382,6 +382,7 @@ class OpenCVFusionBackend(FusionBackend):
             return analysis_to_target @ matrix @ source_to_analysis
 
         from .focus_masks import build_focus_labels, blend_focus_pyramid
+        from .quality_fusion import stabilize_neutral_labels
         from .aligned_cache import AlignedFrameCache
 
         with Image.open(reference_path) as reference_image:
@@ -407,59 +408,23 @@ class OpenCVFusionBackend(FusionBackend):
         )
         try:
             labels = build_focus_labels(len(paths), cache.for_focus, cancel_event=cancel_event)
+            if cancel_event.is_set():
+                raise RuntimeError("Quality fusion cancelled")
+            labels = stabilize_neutral_labels(labels, cache.peek(0))
             result = blend_focus_pyramid(len(paths), cache.for_blend, labels, cancel_event=cancel_event)
         finally:
             cache.clear()
         del labels
         if cancel_event.is_set():
-            raise RuntimeError("OpenCV fusion cancelled")
+            raise RuntimeError("Quality fusion cancelled")
         with Image.fromarray(result) as image:
             final = encode_image_output(image, output_path, config=output_config, original_path=reference_path)
-        diagnostics = ("EXPERIMENTAL_BACKEND", "FULL_RESOLUTION_FOCUS_MASKS", "CONVEX_FOCUS_BLEND",
-                       f"ALIGNED_CACHE_HITS:{cache.hits}/{len(paths)}",
+        diagnostics = ("FULL_RESOLUTION_PREVIEW_ALIGNMENT", "NEUTRAL_EDGE_COHERENCE",
+                       "CONVEX_FOCUS_BLEND", f"ALIGNED_CACHE_HITS:{cache.hits}/{len(paths)}",
                        f"ALIGNED_CACHE_PEAK_BYTES:{cache.peak_bytes}")
         if rebuilt_registration:
             diagnostics += ("PREVIEW_REGISTRATION_REBUILT",)
         return FusionResult(Path(final), self.name, alignment_status="PREVIEW_TRANSFORMS", diagnostics=diagnostics)
 
 
-class LegacyWholeFrameBackend(FusionBackend):
-    """Opt-in adapter for the original renderer; never an automatic fallback.
-
-    Interface retained for comparisons:
-    StackMergeService(..., fusion_backend=LegacyWholeFrameBackend()).
-    Default construction still selects HuginEnfuseBackend and its existing
-    alignment order, retry and export workflow.
-    """
-    name = "legacy_whole_frame"
-
-    def fuse(self, group, analysis, output_path, work_dir, output_config, cancel_event) -> FusionResult:
-        import cv2
-        import numpy as np
-        from .legacy_whole_frame import render_plan
-
-        # Generic analysis publishes source-to-reference homogeneous matrices;
-        # the original renderer expects reference-to-source affine matrices.
-        paths = list(_value(analysis, "capture_order", ()))
-        reference = str(_value(analysis, "preview_reference", ""))
-        selected = [str(path) for path in _value(analysis, "selected_paths", ())]
-        transforms = _value(analysis, "preview_transforms", ())
-        original_paths = [str(_value(row, "path")) for row in _value(analysis, "per_image", ())]
-        if original_paths:
-            paths = original_paths
-        if not paths or reference not in paths or len(transforms) != len(paths):
-            raise ValueError("legacy fusion requires original-order paths and preview transforms")
-        plan = {
-            "paths": paths, "reference_index": paths.index(reference),
-            "selected_indices": [paths.index(path) for path in selected],
-            "preview_shape": _value(analysis, "reference_analysis_shape"),
-            "matrices": [cv2.invertAffineTransform(np.asarray(matrix, np.float32)[:2]).tolist()
-                         for matrix in transforms],
-        }
-        intermediate = render_plan(plan, Path(work_dir) / "legacy_whole_frame.tif", cancel_event=cancel_event)
-        final = encode_output(intermediate, output_path, config=output_config)
-        return FusionResult(Path(final), self.name, alignment_status="PREVIEW_TRANSFORMS",
-                            diagnostics=("LEGACY_WHOLE_FRAME_OPT_IN",))
-
-
-__all__ = ["FusionBackend", "FusionResult", "HuginEnfuseBackend", "OpenCVFusionBackend", "LegacyWholeFrameBackend"]
+__all__ = ["FusionBackend", "FusionResult", "HuginEnfuseBackend", "QualityFusionBackend"]

@@ -42,7 +42,7 @@ class AnalysisConfig:
     # turn an entire captured bracket into ``NO_MERGE``.
     minimum_stack_images: int = 2
     # Short bursts are more likely to be accidental duplicates than a full
-    # focus bracket.  They remain classified but never invoke Hugin.
+    # focus bracket.  They remain classified but never invoke fusion.
     minimum_stack_group_size: int = 3
     # Scene grouping can tolerate a brief interruption while discovering a
     # sequence.  Fusion cannot: every adjacent frame must remain this close
@@ -144,7 +144,7 @@ class RuntimeConfig:
     hugin_bin: str | None = None
     align_image_stack_path: str | None = None
     enfuse_path: str | None = None
-    fusion_backend: str = "hugin_enfuse"
+    fusion_backend: str = "quality"
     crop_ratio_warning: float = 0.65
     crop_ratio_fail: float = 0.35
     crop_ratio_max: float = 1.75
@@ -168,9 +168,8 @@ class RuntimeConfig:
             raise ValueError("min_available_memory_fraction must be between 0 and 1")
         if self.disk_safety_margin_bytes < 0:
             raise ValueError("disk_safety_margin_bytes cannot be negative")
-        self.fusion_backend = str(self.fusion_backend).strip().casefold()
-        if self.fusion_backend not in {"hugin_enfuse", "opencv"}:
-            raise ValueError("fusion_backend must be hugin_enfuse or opencv")
+        from .fusion_modes import normalize_fusion_backend
+        self.fusion_backend = normalize_fusion_backend(self.fusion_backend)
         if not 0 < float(self.crop_ratio_fail) <= float(self.crop_ratio_warning) <= 1:
             raise ValueError("crop ratio thresholds must satisfy 0 < fail <= warning <= 1")
         if float(self.crop_ratio_max) < 1:

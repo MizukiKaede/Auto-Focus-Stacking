@@ -1123,7 +1123,7 @@ class GroupAnalyzer:
         selected_paths = [str(paths[index]) for index in selected_indices]
 
         # The established ECC matrices use inverse-warp convention. Publish
-        # source -> reference matrices for the generic experimental backend.
+        # source-to-reference matrices for the quality backend.
         transforms: list[Any] = []
         for matrix in plan["matrices"]:
             affine = cv2.invertAffineTransform(np.asarray(matrix, np.float32))
@@ -1501,7 +1501,7 @@ class GroupAnalyzer:
         scene_scores: list[float | None] = [None] * total
         # Reference choice is a separate whole-group pre-registration stage.
         # It deliberately precedes focus-map construction and is not reused as
-        # the later Hugin input-order decision.
+        # the later fusion input-order decision.
         from .alignment_order import choose_preview_reference
         preview_edge = int(_setting(self.config, "scene_preview_long_edge", 512, "preview_long_edge"))
         preview_images: list[Any | None] = []
@@ -1774,7 +1774,7 @@ class GroupAnalyzer:
         }
         alignment_order_indices = list(order_result["alignment_order"])
         # Any selected image whose preview failed remains eligible and is
-        # appended in SQLite capture order; Hugin can still attempt it.
+        # appended in SQLite capture order; the selected backend can still attempt it.
         missing_order = [index for index in selected_indices if index not in alignment_order_indices]
         missing_order.sort(key=lambda index: (
             _item_value(items[index], "sequence_index", default=index) is None,

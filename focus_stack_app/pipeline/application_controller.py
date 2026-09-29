@@ -3,7 +3,7 @@
 The lower-level pipeline intentionally knows nothing about folders, cache
 layout, or Qt.  ``ApplicationController`` is the small adapter which joins
 those concerns together while keeping all scanning, decoding, persistence,
-archive I/O, and Hugin work on a background thread.  It is also useful from a
+archive I/O, and fusion work on a background thread.  It is also useful from a
 headless script: every expensive dependency can be injected with a test
 double without importing PySide6 or decoding an image.
 """
@@ -72,7 +72,7 @@ class ApplicationOptions:
     archive_enabled: bool = False
     minimum_stack_group_size: int = 3
     grouping_pause_seconds: int = 20
-    fusion_backend: str = "hugin_enfuse"
+    fusion_backend: str = "quality"
     output_format: str = "jpg"
     parallel: bool = True
     preserve_cache: bool = True
@@ -97,11 +97,8 @@ class ApplicationOptions:
         self.output_format = str(getattr(self.output_format, "value", self.output_format)).lower().lstrip(".")
         if self.output_format not in {"jpg", "jpeg", "tif", "tiff"}:
             raise ValueError("output_format must be jpg, jpeg, tif, or tiff")
-        self.fusion_backend = str(self.fusion_backend or "hugin_enfuse").strip().casefold()
-        aliases = {"standard": "hugin_enfuse", "hugin": "hugin_enfuse", "experimental": "opencv", "fast": "opencv"}
-        self.fusion_backend = aliases.get(self.fusion_backend, self.fusion_backend)
-        if self.fusion_backend not in {"hugin_enfuse", "opencv"}:
-            raise ValueError("fusion_backend must be hugin_enfuse or opencv")
+        from ..fusion_modes import normalize_fusion_backend
+        self.fusion_backend = normalize_fusion_backend(self.fusion_backend)
         self.minimum_stack_group_size = int(self.minimum_stack_group_size)
         if not 2 <= self.minimum_stack_group_size <= 1000:
             raise ValueError("minimum_stack_group_size must be between 2 and 1000")
@@ -1214,7 +1211,7 @@ class ApplicationController:
 
         message = (
             f"场景预览失败：{type(error).__name__}: {error}；"
-            "已降级为逐张归档组，不会调用 Hugin。"
+            "已降级为逐张归档组，不会执行合成。"
         )
         self._event_errors += 1
         self._diagnostics.append(message)
@@ -1596,14 +1593,6 @@ class ApplicationController:
         )
         return self._merge_service
 
-    def _candidate_needs_hugin(self, groups: Sequence[Any]) -> bool:
-        for group in groups:
-            values = _items_for_group(group)
-            count = _mapping_value(group, "image_count", default=None)
-            if len(values) > 1 or (count is not None and int(count or 0) > 1):
-                return True
-        return False
-
     def _build_coordinator(self, analyzer: Any, merger: Any) -> Any:
         if self._coordinator is not None:
             coordinator = self._coordinator
@@ -1656,7 +1645,7 @@ class ApplicationController:
             records: list[Any] = []
             if recovery_groups:
                 # A MOVE can leave the source directory empty after a clean
-                # archive but before Hugin starts.  Rebuild the batch from DB
+                # archive but before fusion starts.  Rebuild the batch from DB
                 # rows instead of asking the scanner to rediscover vanished
                 # originals.
                 seen_images: set[str] = set()

@@ -1,4 +1,4 @@
-"""Merge consumer and the default Hugin -> Enfuse -> archive service."""
+"""Merge consumer and image fusion service."""
 
 from __future__ import annotations
 
@@ -19,7 +19,8 @@ from ..hugin.align import AlignImageStack, AlignmentError
 from ..hugin.enfuse import Enfuser, EnfuseError
 from ..hugin.hugin_locator import HuginToolNotFound
 from ..hugin.output_encoder import OutputConfig, OutputFormat, output_path_for
-from ..fusion.backends import FusionBackend, HuginEnfuseBackend, OpenCVFusionBackend
+from ..fusion.backends import FusionBackend, HuginEnfuseBackend, QualityFusionBackend
+from ..fusion_modes import normalize_fusion_backend
 from .analysis_worker import AnalysisJob
 from .events import PipelineEvent, PipelineStage
 from .job_queue import BoundedJobQueue, QueueClosed
@@ -41,7 +42,7 @@ class MergeResult:
     all_paths: tuple[Path, ...] = ()
     selected_source_paths: tuple[Path, ...] = ()
     first_original: Path | None = None
-    requested_backend: str = "hugin_enfuse"
+    requested_backend: str = "quality"
     actual_backend: str | None = None
     fallback_used: bool = False
     alignment_level: int | None = None
@@ -165,8 +166,7 @@ def extract_image_paths(group: Any, analysis: Any = None) -> tuple[list[Path], l
                 # A cached analysis may retain an original_path string while
                 # the corresponding ImageRecord has already been archived and
                 # now exposes only its current_path.  Resolve that evidence
-                # against the current group objects before handing paths to
-                # Hugin.
+                # against the current group objects before fusion.
                 raw_key = os.path.normcase(os.path.abspath(os.fspath(path)))
                 for item, current in zip(items, paths):
                     alternatives = [
@@ -205,7 +205,7 @@ def extract_image_paths(group: Any, analysis: Any = None) -> tuple[list[Path], l
         selected = list(paths)
 
     # De-duplicate paths but preserve the selection order supplied by the
-    # algorithm; Hugin receives the algorithm's focus-transition order.
+    # algorithm; every backend receives that same focus-transition order.
     def unique(values: Iterable[Path]) -> list[Path]:
         seen: set[str] = set()
         result: list[Path] = []
@@ -295,12 +295,11 @@ def _invoke(callback: Callable[..., Any], job: AnalysisJob, *, cancel_event: thr
 
 
 class StackMergeService:
-    """Default per-group service: align selected -> Enfuse -> optional archive.
+    """Fuse the selected frames, publish the result, then optionally archive.
 
     Original files are not handed to the archiver until the fused output has
     been published successfully.  This ordering is intentional: a missing
-    Hugin installation, an alignment error, or a fusion error must leave the
-    source folder untouched.
+    An alignment or fusion error must leave the source folder untouched.
     """
 
     def __init__(
@@ -321,7 +320,7 @@ class StackMergeService:
         align_image_stack_path: os.PathLike[str] | str | None = None,
         enfuse_path: os.PathLike[str] | str | None = None,
         manifest_writer: Any | None = None,
-        fusion_backend: str | FusionBackend = "hugin_enfuse",
+        fusion_backend: str | FusionBackend = "quality",
         minimum_stack_group_size: int = 3,
         logger: logging.Logger | None = None,
     ):
@@ -372,9 +371,16 @@ class StackMergeService:
             if enfuse_path is not None
             else runtime_value("enfuse_path", "enfuse", "enfuse_executable")
         )
-        self.aligner = aligner or AlignImageStack(align_path or hugin_root, logger=self.logger)
-        self.enfuser = enfuser or Enfuser(enfuse_executable or hugin_root, logger=self.logger)
+        requested = (fusion_backend.name if isinstance(fusion_backend, FusionBackend)
+                     else normalize_fusion_backend(fusion_backend))
+        create_hugin_backend = not isinstance(fusion_backend, FusionBackend) and requested == "hugin_enfuse"
+        self.aligner = (aligner or AlignImageStack(align_path or hugin_root, logger=self.logger)
+                        if create_hugin_backend else aligner)
+        self.enfuser = (enfuser or Enfuser(enfuse_executable or hugin_root, logger=self.logger)
+                        if create_hugin_backend else enfuser)
         for component in (self.aligner, self.enfuser):
+            if component is None:
+                continue
             try:
                 component.logger = self.logger
                 runner = getattr(component, "runner", None)
@@ -389,15 +395,15 @@ class StackMergeService:
             self.backend = fusion_backend
             self.requested_backend = fusion_backend.name
         else:
-            self.requested_backend = str(fusion_backend or "hugin_enfuse").casefold()
-            if self.requested_backend == "opencv":
-                self.backend = OpenCVFusionBackend(aligned_cache_bytes=runtime_value("opencv_aligned_cache_bytes"))
+            self.requested_backend = requested
+            if self.requested_backend == "quality":
+                self.backend = QualityFusionBackend(aligned_cache_bytes=runtime_value("opencv_aligned_cache_bytes"))
             elif self.requested_backend == "hugin_enfuse":
                 self.backend = HuginEnfuseBackend(
                     self.aligner, self.enfuser, runtime_config=runtime, logger=self.logger,
                 )
             else:
-                raise ValueError("fusion_backend must be hugin_enfuse or opencv")
+                raise ValueError("fusion_backend must be quality or hugin_enfuse")
         self.repository = repository
         self.cache_dir = Path(cache_dir) if cache_dir is not None else self.output_dir / ".stack_cache"
         if manifest_writer is None:
@@ -620,7 +626,7 @@ class StackMergeService:
         archive = None
         if self.archive_enabled:
             # Archive every original in the scene only after the composite
-            # exists. Selected paths drive Hugin; all_paths is the complete
+            # exists. Selected paths drive fusion; all_paths is the complete
             # source set.
             _set_group_state(self.repository, group, "ARCHIVING", output_path=str(fused_path))
             archive, destinations = self._archive_map(all_objects, all_paths)
@@ -669,7 +675,7 @@ class StackMergeService:
 
 
 class MergeWorker(threading.Thread):
-    """Consume analysis jobs serially (one Hugin process by default)."""
+    """Consume analysis jobs and run the selected fusion backend."""
 
     def __init__(
         self,
@@ -681,7 +687,7 @@ class MergeWorker(threading.Thread):
         repository: Any | None = None,
         total: int = 0,
         # In coordinator serial mode workers start early solely to drain the
-        # bounded queue.  They defer invoking Hugin until this event is set,
+        # bounded queue.  They defer fusion until this event is set,
         # which removes the producer-join deadlock without changing the
         # requested serial processing semantics.
         defer_until: threading.Event | None = None,
@@ -853,8 +859,8 @@ class MergeWorker(threading.Thread):
                 failure_state,
                 error=exc,
                 analysis=job.analysis,
-                requested_backend=str(getattr(self.merger, "requested_backend", "hugin_enfuse")),
-                actual_backend=str(getattr(self.merger, "requested_backend", "hugin_enfuse")),
+                requested_backend=str(getattr(self.merger, "requested_backend", "quality")),
+                actual_backend=str(getattr(self.merger, "requested_backend", "quality")),
                 fallback_used=False,
                 diagnostics=(str(exc),),
             )
@@ -872,7 +878,7 @@ class MergeWorker(threading.Thread):
             self.merge_queue.task_done()
 
     def _process_with_memory_guard(self, job: AnalysisJob) -> bool:
-        """Wait before a Hugin/Enfuse job; archive-only jobs stay cancellable."""
+        """Wait before fusion; archive-only jobs stay cancellable."""
 
         if self.cancel_event.is_set():
             return False

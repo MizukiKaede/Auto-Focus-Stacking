@@ -156,6 +156,7 @@ class PipelineRecoveryTests(unittest.TestCase):
                 archiver=FileArchiver(output, ArchiveMode.MOVE, repository=proxy),
                 aligner=aligner,
                 enfuser=enfuser,
+                fusion_backend="hugin_enfuse",
                 repository=proxy,
             )
             try:
@@ -270,6 +271,7 @@ class PipelineRecoveryTests(unittest.TestCase):
                     output,
                     aligner=aligner,
                     enfuser=enfuser,
+                    fusion_backend="hugin_enfuse",
                     logger=controller.logger,
                 )
                 self.assertIs(service.aligner.logger, controller.logger)

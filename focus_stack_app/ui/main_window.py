@@ -1,7 +1,7 @@
 """PySide6 main window for the Focus Stack V1 workflow.
 
 The window only collects options and starts an :class:`ApplicationController`.
-Scanner, OpenCV, SQLite writes, archive I/O, and Hugin execution are all
+Scanner, OpenCV, SQLite writes, archive I/O, and fusion are all
 performed by its worker thread; Qt receives immutable events through a queued
 signal bridge.
 """
@@ -224,9 +224,9 @@ try:  # PySide6 remains optional for headless tests and package imports.
 
             self.backend_combo = QComboBox()
             self.backend_combo.setObjectName("fusionBackend")
-            self.backend_combo.addItem("高质量合成（推荐）", "hugin_enfuse")
-            self.backend_combo.addItem("快速合成（实验）", "opencv")
-            self.backend_combo.setToolTip("高质量：Hugin + Enfuse；快速：OpenCV。所有引擎使用相同的自动分组、人工覆盖与智能选片。标准引擎失败时不会静默切换。")
+            self.backend_combo.addItem("高质量合成（推荐）", "quality")
+            self.backend_combo.addItem("实验模式（Hugin / Enfuse）", "hugin_enfuse")
+            self.backend_combo.setToolTip("高质量：全分辨率内存对齐与边缘一致性融合；实验：Hugin 对齐及 Enfuse 合成。两种模式使用相同的自动分组和智能选片。")
             self.backend_combo.setCurrentIndex(0)
             advanced_form.addRow("合成引擎", self.backend_combo)
 
@@ -282,23 +282,7 @@ try:  # PySide6 remains optional for headless tests and package imports.
             checks.addStretch(1)
             advanced_form.addRow("选项", checks)
 
-            # Optional executable overrides are plain text fields so the UI
-            # remains small and works with both a Hugin bin directory and
-            # separately installed tools.  Empty values use PATH discovery.
-            self.hugin_edit = QLineEdit()
-            self.hugin_edit.setObjectName("huginBin")
-            self.hugin_edit.setPlaceholderText("可选：Hugin bin 目录")
-            advanced_form.addRow("Hugin bin", self.hugin_edit)
-            self.align_edit = QLineEdit()
-            self.align_edit.setObjectName("alignImageStackPath")
-            self.align_edit.setPlaceholderText("可选：align_image_stack.exe")
-            advanced_form.addRow("align_image_stack", self.align_edit)
-            self.enfuse_edit = QLineEdit()
-            self.enfuse_edit.setObjectName("enfusePath")
-            self.enfuse_edit.setPlaceholderText("可选：enfuse.exe")
-            advanced_form.addRow("enfuse", self.enfuse_edit)
-            for edit in (self.source_edit, self.output_edit, self.archive_edit,
-                         self.hugin_edit, self.align_edit, self.enfuse_edit):
+            for edit in (self.source_edit, self.output_edit, self.archive_edit):
                 edit.setMinimumWidth(0)
                 edit.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
                 edit.textChanged.connect(edit.setToolTip)
@@ -385,9 +369,6 @@ try:  # PySide6 remains optional for headless tests and package imports.
                 "merge_workers": self.merge_workers_spin.value(),
                 "focus_analysis_workers": self.focus_analysis_workers_spin.value(),
                 "preserve_cache": self.cache_check.isChecked(),
-                "hugin_bin": self.hugin_edit.text().strip() or None,
-                "align_image_stack_path": self.align_edit.text().strip() or None,
-                "enfuse_path": self.enfuse_edit.text().strip() or None,
             }
 
         @staticmethod

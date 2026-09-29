@@ -200,6 +200,247 @@ def _local_boundary_detail(rgb, scale):
     return cv2.dilate(gx * gx + gy * gy, np.ones((2 * radius + 1,) * 2, np.uint8))
 
 
+class _CoherentNeutralEdges:
+    """Keep a dark object's rim on one frame when mask owners fragment."""
+
+    def __init__(self, reference):
+        gray = cv2.cvtColor(reference, cv2.COLOR_RGB2GRAY)
+        r, g, b = cv2.split(reference)
+        chroma = cv2.subtract(cv2.max(r, cv2.max(g, b)), cv2.min(r, cv2.min(g, b)))
+        coloured = np.uint8((chroma > 90) & ((gray > 110) | (r > 140)))
+        colour_count, colour_parts, colour_stats, _ = cv2.connectedComponentsWithStats(coloured)
+        large_colour = np.zeros(colour_count, np.uint8)
+        large_colour[1:] = colour_stats[1:, cv2.CC_STAT_AREA] >= max(
+            1000, round(gray.size * 0.002))
+        self.strong_colour = cv2.dilate(
+            large_colour[colour_parts], np.ones((41, 41), np.uint8))
+        self.colour_surfaces = []
+        self.pale_rims = []
+        for number in range(1, colour_count):
+            if colour_stats[number, cv2.CC_STAT_AREA] < max(10000, round(gray.size * 0.02)):
+                continue
+            material = np.uint8(colour_parts == number)
+            filled = _filled_chromatic_silhouette(material)
+            # Include white printing while leaving dark recesses at their
+            # own depth. Keep the original outer contour's edge decisions.
+            surface = np.uint8((material != 0) | ((filled != 0) & (gray > 160)))
+            surface = cv2.erode(surface, np.ones((11, 11), np.uint8))
+            tiles = []
+            for y in range(0, gray.shape[0], 256):
+                for x in range(0, gray.shape[1], 256):
+                    piece = surface[y:y + 256, x:x + 256] != 0
+                    if np.count_nonzero(piece) >= 1000:
+                        tiles.append((slice(y, y + 256), slice(x, x + 256), piece))
+            if len(tiles) >= 4:
+                self.colour_surfaces.append((surface, tiles, []))
+                # A translucent raised lip can focus well after the coloured
+                # body. Measure its inner line and outer texture separately;
+                # body texture must not choose the lip's focus plane.
+                upper = (filled != 0) & (np.pad(filled[:-1], ((1, 0), (0, 0))) == 0)
+                band = (cv2.dilate(np.uint8(upper), np.ones((61, 61), np.uint8)) != 0) & (filled == 0)
+                columns = np.count_nonzero(band, axis=0)
+                dark = np.count_nonzero(band & (gray < 130), axis=0)
+                exposed = (columns >= 5) & (dark / np.maximum(columns, 1) < 0.15)
+                if np.count_nonzero(exposed) >= 128:
+                    band &= exposed[None, :]
+                    distance = cv2.distanceTransform(np.uint8(filled == 0), cv2.DIST_L2, 5)
+                    near = band & (distance < 8)
+                    far = band & (distance >= 24) & (distance < 30)
+                    if np.count_nonzero(near) >= 1000 and np.count_nonzero(far) >= 1000:
+                        inner_band = near
+                        outer_band = band & (distance >= 18)
+                        self.pale_rims.append((band, near, far, inner_band, outer_band, [], []))
+        dark = np.uint8((gray < 130) & (chroma < 70))
+        dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+        count, components, stats, _ = cv2.connectedComponentsWithStats(dark)
+        self.regions = []
+        minimum = max(2000, round(gray.size * 0.005))
+        for number in range(1, count):
+            if stats[number, cv2.CC_STAT_AREA] < minimum:
+                continue
+            subject = np.uint8(components == number)
+            edge = cv2.morphologyEx(subject, cv2.MORPH_GRADIENT,
+                                    np.ones((5, 5), np.uint8))
+            outside = (cv2.dilate(subject, np.ones((23, 23), np.uint8)) != 0) & (subject == 0)
+            if not np.any(outside) or np.mean(gray[outside] > 175) < 0.2:
+                continue
+            if np.mean(chroma[outside] > 60) > 0.2:
+                continue
+            collar = cv2.dilate(edge, np.ones((41, 41), np.uint8)) != 0
+            outer = (cv2.dilate(subject, np.ones((111, 111), np.uint8)) != 0) & (
+                cv2.dilate(subject, np.ones((21, 21), np.uint8)) == 0)
+            outer &= self.strong_colour == 0
+            self.regions.append((subject, collar, outer, [], []))
+
+    def observe(self, rgb):
+        if not self.regions and not self.colour_surfaces and not self.pale_rims:
+            return
+        score = focus_response(rgb, support_radius=0)
+        for _, collar, outer, strengths, outer_strengths in self.regions:
+            strengths.append(float(np.mean(score[collar])))
+            outer_strengths.append(float(np.mean(score[outer])) if np.any(outer) else 0.0)
+        for _, tiles, strengths in self.colour_surfaces:
+            strengths.append([float(np.mean(score[y, x][piece]))
+                              for y, x, piece in tiles])
+        if self.pale_rims:
+            gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+            r, g, b = cv2.split(rgb)
+            chroma = cv2.subtract(cv2.max(r, cv2.max(g, b)), cv2.min(r, cv2.min(g, b)))
+            neutral = (gray >= 145) & (gray <= 210) & (chroma < 45)
+            for _, near, far, _, _, near_scores, far_scores in self.pale_rims:
+                inner = near & neutral
+                outer = far & neutral
+                near_scores.append(float(np.mean(score[inner])) if np.count_nonzero(inner) >= 100 else 0.0)
+                far_scores.append(float(np.mean(score[outer])) if np.count_nonzero(outer) >= 100 else 0.0)
+
+    @staticmethod
+    def _assign_pale_rim(labels, region_small, winner, load_aligned, dilation, blur,
+                         closing=11, limit_small=None, low_gray=95, high_gray=235):
+        size = (labels.shape[1], labels.shape[0])
+        region = cv2.resize(np.uint8(region_small), size, interpolation=cv2.INTER_NEAREST)
+        rgb = load_aligned(winner)
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        r, g, b = cv2.split(rgb)
+        chroma = cv2.subtract(cv2.max(r, cv2.max(g, b)), cv2.min(r, cv2.min(g, b)))
+        neutral = np.uint8((region != 0) & (gray >= low_gray) &
+                           (gray <= high_gray) & (chroma < 75))
+        neutral = cv2.morphologyEx(neutral, cv2.MORPH_CLOSE, np.ones((closing, closing), np.uint8))
+        neutral = cv2.dilate(neutral, np.ones((dilation, dilation), np.uint8))
+        selected = cv2.GaussianBlur(neutral.astype(np.float32), (0, 0), blur) >= 0.45
+        selected &= cv2.dilate(region, np.ones((dilation, dilation), np.uint8)) != 0
+        if limit_small is not None:
+            limit = cv2.resize(np.uint8(limit_small), size, interpolation=cv2.INTER_NEAREST)
+            selected &= limit != 0
+        labels[selected] = winner
+        return selected
+
+    def apply(self, labels, protected=None, *, gray_frames=None, load_aligned=None):
+        if not self.regions and not self.colour_surfaces and not self.pale_rims:
+            return protected
+        sample = (self.regions[0][0] if self.regions else
+                  self.colour_surfaces[0][0] if self.colour_surfaces else self.pale_rims[0][0])
+        small_size = (sample.shape[1], sample.shape[0])
+        small_labels = cv2.resize(labels, small_size, interpolation=cv2.INTER_NEAREST)
+        scale = max(labels.shape[1] / small_size[0], labels.shape[0] / small_size[1])
+        radius = max(18, round(90 / scale))
+        for subject, collar, _, strengths, outer_strengths in self.regions:
+            values = np.asarray(strengths, np.float32)
+            winner = int(np.argmax(values))
+            if values[winner] <= 1e-3:
+                continue
+            # A thin broken rim can be obvious even when it occupies only a
+            # small fraction of a long subject edge.
+            poor = values[small_labels[collar]] < 0.55 * values[winner]
+            if np.mean(poor) < 0.04:
+                continue
+            region = cv2.dilate(subject, np.ones((2 * radius + 1,) * 2, np.uint8))
+            # Keep the dark component itself where it enters a coloured
+            # handle; only its expanded fringe must avoid that handle.
+            region &= np.uint8((self.strong_colour == 0) | (subject != 0))
+            region = cv2.resize(region, (labels.shape[1], labels.shape[0]),
+                                interpolation=cv2.INTER_NEAREST) != 0
+            # A dark blue fringe can be classified as a coloured subject.
+            # The neutral connected body takes precedence there; saturated
+            # printed parts remain excluded by strong_colour above.
+            labels[region] = winner
+            rim_values = np.asarray(outer_strengths, np.float32)
+            rim_winner = int(np.argmax(rim_values))
+            if (rim_values[rim_winner] > 1.25 * rim_values[winner]
+                    and load_aligned is not None):
+                # A pale raised tooth can focus separately from the dark
+                # body. Find the body in its own sharp frame at full size,
+                # then let the crisp rim frame own only the exterior. Filling
+                # the body's contour avoids white holes inside its texture.
+                gray = None if gray_frames is None else gray_frames.get(winner)
+                if gray is None:
+                    gray = cv2.cvtColor(load_aligned(winner), cv2.COLOR_RGB2GRAY)
+                body = cv2.morphologyEx(np.uint8(gray < 130), cv2.MORPH_CLOSE,
+                                        np.ones((9, 9), np.uint8))
+                count, parts, _, _ = cv2.connectedComponentsWithStats(body)
+                if count > 1:
+                    reference = cv2.resize(subject, (labels.shape[1], labels.shape[0]),
+                                           interpolation=cv2.INTER_NEAREST) != 0
+                    overlap = np.bincount(parts[reference].ravel(), minlength=count)
+                    overlap[0] = 0
+                    match = int(np.argmax(overlap))
+                    if overlap[match] >= 0.3 * np.count_nonzero(reference):
+                        filled = _filled_chromatic_silhouette(np.uint8(parts == match))
+                        # Keep the dark-to-white inner edge on the body frame.
+                        # Only the genuinely pale raised rim needs the other
+                        # focus plane; a thin blue fringe is too narrow to
+                        # count as a separate rim.
+                        pale = np.uint8((gray >= 130) & (gray < 225) & (filled == 0))
+                        pale = cv2.morphologyEx(pale, cv2.MORPH_OPEN,
+                                                np.ones((9, 9), np.uint8))
+                        pale = cv2.dilate(pale, np.ones((51, 51), np.uint8))
+                        exterior = region & (filled == 0) & (pale != 0)
+                        labels[exterior] = rim_winner
+            if protected is None:
+                protected = region
+            else:
+                protected |= region
+        for surface, _, strengths in self.colour_surfaces:
+            tile_scores = np.asarray(strengths, np.float32)
+            local_best = np.maximum(np.max(tile_scores, axis=0), 1e-9)
+            coverage = np.mean(tile_scores >= 0.75 * local_best, axis=1)
+            winner = max(range(len(coverage)), key=lambda index: (
+                coverage[index], np.mean(tile_scores[index])))
+            if coverage[winner] < 0.8:
+                continue
+            active = surface != 0
+            neighbours = active[:, :-1] & active[:, 1:]
+            if not np.any(neighbours):
+                continue
+            fragmentation = np.mean(
+                small_labels[:, :-1][neighbours] != small_labels[:, 1:][neighbours])
+            if fragmentation < 0.04:
+                continue
+            region = cv2.resize(surface, (labels.shape[1], labels.shape[0]),
+                                interpolation=cv2.INTER_NEAREST) != 0
+            labels[region] = winner
+            if protected is None:
+                protected = region
+            else:
+                protected |= region
+        for band, near, far, inner_band, outer_band, near_scores, far_scores in self.pale_rims:
+            if load_aligned is None:
+                continue
+            inner_values = np.asarray(near_scores, np.float32)
+            outer_values = np.asarray(far_scores, np.float32)
+            inner_best = float(np.max(inner_values))
+            outer_best = float(np.max(outer_values))
+            if inner_best < 0.001 or outer_best < 0.001:
+                continue
+            inner_winner = int(np.argmax(inner_values))
+            balanced = np.minimum(inner_values / inner_best, outer_values / outer_best)
+            outer_winner = int(np.argmax(balanced))
+            if inner_winner == outer_winner or balanced[outer_winner] < 0.25:
+                continue
+            poor_inner = np.mean(inner_values[small_labels[near]] < 0.55 * inner_best)
+            poor_outer = np.mean(outer_values[small_labels[far]] < 0.55 * outer_best)
+            if max(poor_inner, poor_outer) < 0.08:
+                continue
+            outer_region = self._assign_pale_rim(
+                labels, band, outer_winner, load_aligned, dilation=31, blur=6,
+                high_gray=245)
+            far_winner = int(np.argmax(outer_values))
+            if (far_winner != outer_winner and
+                    outer_values[far_winner] > 1.3 * outer_values[outer_winner]):
+                outermost_region = self._assign_pale_rim(
+                    labels, outer_band, far_winner, load_aligned, dilation=31, blur=6,
+                    high_gray=245)
+                outer_region |= outermost_region
+            inner_limit = cv2.dilate(np.uint8(inner_band), np.ones((5, 5), np.uint8))
+            inner_region = self._assign_pale_rim(
+                labels, inner_band, inner_winner, load_aligned, dilation=21, blur=4,
+                closing=9, limit_small=inner_limit, low_gray=50)
+            if protected is None:
+                protected = outer_region | inner_region
+            else:
+                protected |= outer_region | inner_region
+        return protected
+
+
 def _chromatic_boundary_response(rgb, subject, scale):
     """Measure a coloured boundary without using neutral backdrop texture."""
     smooth = cv2.GaussianBlur(rgb, (0, 0), 1.2)
@@ -235,6 +476,7 @@ def build_focus_labels(
     boundary_best = boundary_owner = boundary_texture = boundary_silhouette = None
     boundary_local_best = boundary_local_selected = None
     background = _StableBackground() if stabilize_background else None
+    neutral_edges = None
     gray_cache_budget = _gray_cache_budget(int(gray_cache_bytes)) if protect_chromatic_edges else 0
     gray_frames = {}
     gray_bytes = 0
@@ -268,6 +510,9 @@ def build_focus_labels(
             scale = min(1.0, 2048.0 / max(height, width))
             size = (max(1, round(width * scale)), max(1, round(height * scale)))
             small = cv2.resize(rgb, size, interpolation=cv2.INTER_AREA) if scale < 1 else rgb
+            if neutral_edges is None:
+                neutral_edges = _CoherentNeutralEdges(small)
+            neutral_edges.observe(small)
             subject = colour_subject_mask(small)
             if subject is not None:
                 if silhouette_union is None:
@@ -400,6 +645,9 @@ def build_focus_labels(
                                      interpolation=cv2.INTER_NEAREST)
         labels[boundary_band] = boundary_labels[boundary_band]
         protected = base_guard | guarded | boundary_band
+    if neutral_edges is not None:
+        protected = neutral_edges.apply(
+            labels, protected, gray_frames=gray_frames, load_aligned=load_aligned)
     if background is not None:
         background.apply(labels, protected=protected)
     return labels

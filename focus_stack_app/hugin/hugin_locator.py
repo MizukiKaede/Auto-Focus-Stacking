@@ -17,8 +17,8 @@ class HuginToolNotFound(FileNotFoundError):
         self.searched = tuple(str(p) for p in searched)
         detail = "\n".join(f"  - {item}" for item in self.searched)
         message = (
-            f"Hugin tool '{tool}' was not found. Install Hugin or choose its bin directory "
-            "in settings."
+            f"Hugin tool '{tool}' was not found. Install Hugin or set HUGIN_BIN "
+            "to its bin directory."
         )
         if detail:
             message += f"\nSearched:\n{detail}"

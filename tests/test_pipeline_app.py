@@ -99,7 +99,7 @@ class ArchiveAndHuginTests(unittest.TestCase):
             self.assertIn("group_id,first_image", text)
             self.assertIn("true", text)
 
-    def test_runtime_hugin_paths_are_propagated_to_default_service(self):
+    def test_runtime_hugin_paths_are_propagated_to_legacy_service(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)
             align_path = root / "align_image_stack.exe"
@@ -109,7 +109,7 @@ class ArchiveAndHuginTests(unittest.TestCase):
                 align_image_stack_path=str(align_path),
                 enfuse_path=str(enfuse_path),
             )
-            service = StackMergeService(root / "output", runtime_config=runtime)
+            service = StackMergeService(root / "output", runtime_config=runtime, fusion_backend="hugin_enfuse")
             self.assertEqual(service.aligner.executable, align_path)
             self.assertEqual(service.enfuser.executable, enfuse_path)
 
@@ -164,6 +164,7 @@ class ArchiveAndHuginTests(unittest.TestCase):
                 archiver=TrackingArchiver(archive_dir, ArchiveMode.MOVE),
                 aligner=Aligner(),
                 enfuser=Enfuser(),
+                fusion_backend="hugin_enfuse",
             )
             group = {"id": 7, "images": [{"path": source} for source in sources]}
             analysis = {
@@ -228,6 +229,7 @@ class ArchiveAndHuginTests(unittest.TestCase):
                 archive_enabled=False,
                 aligner=Aligner(),
                 enfuser=Enfuser(),
+                fusion_backend="hugin_enfuse",
             )
             group = {"id": 8, "images": [{"path": source} for source in sources]}
             analysis = {
@@ -273,6 +275,7 @@ class ArchiveAndHuginTests(unittest.TestCase):
                 archive_enabled=False,
                 aligner=FailingAligner(),
                 enfuser=MustNotFuse(),
+                fusion_backend="hugin_enfuse",
             )
             group = {"id": 9, "images": [{"path": source} for source in sources]}
             analysis = {
@@ -314,6 +317,7 @@ class ArchiveAndHuginTests(unittest.TestCase):
                 archiver=FileArchiver(archive_dir, ArchiveMode.MOVE),
                 aligner=Aligner(),
                 enfuser=BrokenEnfuser(),
+                fusion_backend="hugin_enfuse",
             )
             group = {"id": 9, "images": [{"path": source} for source in sources]}
             analysis = {

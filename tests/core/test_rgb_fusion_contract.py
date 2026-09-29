@@ -1,6 +1,3 @@
-import threading
-from pathlib import Path
-
 import cv2
 import numpy as np
 import pytest
@@ -8,8 +5,7 @@ from PIL import Image
 
 from focus_stack_app.core.group_analyzer import GroupAnalyzer, GroupAnalyzerConfig
 from focus_stack_app.core.types import SceneGroup
-from focus_stack_app.fusion import HuginEnfuseBackend, LegacyWholeFrameBackend
-from focus_stack_app.hugin.output_encoder import OutputConfig
+from focus_stack_app.fusion import QualityFusionBackend
 from focus_stack_app.pipeline.application_controller import ApplicationController, ApplicationOptions
 from focus_stack_app.pipeline.analysis_worker import AnalysisJob
 from focus_stack_app.pipeline.merge_worker import StackMergeService
@@ -56,19 +52,7 @@ def test_rgb_controller_input_matches_original_loader(tmp_path):
     controller = ApplicationController(ApplicationOptions(source_dir=tmp_path, output_dir=tmp_path / "out"))
     path = group.items[0].path
     np.testing.assert_array_equal(controller._analysis_loader(group.items[0], 1280), load_rgb(path, 1280))
-    assert isinstance(StackMergeService(tmp_path / "out").backend, HuginEnfuseBackend)
-
-
-def test_legacy_adapter_runs_through_existing_merge_interface(tmp_path):
-    group = frames(tmp_path, 4)
-    analysis = GroupAnalyzer(GroupAnalyzerConfig(minimum_stack_group_size=4)).analyze_group(group)
-    merger = StackMergeService(tmp_path / "out", archive_enabled=False, fusion_backend=LegacyWholeFrameBackend())
-    result = merger.process(AnalysisJob(group=group, analysis=analysis))
-    assert result.status == "DONE"
-    assert result.actual_backend == "legacy_whole_frame"
-    with Image.open(result.output_path) as image:
-        assert image.size == (360, 240)
-    assert all(Path(item.path).exists() for item in group.items)
+    assert isinstance(StackMergeService(tmp_path / "out").backend, QualityFusionBackend)
 
 
 def test_failed_alignment_cannot_satisfy_four_frame_gate(tmp_path, monkeypatch):
