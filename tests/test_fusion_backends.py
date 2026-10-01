@@ -8,6 +8,7 @@ import pytest
 from focus_stack_app.fusion.backends import HuginEnfuseBackend, QualityFusionBackend
 from focus_stack_app.hugin.align import AlignImageStack
 from focus_stack_app.hugin.align import AlignmentError
+from focus_stack_app.hugin.enfuse import Enfuser
 from focus_stack_app.hugin.process import CommandResult
 from focus_stack_app.hugin.output_encoder import OutputConfig
 
@@ -136,6 +137,63 @@ def test_hugin_backend_retries_in_isolated_dirs_and_preserves_order(tmp_path):
     assert "--align-to-first" not in runner.calls[1][0]
     assert runner.calls[1][0][-2:] == [str(other), str(anchor)]
     assert any(item.startswith("CROP_RATIO_WARNING") for item in result.diagnostics)
+
+
+def test_hugin_quality_without_preview_reference_uses_aligned_zero_but_gate_rejects(tmp_path):
+    import threading
+
+    import cv2
+
+    pixels = np.full((120, 160, 3), 220, np.uint8)
+    cv2.rectangle(pixels, (40, 25), (120, 95), (190, 30, 30), -1)
+    paths = [tmp_path / "a.jpg", tmp_path / "b.jpg"]
+    for path in paths:
+        Image.fromarray(pixels).save(path, quality=100)
+
+    class Aligner:
+        def align(self, inputs, *, work_dir, cancel_event=None):
+            return type("Alignment", (), {
+                "input_paths": tuple(inputs),
+                "aligned_paths": tuple(inputs),
+                "command_result": CommandResult(("fake-align",), 0),
+            })()
+
+    class RecordingEnfuser(Enfuser):
+        def __init__(self):
+            super().__init__("fake-enfuse.exe")
+            self.kwargs = None
+
+        def fuse(self, aligned_paths, output_path, **kwargs):
+            self.kwargs = kwargs
+            output_path = __import__("pathlib").Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.fromarray(pixels).save(output_path, quality=100)
+            return type("Fused", (), {
+                "output_path": output_path,
+                "command_result": CommandResult(("fake-enfuse",), 0),
+            })()
+
+    quality_enfuser = RecordingEnfuser()
+    quality_backend = HuginEnfuseBackend(
+        Aligner(), quality_enfuser, runtime_config={"hugin_focus_mask_mode": "quality"},
+    )
+    quality_backend.fuse(
+        {}, {"selected_paths": paths}, tmp_path / "quality.jpg", tmp_path / "quality-work",
+        OutputConfig(), threading.Event(),
+    )
+    assert quality_enfuser.kwargs["focus_mask_mode"] == "quality"
+    assert quality_enfuser.kwargs["focus_reference_index"] == 0
+
+    gate_enfuser = RecordingEnfuser()
+    gate_backend = HuginEnfuseBackend(
+        Aligner(), gate_enfuser, runtime_config={"hugin_focus_mask_mode": "gate"},
+    )
+    with pytest.raises(ValueError, match="selected preview reference"):
+        gate_backend.fuse(
+            {}, {"selected_paths": paths}, tmp_path / "gate.jpg", tmp_path / "gate-work",
+            OutputConfig(), threading.Event(),
+        )
+    assert gate_enfuser.kwargs is None
 
 
 def test_quality_backend_uses_generic_analysis_data(tmp_path):

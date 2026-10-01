@@ -11,12 +11,41 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
 
 class ImageIOError(RuntimeError):
     """Base error for optional image-decoding operations."""
+
+
+_QUALITY_JPEG_READ_SEMAPHORE = threading.BoundedSemaphore(1)
+
+
+def load_quality_rgb(path: str | Path, *, pass_index: int | None = None) -> Any:
+    """Read one whole JPEG under the process-wide disk limit; decode outside it."""
+    import cv2
+    import numpy as np
+    from .performance import stage
+
+    path = Path(path)
+    if path.suffix.lower() not in {".jpg", ".jpeg"}:
+        return load_rgb(path)
+    with stage("jpeg_read_wait", path=str(path), pass_index=pass_index):
+        _QUALITY_JPEG_READ_SEMAPHORE.acquire()
+    try:
+        with stage("jpeg_read", path=str(path), bytes=path.stat().st_size,
+                   read_concurrency_limit=1, pass_index=pass_index):
+            encoded = path.read_bytes()
+    finally:
+        _QUALITY_JPEG_READ_SEMAPHORE.release()
+    with stage("image_decode", path=str(path), decoder="opencv_imdecode", pass_index=pass_index):
+        bgr = cv2.imdecode(np.frombuffer(encoded, np.uint8),
+                           cv2.IMREAD_COLOR | cv2.IMREAD_IGNORE_ORIENTATION)
+        if bgr is None:
+            raise ImageIOError(f"unable to decode JPEG {path}")
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,7 +257,17 @@ def load_rgb(path: str | Path, long_edge: int | None = None) -> Any:
             return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         except ImportError:
             return image
-    with Image.open(path) as image:
+    from .performance import stage
+    from io import BytesIO
+    # Preserve Pillow's decoder and RGB conversion while separating JPEG
+    # sequential read from decode for the baseline. Other formats retain
+    # their existing file reader, especially large aligned TIFFs.
+    source = path
+    if long_edge is None and Path(path).suffix.lower() in {".jpg", ".jpeg"}:
+        with stage("jpeg_read", path=str(path), bytes=Path(path).stat().st_size):
+            source = BytesIO(Path(path).read_bytes())
+    with stage("tiff_read_decode" if Path(path).suffix.lower() in {".tif", ".tiff"} else "image_decode",
+               path=str(path)), Image.open(source) as image:
         if long_edge and long_edge <= 320:
             image.draft("RGB", (long_edge, long_edge))
         image = image.convert("RGB")
@@ -253,7 +292,8 @@ def load_rgb_with_previews(
     except ImportError as exc:
         raise ImageIOError("RGB preview decoding requires Pillow + NumPy") from exc
 
-    with Image.open(path) as image:
+    from .performance import stage
+    with stage("tiff_validation_read_decode", path=str(path)), Image.open(path) as image:
         source = image.convert("RGB")
         full_resolution = np.asarray(source)
         previews: dict[int, Any] = {}

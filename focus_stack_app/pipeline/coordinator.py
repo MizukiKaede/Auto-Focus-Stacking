@@ -85,6 +85,7 @@ class PipelineCoordinator:
         memory_guard: Any | None = None,
         job_state: Any | None = None,
         logger: logging.Logger | None = None,
+        measured_worker_peak_bytes: int = 0,
     ):
         if config is None:
             config = PipelineConfig(
@@ -99,6 +100,7 @@ class PipelineCoordinator:
                 parallel=getattr(config, "parallel", getattr(config, "parallel_pipeline", True)) if parallel is None else parallel,
             )
         self.config = config
+        self.effective_workers = config.merge_workers
         self.analyzer = analyzer
         self.merger = merger
         self.repository = repository
@@ -112,6 +114,7 @@ class PipelineCoordinator:
             manifest_writer = ManifestWriter(manifest_path)
         self.manifest_writer = manifest_writer
         self.memory_guard = memory_guard
+        self.measured_worker_peak_bytes = max(0, int(measured_worker_peak_bytes))
         self.job_state = job_state
         self._manifest_lock = threading.RLock()
         self.logger = logger or logging.getLogger(__name__)
@@ -194,6 +197,22 @@ class PipelineCoordinator:
             if self._started_at <= 0:
                 self._started_at = time.monotonic()
         summary = PipelineSummary(groups_total=len(group_values))
+        from ..utils.fusion_budget import quality_worker_budget
+        budget = quality_worker_budget(
+            self.config.merge_workers, self.measured_worker_peak_bytes,
+            minimum_bytes=getattr(self.memory_guard, "minimum_bytes", 2 * 1024**3),
+            minimum_fraction=getattr(self.memory_guard, "minimum_fraction", 0.10),
+        )
+        self.effective_workers = budget.effective_workers
+        self.logger.info(
+            "Fusion worker budget requested_workers=%s effective_workers=%s available_bytes=%s "
+            "reserved_bytes=%s measured_worker_peak_bytes=%s reason=%s",
+            budget.requested_workers, budget.effective_workers, budget.available_bytes,
+            budget.reserved_bytes, budget.measured_worker_peak_bytes, budget.reason,
+        )
+        if self.measured_worker_peak_bytes and self.memory_guard is None:
+            from .memory_guard import MemoryGuard
+            self.memory_guard = MemoryGuard(event_callback=self._on_worker_event, logger=self.logger)
         self._queue = BoundedJobQueue(self.config.queue_size, cancel_event=self.cancel_event)
         analysis_done = threading.Event()
         analysis = AnalysisWorker(
@@ -221,8 +240,9 @@ class PipelineCoordinator:
                 logger=self.logger,
                 memory_guard=self.memory_guard,
                 job_state=self.job_state,
+                extra_memory_bytes=self.measured_worker_peak_bytes,
             )
-            for _ in range(self.config.merge_workers)
+            for _ in range(self.effective_workers)
         ]
         self._analysis_worker = analysis
         self._merge_workers = merge_workers

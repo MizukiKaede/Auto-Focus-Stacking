@@ -71,6 +71,17 @@ QWidget {
     font-size: 13px;
 }
 
+/* Dialog windows do not inherit the main window's background palette. */
+QMessageBox {
+    background: #181D26;
+    color: #F1F5F9;
+}
+
+QMessageBox QLabel {
+    color: #F1F5F9;
+    background: transparent;
+}
+
 QFrame#panel, QWidget#settingsContent, QFrame#card {
     background: #181D26;
     border: 1px solid #262E3D;

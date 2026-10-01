@@ -13,7 +13,8 @@ from focus_stack_app.files.archiver import ArchiveMode, FileArchiver, safe_copy
 from focus_stack_app.hugin.align import AlignConfig, AlignImageStack
 from focus_stack_app.hugin.hugin_locator import HuginLocator, HuginToolNotFound
 from focus_stack_app.hugin.output_encoder import OutputConfig, OutputFormat, output_path_for
-from focus_stack_app.config import RuntimeConfig
+from focus_stack_app.config import AppConfig, RuntimeConfig
+from focus_stack_app.pipeline.application_controller import ApplicationController
 from focus_stack_app.pipeline.coordinator import PipelineConfig, PipelineCoordinator
 from focus_stack_app.pipeline.events import PipelineStage
 from focus_stack_app.pipeline.merge_worker import StackMergeService
@@ -112,6 +113,23 @@ class ArchiveAndHuginTests(unittest.TestCase):
             service = StackMergeService(root / "output", runtime_config=runtime, fusion_backend="hugin_enfuse")
             self.assertEqual(service.aligner.executable, align_path)
             self.assertEqual(service.enfuser.executable, enfuse_path)
+
+    def test_application_factory_passes_app_runtime_to_quality_service(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            config = AppConfig()
+            controller = ApplicationController(
+                {"source_dir": root / "source", "output_dir": root / "output"},
+                config=config,
+                cleanup_stale_temp_on_start=False,
+            )
+            service = controller._build_merger()
+            # _make_config applies UI overrides and returns the controller's
+            # resolved AppConfig; the service must receive that runtime object.
+            self.assertIs(service.backend.runtime_config, controller.config.runtime)
+            self.assertEqual(service.backend.runtime_config.quality_variant, "gate")
+            self.assertEqual(service.backend.runtime_config.quality_execution, "cached")
+            self.assertTrue(service.backend.runtime_config.quality_printed_edge_guard)
 
     def test_successful_stack_is_written_before_complete_group_is_archived(self):
         with tempfile.TemporaryDirectory() as directory:

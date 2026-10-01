@@ -14,6 +14,7 @@ from ..hugin.enfuse import Enfuser
 from ..hugin.output_encoder import encode_image_output, OutputCollisionError, _same_path
 from ..hugin.hugin_locator import HuginToolNotFound
 from ..utils.image_io import load_rgb
+from ..utils.performance import profiled_fusion, stage, diagnostic
 
 
 @dataclass(slots=True)
@@ -74,7 +75,9 @@ class HuginEnfuseBackend(FusionBackend):
                  *, runtime_config: Any = None, logger: logging.Logger | None = None):
         self.aligner = aligner or AlignImageStack()
         self.enfuser = enfuser or Enfuser()
-        self.runtime_config = runtime_config
+        self.runtime_config = (runtime_config.get("runtime", runtime_config)
+                               if isinstance(runtime_config, Mapping)
+                               else getattr(runtime_config, "runtime", runtime_config))
         self.logger = logger or logging.getLogger(__name__)
 
     def _threshold(self, name: str, default: float) -> float:
@@ -177,12 +180,26 @@ class HuginEnfuseBackend(FusionBackend):
             except OSError:
                 self.logger.warning("Unable to release superseded alignment TIFF %s", path)
 
+    @profiled_fusion
     def fuse(self, group, analysis, output_path, work_dir, output_config, cancel_event) -> FusionResult:
         ordered = [Path(path) for path in _value(analysis, "alignment_order", ())]
         selected = [Path(path) for path in _value(analysis, "selected_paths", ())]
         paths = ordered or selected
         if len(paths) < 2:
             raise ValueError("Hugin fusion requires at least two selected images")
+        if selected and ordered and (len(ordered) != len(selected)
+                or {path.resolve() for path in ordered} != {path.resolve() for path in selected}):
+            raise ValueError("Hugin alignment order does not contain exactly the selected inputs")
+        preset = _value(self.runtime_config, "hugin_alignment_preset", "legacy")
+        if preset not in {"legacy", "first", "reference_first"}:
+            raise ValueError("hugin_alignment_preset must be legacy, first or reference_first")
+        if preset == "reference_first":
+            reference = _value(analysis, "preview_reference", None)
+            reference_path = next((path for path in paths
+                                   if reference is not None and _same_path(path, Path(reference))), None)
+            if reference_path is None:
+                raise ValueError("Hugin reference_first requires a selected preview reference")
+            paths = [reference_path, *(path for path in paths if path != reference_path)]
         anchor = Path(_value(analysis, "first_original_path", paths[0]))
         levels = (
             ((), False),
@@ -200,10 +217,12 @@ class HuginEnfuseBackend(FusionBackend):
                          if Path(path).resolve() in selected_keys]
         capture_order_complete = (len(capture_paths) == len(paths)
                                   and {path.resolve() for path in capture_paths} == selected_keys)
-        prefer_capture_order = len(paths) > 20 and capture_order_complete
+        prefer_capture_order = (preset != "reference_first" and
+                                len(paths) > 20 and capture_order_complete)
         if prefer_capture_order:
             paths = capture_paths
-        use_capture_retry = capture_order_complete and capture_paths != paths
+        use_capture_retry = (preset != "reference_first" and
+                             capture_order_complete and capture_paths != paths)
         if use_capture_retry:
             levels = (((), False), ((), False), (("--corr=0.8",), False),
                       (("-d", "--corr=0.8"), False))
@@ -216,6 +235,8 @@ class HuginEnfuseBackend(FusionBackend):
             )),
         )
         diagnostics: list[str] = []
+        if preset == "reference_first":
+            diagnostics.append("ALIGNMENT_PREVIEW_REFERENCE_FIRST")
         if prefer_capture_order:
             diagnostics.append("ALIGNMENT_CAPTURE_ORDER_PRIMARY")
         alignment = None
@@ -223,6 +244,11 @@ class HuginEnfuseBackend(FusionBackend):
         level = 0
         previous_attempt = None
         for level, (extra, centre) in enumerate(levels, 1):
+            # Failed output is already described in the profile. Release it
+            # before writing a replacement, including incomplete tool runs.
+            # A diagnostic .keep marker explicitly retains the evidence.
+            self._release_superseded_tiffs(previous_attempt, work_dir)
+            previous_attempt = None
             if level == 2 and use_capture_retry:
                 paths = capture_paths
                 diagnostics.append("ALIGNMENT_CAPTURE_ORDER_RETRY")
@@ -231,10 +257,11 @@ class HuginEnfuseBackend(FusionBackend):
             try:
                 if isinstance(self.aligner, AlignImageStack):
                     original = self.aligner.config
+                    preset_args = ("--align-to-first",) if preset in {"first", "reference_first"} else ()
                     self.aligner.config = replace(
                         original, optimize_field_of_view=True, optimize_scale=True,
                         crop_to_fit=True, optimize_centre=centre,
-                        extra_args=tuple(extra),
+                        extra_args=tuple(original.extra_args) + preset_args + tuple(extra),
                     )
                     try:
                         alignment = self.aligner.align(paths, work_dir=attempt_dir, cancel_event=cancel_event)
@@ -244,10 +271,21 @@ class HuginEnfuseBackend(FusionBackend):
                     alignment = self.aligner.align(paths, work_dir=attempt_dir, cancel_event=cancel_event)
                     if len(tuple(alignment.aligned_paths)) != len(paths):
                         raise AlignmentError("aligned TIFF count does not match input count", alignment)
-                # A complete replacement now exists. Retain it if validation
-                # fails, but do not accumulate all earlier TIFF sets on HDD.
-                self._release_superseded_tiffs(previous_attempt, work_dir)
+                # Retain this attempt on a terminal failure; a later retry
+                # releases it before writing its own TIFFs unless .keep exists.
                 previous_attempt = alignment
+                command_result = getattr(alignment, "command_result", None)
+                tiff_layouts = []
+                for tiff in alignment.aligned_paths:
+                    try:
+                        tiff_layouts.append(dict(path=str(tiff), bytes=tiff.stat().st_size,
+                                                layout=_image_info(tiff)))
+                    except Exception:
+                        pass
+                diagnostic("hugin_alignment_chain", attempt=level, input_order=[str(p) for p in paths],
+                           command=list(getattr(command_result, "command", ())), retry_args=list(extra),
+                           tiffs=tiff_layouts, total_tiff_bytes=sum(t["bytes"] for t in tiff_layouts),
+                           timing_scope="alignment_includes_external_tiff_write")
                 crop_ratio, warnings = self._validate_alignment(
                     alignment, anchor, aligned_cache=aligned_cache,
                 )
@@ -256,6 +294,13 @@ class HuginEnfuseBackend(FusionBackend):
                 break
             except Exception as exc:
                 aligned_cache.clear()
+                failed_alignment = getattr(exc, "result", None)
+                if failed_alignment is not None:
+                    previous_attempt = failed_alignment
+                failed_command = getattr(failed_alignment, "command_result", None)
+                diagnostic("hugin_alignment_failed", attempt=level, error=str(exc),
+                           input_order=[str(p) for p in paths], retry_args=list(extra),
+                           command=list(getattr(failed_command, "command", ())))
                 diagnostics.append(f"ALIGNMENT_LEVEL_{level}_FAILED:{exc}")
                 if level == len(levels) or not self._retryable(exc, cancel_event):
                     raise
@@ -270,6 +315,20 @@ class HuginEnfuseBackend(FusionBackend):
                 fuse_kwargs["image_loader"] = (
                     lambda index: aligned_cache.load(alignment.aligned_paths[index])
                 )
+                fuse_kwargs["cleanup_on_success"] = not (Path(work_dir) / ".keep").exists()
+                mask_mode = _value(self.runtime_config, "hugin_focus_mask_mode", "legacy")
+                if mask_mode != "legacy":
+                    reference = _value(analysis, "preview_reference", None)
+                    reference_index = next((i for i, path in enumerate(paths)
+                                            if reference is not None and _same_path(path, Path(reference))), None)
+                    if reference_index is None and mask_mode == "gate":
+                        raise ValueError("Hugin texture gate requires a selected preview reference")
+                    # Quality's compatibility rule uses aligned input zero;
+                    # only the optional gate needs the geometric reference.
+                    if reference_index is None:
+                        reference_index = 0
+                    fuse_kwargs.update(focus_mask_mode=mask_mode, focus_reference_index=reference_index,
+                                       focus_gate_edge_mode=_value(self.runtime_config, "quality_gate_edge_mode", "localized"))
             fused = self.enfuser.fuse(
                 alignment.aligned_paths, output_path, **fuse_kwargs,
             )
@@ -311,12 +370,14 @@ class QualityFusionBackend(FusionBackend):
 
     name = "quality"
 
-    def __init__(self, *, aligned_cache_bytes=None):
+    def __init__(self, *, aligned_cache_bytes=None, runtime_config=None):
         from .aligned_cache import DEFAULT_ALIGNED_CACHE_BYTES
         self.aligned_cache_bytes = DEFAULT_ALIGNED_CACHE_BYTES if aligned_cache_bytes is None else int(aligned_cache_bytes)
+        self.runtime_config = runtime_config
         if self.aligned_cache_bytes < 0:
             raise ValueError("aligned cache limit cannot be negative")
 
+    @profiled_fusion
     def fuse(self, group, analysis, output_path, work_dir, output_config, cancel_event) -> FusionResult:
         import cv2
         import numpy as np
@@ -387,43 +448,205 @@ class QualityFusionBackend(FusionBackend):
 
         with Image.open(reference_path) as reference_image:
             width, height = reference_image.size
+        execution = _value(self.runtime_config, "quality_execution", "cached")
+        decoder = _value(self.runtime_config, "quality_jpeg_decoder", "pillow")
+        if execution not in {"cached", "memory", "streaming"}:
+            raise ValueError("quality_execution must be cached, memory or streaming")
+        if decoder not in {"pillow", "opencv"}:
+            raise ValueError("quality_jpeg_decoder must be pillow or opencv")
+        if execution != "cached" and decoder != "opencv":
+            raise ValueError("two-pass and memory-reference Quality require opencv JPEG decoding")
+        pass_number = 1
+        if decoder == "opencv":
+            from ..utils.image_io import load_quality_rgb
+            def load_source(path):
+                return load_quality_rgb(path, pass_index=pass_number)
+        else:
+            load_source = load_rgb
+        diagnostic("quality_configuration", input_order=[str(p) for p in paths],
+                   selected_indices=indices, reference=str(reference_path),
+                   dimensions=[width, height], blend_levels=1, aligned_cache_bytes=self.aligned_cache_bytes,
+                   reference_coordinate_shape=reference_analysis_shape,
+                   source_coordinate_shapes=[analysis_shapes[i] for i in indices],
+                   registration_diagnostics=bool(_value(self.runtime_config, "registration_diagnostics", False)),
+                   execution=execution, jpeg_decoder=decoder,
+                   printed_edge_guard=bool(_value(self.runtime_config, "quality_printed_edge_guard", False)
+                                           and _value(self.runtime_config, "quality_variant", "legacy") in {"gate", "clean"}),
+                   surface_tone=bool(_value(self.runtime_config, "quality_surface_tone", False)
+                                     and _value(self.runtime_config, "quality_variant", "legacy") in {"gate", "clean"}))
+
+        variant = _value(self.runtime_config, "quality_variant", "legacy")
+        if variant not in {"legacy", "gain", "gate", "clean"}:
+            raise ValueError("quality_variant must be legacy, gain, gate or clean")
+        gain_model = None
+        seeded_source = {}
+        selected_reference = next((i for i, path in enumerate(paths)
+                                   if _same_path(path, reference_path)), None)
+        if execution != "cached" and selected_reference is None:
+            raise ValueError("two-pass Quality requires a selected preview reference")
+        fusion_reference = selected_reference if selected_reference is not None else 0
+        surface_tone = None
+        surface_boundary = None
+        printed_guard = None
+        if variant in {"gate", "clean"} and _value(self.runtime_config, "quality_printed_edge_guard", False):
+            from .quality_fusion import PrintedEdgeOwnership
+            printed_guard = PrintedEdgeOwnership()
+        if variant in {"gate", "clean"} and _value(self.runtime_config, "quality_surface_tone", False):
+            from .surface_tone import SurfaceToneHarmonizer
+            surface_tone = SurfaceToneHarmonizer(fusion_reference)
+            from .quality_fusion import SurfaceBoundaryOwnership
+            surface_boundary = SurfaceBoundaryOwnership()
+        use_gain = (variant == "gain" or (variant in {"gate", "clean"} and
+                                         _value(self.runtime_config, "quality_exposure_gain", False)))
+        # Seed the reference once for the sequential pass; diagnostics and
+        # gain previews retain compact data rather than rereading its JPEG.
+        raw_reference = None
+        if execution != "cached" or use_gain:
+            raw_reference = load_source(paths[fusion_reference])
+            seeded_source[fusion_reference] = raw_reference
+        residuals = None
+        if _value(self.runtime_config, "registration_diagnostics", False):
+            from .registration_diagnostics import RegistrationResiduals
+            residuals = RegistrationResiduals(
+                raw_reference if raw_reference is not None and _same_path(paths[fusion_reference], reference_path)
+                else load_source(reference_path)
+            )
+        if use_gain:
+            from .exposure_gain import ExposureGain
+            global_index = indices[fusion_reference]
+            reference_matrix = scaled_matrix(transforms[global_index], analysis_shapes[global_index],
+                                             raw_reference.shape[:2], reference_analysis_shape, (height, width))
+            gain_model = ExposureGain(raw_reference, reference_matrix, (height, width), fusion_reference)
+        del raw_reference
+        diagnostic("quality_variant", variant=variant, fusion_reference_index=fusion_reference)
+        pass_number = 1
 
         def load_aligned(local):
             index, path = indices[local], paths[local]
             matrix = transforms[index] if index < len(transforms) else None
-            source = load_rgb(path)
+            with stage("quality_read_decode", path=str(path), frame=local, pass_index=pass_number):
+                source = seeded_source.pop(local, None)
+                if source is None:
+                    source = load_source(path)
             source_analysis_shape = analysis_shapes[index]
             full_matrix = scaled_matrix(
                 matrix, source_analysis_shape, source.shape[:2],
                 reference_analysis_shape, (height, width),
             )
-            return cv2.warpPerspective(
-                source, full_matrix, (width, height), flags=cv2.INTER_LANCZOS4,
-                borderMode=cv2.BORDER_REFLECT_101,
-            )
+            if gain_model is not None:
+                if pass_number == 2 and local not in gain_model.gains:
+                    raise RuntimeError("second Quality pass lacks the first pass brightness gain")
+                source = gain_model.apply(local, source, full_matrix)
+            with stage("warp", frame=local, pass_index=pass_number):
+                aligned = cv2.warpPerspective(
+                    source, full_matrix, (width, height), flags=cv2.INTER_LANCZOS4,
+                    borderMode=cv2.BORDER_REFLECT_101,
+                )
+            if residuals is not None and pass_number == 1:
+                try:
+                    residuals.measure(aligned, local, full_matrix, source.shape[:2])
+                except Exception as exc:
+                    diagnostic("registration_residual_unavailable", frame=local, reason=str(exc))
+            return aligned
 
-        cache = AlignedFrameCache(
-            load_aligned, max_bytes=self.aligned_cache_bytes,
-            working_bytes=width * height * 80,
-        )
+        if execution == "memory":
+            from .quality_streaming import MemoryReferenceFrames
+            cache = MemoryReferenceFrames(load_aligned, working_bytes=width * height * 80)
+        else:
+            cache = AlignedFrameCache(
+                load_aligned, max_bytes=0 if execution == "streaming" else self.aligned_cache_bytes,
+                working_bytes=width * height * 80,
+            )
         try:
-            labels = build_focus_labels(len(paths), cache.for_focus, cancel_event=cancel_event)
+            texture = None
+            if variant in {"gate", "clean"}:
+                from .quality_fusion import FlatTextureStatistics
+                texture = FlatTextureStatistics(
+                    fusion_reference,
+                    edge_mode=_value(self.runtime_config, "quality_gate_edge_mode", "coherent"),
+                )
+            compatibility_mask = None
+
+            def observe_frame(index, rgb, gray, score):
+                nonlocal compatibility_mask
+                if printed_guard is not None:
+                    printed_guard.observe(index, rgb, gray, score)
+                if surface_tone is not None:
+                    surface_tone.observe(index, rgb)
+                    surface_boundary.observe(index, rgb, score)
+                if texture is not None:
+                    texture.observe(index, rgb, gray, score)
+                elif execution == "streaming" and index == 0:
+                    from .quality_fusion import neutral_mask
+                    compatibility_mask = neutral_mask(rgb, gray)
+
+            frame_order = ([fusion_reference, *(i for i in range(len(paths)) if i != fusion_reference)]
+                           if execution == "streaming" else None)
+            diagnostic("quality_scan_configuration", execution=execution,
+                       focus_order=frame_order or list(range(len(paths))),
+                       rgb_order=list(range(len(paths))), prefetch=execution == "cached",
+                       disk_read_concurrency=1 if decoder == "opencv" else "legacy",
+                       version="quality-two-pass-v1" if execution != "cached" else "quality-cached-p1")
+            with stage("quality_pass_1"):
+                labels = build_focus_labels(
+                    len(paths), cache.for_focus, cancel_event=cancel_event,
+                    stabilize_background=True, frame_order=frame_order,
+                    prefetch=execution == "cached", frame_observer=observe_frame,
+                    # Apply the guard after the other label regularizers;
+                    # they must not split its coherent ink/fringe coverage.
+                    printed_edge_guard=False,
+                )
             if cancel_event.is_set():
                 raise RuntimeError("Quality fusion cancelled")
-            labels = stabilize_neutral_labels(labels, cache.peek(0))
-            result = blend_focus_pyramid(len(paths), cache.for_blend, labels, cancel_event=cancel_event)
+            if texture is None:
+                if execution == "streaming":
+                    from .quality_fusion import stabilize_neutral_mask
+                    labels = stabilize_neutral_mask(labels, compatibility_mask)
+                    del compatibility_mask
+                else:
+                    labels = stabilize_neutral_labels(labels, cache.peek(0))
+            else:
+                labels, protected = texture.apply(labels)
+                del texture
+                if variant == "clean":
+                    from .quality_fusion import clean_tiny_labels
+                    labels = clean_tiny_labels(labels, protected, cancel_event=cancel_event)
+                del protected
+            if surface_boundary is not None:
+                labels = surface_boundary.apply(labels)
+            if printed_guard is not None:
+                labels = printed_guard.apply(labels, protected_texture=(
+                    surface_boundary.texture_protection(labels.shape) if surface_boundary is not None else None))
+            pass_number = 2
+            def load_blend_frame(index):
+                rgb = cache.for_blend(index)
+                # Remove each material's source drift before focus ownership
+                # turns it into sharp contours. Pure reference cores and
+                # continuous confidence avoid the old per-frame hard gates.
+                if surface_tone is not None:
+                    rgb = surface_tone.correct(rgb, index)
+                return rgb
+            with stage("quality_pass_2", second_decode=execution == "streaming",
+                       second_warp=execution == "streaming"):
+                if execution == "streaming":
+                    from .quality_streaming import blend_focus_narrow
+                    result = blend_focus_narrow(len(paths), load_blend_frame, labels, cancel_event=cancel_event)
+                else:
+                    result = blend_focus_pyramid(len(paths), load_blend_frame, labels, cancel_event=cancel_event)
         finally:
             cache.clear()
         del labels
         if cancel_event.is_set():
             raise RuntimeError("Quality fusion cancelled")
-        with Image.fromarray(result) as image:
+        with stage("encoding"), Image.fromarray(result) as image:
             final = encode_image_output(image, output_path, config=output_config, original_path=reference_path)
         diagnostics = ("FULL_RESOLUTION_PREVIEW_ALIGNMENT", "NEUTRAL_EDGE_COHERENCE",
                        "CONVEX_FOCUS_BLEND", f"ALIGNED_CACHE_HITS:{cache.hits}/{len(paths)}",
                        f"ALIGNED_CACHE_PEAK_BYTES:{cache.peak_bytes}")
         if rebuilt_registration:
             diagnostics += ("PREVIEW_REGISTRATION_REBUILT",)
+        if surface_tone is not None:
+            diagnostics += ("MATERIAL_SOURCE_SURFACE_TONE_V16",)
         return FusionResult(Path(final), self.name, alignment_status="PREVIEW_TRANSFORMS", diagnostics=diagnostics)
 
 

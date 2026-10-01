@@ -24,6 +24,12 @@ class NaturalSortAndConfigTests(unittest.TestCase):
         self.assertEqual(config.runtime.max_hugin_workers, 3)
         self.assertFalse(config.runtime.preserve_cache)
         self.assertEqual(config.runtime.focus_analysis_workers, 0)
+        self.assertEqual(config.runtime.quality_variant, "gate")
+        self.assertEqual(config.runtime.quality_gate_edge_mode, "localized")
+        self.assertEqual(config.runtime.quality_jpeg_decoder, "opencv")
+        self.assertEqual(config.runtime.quality_execution, "cached")
+        self.assertEqual(config.runtime.hugin_focus_mask_mode, "quality")
+        self.assertFalse(config.runtime.quality_exposure_gain)
         self.assertEqual(config.analysis.minimum_stack_stability, 0.98)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"

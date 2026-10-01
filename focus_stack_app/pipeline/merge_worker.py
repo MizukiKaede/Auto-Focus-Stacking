@@ -397,7 +397,11 @@ class StackMergeService:
         else:
             self.requested_backend = requested
             if self.requested_backend == "quality":
-                self.backend = QualityFusionBackend(aligned_cache_bytes=runtime_value("opencv_aligned_cache_bytes"))
+                self.backend = QualityFusionBackend(
+                    aligned_cache_bytes=runtime_value("opencv_aligned_cache_bytes"),
+                    runtime_config=(runtime.get("runtime", runtime) if isinstance(runtime, Mapping)
+                                    else getattr(runtime, "runtime", runtime)),
+                )
             elif self.requested_backend == "hugin_enfuse":
                 self.backend = HuginEnfuseBackend(
                     self.aligner, self.enfuser, runtime_config=runtime, logger=self.logger,
@@ -406,6 +410,22 @@ class StackMergeService:
                 raise ValueError("fusion_backend must be quality or hugin_enfuse")
         self.repository = repository
         self.cache_dir = Path(cache_dir) if cache_dir is not None else self.output_dir / ".stack_cache"
+        self.temp_root = self.cache_dir / "temp"
+        if self.requested_backend == "hugin_enfuse":
+            from ..utils.temp_storage import select_hugin_temp_root
+            self.temp_root, reason, media = select_hugin_temp_root(
+                self.cache_dir, explicit=runtime_value("hugin_temp_directory"),
+            )
+            if reason != "explicit":
+                try:
+                    self.temp_root.mkdir(parents=True, exist_ok=True)
+                except OSError:
+                    self.logger.warning("detected Hugin temporary storage is unavailable: %s; using cache",
+                                        self.temp_root)
+                    self.temp_root = self.cache_dir / "temp"
+                    reason, media = "detected_ssd_unavailable_keep_cache", "UNKNOWN"
+            self.logger.info("hugin temporary storage path=%s media=%s reason=%s",
+                             self.temp_root, media, reason)
         if manifest_writer is None:
             # A real pipeline should leave a durable manifest even when the
             # caller only supplied an output directory.  Import lazily to
@@ -465,12 +485,22 @@ class StackMergeService:
         """Remove only the private per-group directory created by this service."""
 
         try:
-            temp_root = (self.cache_dir / "temp").resolve()
+            temp_root = self.temp_root.resolve()
             target = work.resolve()
             if target.parent != temp_root:
                 self.logger.warning(
                     "refusing to clean unexpected fusion work directory: %s", target,
                 )
+                return
+            profile = target / "fusion_profile.json"
+            if profile.is_file():
+                profile_root = self.cache_dir / "logs" / "fusion_profiles"
+                profile_root.mkdir(parents=True, exist_ok=True)
+                saved_profile = profile_root / f"{target.name}.json"
+                shutil.copy2(profile, saved_profile)
+                self.logger.info("fusion profile saved: %s", saved_profile)
+            if (target / ".keep").is_file():
+                self.logger.info("preserved diagnostic fusion work directory: %s", target)
                 return
             shutil.rmtree(target)
             self.logger.info("cleaned successful fusion work directory: %s", target)
@@ -579,7 +609,7 @@ class StackMergeService:
             self._publish_manifest(result)
             return result
 
-        work = self.cache_dir / "temp" / f"{_group_id(group) or 'group'}_{uuid.uuid4().hex}"
+        work = self.temp_root / f"{_group_id(group) or 'group'}_{uuid.uuid4().hex}"
         work.mkdir(parents=True, exist_ok=True)
         self.logger.info(
             "fusion group_id=%s original_count=%s selected_count=%s anchor=%s capture_order=%s "
@@ -695,6 +725,7 @@ class MergeWorker(threading.Thread):
         logger: logging.Logger | None = None,
         memory_guard: Any | None = None,
         job_state: Any | None = None,
+        extra_memory_bytes: int = 0,
     ):
         super().__init__(name="focus-stack-merge", daemon=True)
         self.merge_queue = merge_queue
@@ -707,6 +738,7 @@ class MergeWorker(threading.Thread):
         self.result_callback = result_callback
         self.logger = logger or logging.getLogger(__name__)
         self.memory_guard = memory_guard
+        self.extra_memory_bytes = max(0, int(extra_memory_bytes))
         self.job_state = job_state
         self.completed = 0
         # ``completed`` remains the number of successful merge results (and
@@ -898,6 +930,7 @@ class MergeWorker(threading.Thread):
                     stage=PipelineStage.FUSION,
                     current_file=str(extract_image_paths(group, job.analysis)[2] or ""),
                     current_group=_group_id(group),
+                    extra_bytes=self.extra_memory_bytes,
                 )
             except TypeError:
                 allowed = wait(self.cancel_event)

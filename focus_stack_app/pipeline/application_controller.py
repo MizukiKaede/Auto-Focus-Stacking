@@ -1616,6 +1616,10 @@ class ApplicationController:
                 pass
             return coordinator
         manifest_path = self.output_dir / "stack_manifest.csv"
+        runtime = getattr(self.config, "runtime", None)
+        measured_peak = (int(getattr(runtime, "quality_worker_peak_60mp_bytes", 0))
+                         if self.options.fusion_backend == "quality"
+                         and getattr(runtime, "quality_execution", "cached") == "streaming" else 0)
         return PipelineCoordinator(
             analyzer=analyzer,
             merger=merger,
@@ -1630,9 +1634,12 @@ class ApplicationController:
             memory_guard=self._memory_guard,
             job_state=self._job_state,
             logger=self.logger,
+            measured_worker_peak_bytes=measured_peak,
         )
 
     def _run(self) -> None:
+        from ..utils.opencl import log_opencl_status
+        log_opencl_status(self.logger)
         started = self._started_at or time.monotonic()
         summary: ControllerSummary | None = None
         report: Any | None = None

@@ -155,6 +155,22 @@ class RuntimeConfig:
     focus_analysis_workers: int = 0
     # Appended to preserve positional compatibility with earlier callers.
     aligned_tiff_cache_bytes: int = 512 * 1024**2
+    registration_diagnostics: bool = True
+    # The P1 representative checkpoint passed; each old stage remains an A/B preset.
+    quality_variant: str = "gate"
+    quality_exposure_gain: bool = False
+    hugin_temp_directory: str | None = None
+    hugin_alignment_preset: str = "legacy"
+    quality_gate_edge_mode: str = "localized"
+    hugin_focus_mask_mode: str = "quality"
+    quality_execution: str = "cached"
+    quality_jpeg_decoder: str = "opencv"
+    # Populate only after an isolated 60MP streaming-worker measurement.
+    quality_worker_peak_60mp_bytes: int = 0
+    # Coloured-print fringe regression passed; legacy/gain retain their old routing.
+    quality_printed_edge_guard: bool = True
+    # Validated on the three requested full-size stacks; explicit False rolls back.
+    quality_surface_tone: bool = True
 
     def __post_init__(self) -> None:
         if not 1 <= int(self.max_hugin_workers) <= 6:
@@ -162,6 +178,22 @@ class RuntimeConfig:
         if not 0 <= int(self.focus_analysis_workers) <= 10:
             raise ValueError("focus_analysis_workers must be between 0 and 10")
         self.focus_analysis_workers = int(self.focus_analysis_workers)
+        if self.quality_variant not in {"legacy", "gain", "gate", "clean"}:
+            raise ValueError("quality_variant must be legacy, gain, gate or clean")
+        if self.hugin_alignment_preset not in {"legacy", "first", "reference_first"}:
+            raise ValueError("hugin_alignment_preset must be legacy, first or reference_first")
+        if self.quality_gate_edge_mode not in {"coherent", "localized"}:
+            raise ValueError("quality_gate_edge_mode must be coherent or localized")
+        if self.hugin_focus_mask_mode not in {"legacy", "quality", "gate"}:
+            raise ValueError("hugin_focus_mask_mode must be legacy, quality or gate")
+        if self.quality_execution not in {"cached", "memory", "streaming"}:
+            raise ValueError("quality_execution must be cached, memory or streaming")
+        if self.quality_jpeg_decoder not in {"pillow", "opencv"}:
+            raise ValueError("quality_jpeg_decoder must be pillow or opencv")
+        if self.quality_execution != "cached" and self.quality_jpeg_decoder != "opencv":
+            raise ValueError("two-pass and memory-reference Quality require opencv JPEG decoding")
+        if int(self.quality_worker_peak_60mp_bytes) < 0:
+            raise ValueError("quality_worker_peak_60mp_bytes cannot be negative")
         if self.min_available_memory_bytes < 0:
             raise ValueError("min_available_memory_bytes cannot be negative")
         if not 0 <= float(self.min_available_memory_fraction) <= 1:

@@ -1,9 +1,10 @@
 """Full-resolution focus decisions with bounded, frame-count independent RAM."""
 from __future__ import annotations
 
-from ..utils.performance import timed
+from ..utils.performance import timed, stage
 
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 
 import cv2
 import numpy as np
@@ -40,19 +41,35 @@ def _ordered_prefetched_frames(count, load_aligned, cancel_event):
     try:
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("focus fusion cancelled")
-        future = executor.submit(load_aligned, 0)
+        future = executor.submit(copy_context().run, load_aligned, 0)
         for index in range(count):
             if cancel_event is not None and cancel_event.is_set():
                 raise RuntimeError("focus fusion cancelled")
             rgb = future.result()
             future = None
             if index + 1 < count:
-                future = executor.submit(load_aligned, index + 1)
+                future = executor.submit(copy_context().run, load_aligned, index + 1)
             yield index, rgb
     finally:
         if future is not None:
             future.cancel()
         executor.shutdown(wait=True, cancel_futures=True)
+
+
+def _ordered_frames(count, load_aligned, cancel_event, frame_order=None, prefetch=True):
+    order = list(range(count)) if frame_order is None else list(frame_order)
+    if len(order) != count or sorted(order) != list(range(count)):
+        raise ValueError("frame order must contain every selected index exactly once")
+    if prefetch:
+        for slot, rgb in _ordered_prefetched_frames(count, lambda slot: load_aligned(order[slot]), cancel_event):
+            yield order[slot], rgb
+    else:
+        for index in order:
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("focus fusion cancelled")
+            rgb = load_aligned(index)
+            yield index, rgb
+            del rgb
 
 
 class SurfaceToneMonitor:
@@ -93,6 +110,7 @@ class SurfaceToneMonitor:
             64, round(common.size * 0.05))
 
 
+@timed("focus_response")
 def focus_response(rgb, gray=None, *, support_radius=7):
     """Compare fine detail on a common scale, including its defocus fringe.
 
@@ -124,8 +142,10 @@ class _StableBackground:
     def __init__(self):
         self.detail = None
         self.tones = []
+        self.indices = []
 
-    def observe(self, rgb, gray, score):
+    @timed("background_statistics")
+    def observe(self, rgb, gray, score, index=None):
         # Bound the adaptive noise estimate: a fully textured photograph must
         # never classify its lowest-scoring fifth as a textureless background.
         noise = float(np.percentile(score[::8, ::8], 20))
@@ -146,8 +166,10 @@ class _StableBackground:
             self.detail |= detail
         # A central exposure preserves the original light/shadow gradient.
         # No filename, capture index or manually named result defines it.
+        self.indices.append(len(self.tones) if index is None else int(index))
         self.tones.append(float(gray[::8, ::8].mean()))
 
+    @timed("background_regularization")
     def apply(self, labels, protected=None):
         if len(self.tones) < 2:
             return
@@ -159,7 +181,10 @@ class _StableBackground:
         flat = keep[regions]
         if protected is not None:
             flat &= ~protected
-        anchor = int(np.argmin(np.abs(np.asarray(self.tones) - np.median(self.tones))))
+        distances = np.abs(np.asarray(self.tones) - np.median(self.tones))
+        # Preserve capture-index ties when a streaming scan starts at its
+        # reference. The original natural-order scan chose the lowest index.
+        anchor = min(self.indices[i] for i in np.flatnonzero(distances == distances.min()))
         labels[flat] = anchor
 
 
@@ -459,6 +484,8 @@ def build_focus_labels(
     count, load_aligned, *, cancel_event=None, protect_chromatic_edges=False,
     gray_cache_bytes=DEFAULT_FOCUS_GRAY_CACHE_BYTES, tone_monitor=None,
     focus_support_radius=7, stabilize_background=True,
+    frame_order=None, prefetch=True, frame_observer=None,
+    printed_edge_guard=False,
 ):
     """Choose focused pixels and protect nearby neutral subject silhouettes.
 
@@ -480,31 +507,51 @@ def build_focus_labels(
     gray_cache_budget = _gray_cache_budget(int(gray_cache_bytes)) if protect_chromatic_edges else 0
     gray_frames = {}
     gray_bytes = 0
+    print_guard = selected_coloured = None
+    if printed_edge_guard:
+        from .quality_fusion import PrintedEdgeOwnership
+        print_guard = PrintedEdgeOwnership()
     if protect_chromatic_edges:
         from .alignment_quality import colour_subject_mask
-    for index, rgb in _ordered_prefetched_frames(count, load_aligned, cancel_event):
+    for index, rgb in _ordered_frames(count, load_aligned, cancel_event, frame_order, prefetch):
         if tone_monitor is not None:
             tone_monitor.observe(rgb)
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
         score = focus_response(rgb, gray=gray, support_radius=focus_support_radius)
+        if print_guard is not None:
+            print_guard.observe(index, rgb, gray, score)
+            frame_coloured = (rgb.max(axis=2) - rgb.min(axis=2) >= 65) & (gray >= 30)
+        if frame_observer is not None:
+            # Observers retain compact statistics, never the input/score maps.
+            with stage("texture_statistics", frame=index):
+                frame_observer(index, rgb, gray, score)
         if background is not None:
-            background.observe(rgb, gray, score)
+            background.observe(rgb, gray, score, index=index)
         if gray_bytes + gray.nbytes <= gray_cache_budget:
             gray_frames[index] = gray
             gray_bytes += gray.nbytes
-        if best is None:
-            best = score
-            labels = np.zeros(score.shape, np.uint16)
-            if protect_chromatic_edges:
-                winner_luma = gray.copy()
-        else:
-            if score.shape != best.shape:
-                raise ValueError("aligned focus frames must have matching dimensions")
-            better = score > best
-            best[better] = score[better]
-            labels[better] = index
-            if protect_chromatic_edges:
-                winner_luma[better] = gray[better]
+        with stage("focus_label_update", frame=index):
+            if best is None:
+                best = score
+                labels = np.full(score.shape, index, np.uint16)
+                if print_guard is not None:
+                    selected_coloured = frame_coloured.copy()
+                if protect_chromatic_edges:
+                    winner_luma = gray.copy()
+            else:
+                if score.shape != best.shape:
+                    raise ValueError("aligned focus frames must have matching dimensions")
+                better = score > best
+                if frame_order is not None:
+                    # Preserve the original source index's tie rule even when
+                    # the reference is processed first in a streaming scan.
+                    better |= (score == best) & (index < labels)
+                best[better] = score[better]
+                labels[better] = index
+                if print_guard is not None:
+                    selected_coloured[better] = frame_coloured[better]
+                if protect_chromatic_edges:
+                    winner_luma[better] = gray[better]
         if protect_chromatic_edges:
             height, width = score.shape
             scale = min(1.0, 2048.0 / max(height, width))
@@ -650,6 +697,8 @@ def build_focus_labels(
             labels, protected, gray_frames=gray_frames, load_aligned=load_aligned)
     if background is not None:
         background.apply(labels, protected=protected)
+    if print_guard is not None:
+        labels = print_guard.apply(labels, selected_coloured)
     return labels
 
 

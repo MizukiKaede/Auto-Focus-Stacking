@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from ..utils.performance import timed
 
-from ..utils.performance import stage
+from ..utils.performance import stage, diagnostic
 
 from dataclasses import dataclass
 import logging
@@ -132,10 +132,17 @@ class Enfuser:
         cleanup_on_success: bool = True,
         output_config: OutputConfig | None = None,
         image_loader=None,
+        focus_mask_mode: str = "legacy",
+        focus_reference_index: int = 0,
+        focus_gate_edge_mode: str = "localized",
     ) -> EnfuseResult:
         paths = tuple(Path(item) for item in aligned_paths)
         if not paths:
             raise ValueError("At least one aligned image is required for enfuse")
+        if focus_mask_mode not in {"legacy", "quality", "gate"}:
+            raise ValueError("focus_mask_mode must be legacy, quality or gate")
+        if not 0 <= focus_reference_index < len(paths):
+            raise ValueError("focus reference must identify an aligned input")
         for path in paths:
             if not path.is_file():
                 raise FileNotFoundError(f"Enfuse input does not exist: {path}")
@@ -179,23 +186,39 @@ class Enfuser:
             with stage("focus_masks_inclusive", frames=len(paths)):
                 aligned_loader = image_loader or (lambda i: load_rgb(paths[i]))
                 tone_monitor = SurfaceToneMonitor() if self.config.focus_blend_levels is None else None
+                texture = None
+                if focus_mask_mode == "gate":
+                    from ..fusion.quality_fusion import FlatTextureStatistics
+                    texture = FlatTextureStatistics(focus_reference_index, edge_mode=focus_gate_edge_mode)
+                support = (7 if focus_mask_mode != "legacy" or self.config.focus_blend_levels == 1 else 39)
                 labels = build_focus_labels(
                     len(paths), aligned_loader, cancel_event=cancel_event,
-                    protect_chromatic_edges=True,
+                    protect_chromatic_edges=focus_mask_mode == "legacy",
                     gray_cache_bytes=self.config.focus_gray_cache_bytes, tone_monitor=tone_monitor,
                     # Five-level blending reaches beyond the old seven-pixel
                     # ownership band and can mix a defocused white letter's
                     # rim into red print. Cover an extra 32 source pixels.
                     # A rectangular max filter keeps this linear-time without
                     # storing another full-resolution score/label pyramid.
-                    focus_support_radius=7 if self.config.focus_blend_levels == 1 else 39,
+                    focus_support_radius=support,
+                    frame_observer=texture.observe if texture else None,
                 )
+                if texture is not None:
+                    labels, protected = texture.apply(labels)
+                    del texture, protected
+                elif focus_mask_mode == "quality":
+                    from ..fusion.quality_fusion import stabilize_neutral_labels
+                    labels = stabilize_neutral_labels(labels, aligned_loader(0))
+                diagnostic("hugin_focus_mask_configuration", mode=focus_mask_mode,
+                           focus_support_radius=support, reference_index=focus_reference_index,
+                           protect_chromatic_edges=focus_mask_mode == "legacy")
                 digits = len(str(len(paths)))
                 for index in range(len(paths)):
                     if cancel_event is not None and cancel_event.is_set():
                         raise EnfuseError("Enfuse cancelled while generating focus masks")
                     mask = (labels == index).astype("uint8") * 255
-                    Image.fromarray(mask).save(work / f"hardmask-{index + 1:0{digits}}.tif", compression="tiff_deflate")
+                    with stage("focus_mask_tiff_write", frame=index):
+                        Image.fromarray(mask).save(work / f"hardmask-{index + 1:0{digits}}.tif", compression="tiff_deflate")
                 del labels, mask
             # Use the default relative templates: custom template arguments
             # crash some Windows Enfuse builds. Enfuse pads
@@ -213,6 +236,8 @@ class Enfuser:
         # Mirror the runner audit here so custom/mock runners still publish
         # command and return-code evidence to the application's shared log.
         self.logger.info("enfuse command: %s", command)
+        diagnostic("enfuse_chain", command=command, hard_mask=self.config.hard_mask,
+                   configured_levels=self.config.focus_blend_levels)
         with stage("fusion", backend="enfuse", output=str(final)):
             command_result = self.runner.run(
                 command,
