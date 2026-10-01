@@ -139,6 +139,84 @@ def test_hugin_backend_retries_in_isolated_dirs_and_preserves_order(tmp_path):
     assert any(item.startswith("CROP_RATIO_WARNING") for item in result.diagnostics)
 
 
+def test_shared_hugin_aligner_keeps_retry_args_local_during_parallel_fusions(tmp_path):
+    import threading
+
+    pixels = np.full((480, 640, 3), 220, np.uint8)
+    pixels[80:400, 240:380] = (180, 35, 35)
+    input_sets = {}
+    for prefix in ("a", "b"):
+        paths = [tmp_path / f"{prefix}{index}.jpg" for index in range(2)]
+        for path in paths:
+            Image.fromarray(pixels).save(path, quality=95)
+        input_sets[prefix] = paths
+
+    class Runner:
+        def __init__(self):
+            self.b_retry_started = threading.Event()
+            self.a_started = threading.Event()
+            self.commands = {}
+            self.lock = threading.Lock()
+
+        def run(self, command, **kwargs):
+            command = list(map(str, command))
+            input_names = [Path(item).name for item in command[-2:]]
+            prefix = input_names[0][0]
+            level = Path(kwargs["cwd"]).name
+            if prefix == "b" and level == "alignment_level_1":
+                return CommandResult(tuple(command), 1, stderr="not enough control points")
+            if prefix == "b" and level == "alignment_level_2":
+                self.b_retry_started.set()
+                assert self.a_started.wait(10), "parallel first-level attempt did not start"
+            if prefix == "a" and level == "alignment_level_1":
+                self.a_started.set()
+            with self.lock:
+                self.commands[(prefix, level)] = command
+            output_prefix = command[command.index("-a") + 1]
+            for index in range(2):
+                Image.fromarray(pixels).save(f"{output_prefix}{index:04d}.tif")
+            return CommandResult(tuple(command), 0)
+
+    class Fusion:
+        def fuse(self, aligned_paths, output_path, **kwargs):
+            Image.open(aligned_paths[0]).convert("RGB").save(output_path, quality=95)
+            return SimpleNamespace(
+                output_path=Path(output_path),
+                command_result=CommandResult(("fake-enfuse",), 0),
+            )
+
+    runner = Runner()
+    shared_aligner = AlignImageStack("align.exe", runner=runner)
+    backend = HuginEnfuseBackend(shared_aligner, Fusion())
+    errors = []
+
+    def fuse(prefix):
+        try:
+            backend.fuse(
+                {}, {"selected_paths": input_sets[prefix]},
+                tmp_path / f"{prefix}-output.jpg", tmp_path / f"{prefix}-work",
+                OutputConfig(), threading.Event(),
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    slow_retry = threading.Thread(target=fuse, args=("b",), daemon=True)
+    slow_retry.start()
+    assert runner.b_retry_started.wait(10), "retry did not reach its second alignment attempt"
+    first_attempt = threading.Thread(target=fuse, args=("a",), daemon=True)
+    first_attempt.start()
+    slow_retry.join(15)
+    first_attempt.join(15)
+
+    assert not slow_retry.is_alive() and not first_attempt.is_alive()
+    assert errors == []
+    a_command = runner.commands[("a", "alignment_level_1")]
+    b_retry_command = runner.commands[("b", "alignment_level_2")]
+    assert "--corr=0.8" not in a_command and "-d" not in a_command
+    assert "--corr=0.8" in b_retry_command
+    assert shared_aligner.config == AlignImageStack("align.exe").config
+
+
 def test_hugin_quality_without_preview_reference_uses_aligned_zero_but_gate_rejects(tmp_path):
     import threading
 
@@ -183,6 +261,21 @@ def test_hugin_quality_without_preview_reference_uses_aligned_zero_but_gate_reje
     )
     assert quality_enfuser.kwargs["focus_mask_mode"] == "quality"
     assert quality_enfuser.kwargs["focus_reference_index"] == 0
+    assert quality_enfuser.kwargs["focus_edge_ownership"] is True
+    assert quality_enfuser.kwargs["focus_surface_tone"] is True
+
+    disabled_enfuser = RecordingEnfuser()
+    HuginEnfuseBackend(
+        Aligner(), disabled_enfuser,
+        runtime_config={"hugin_focus_mask_mode": "quality",
+                        "hugin_edge_ownership": False, "hugin_surface_tone": False},
+    ).fuse(
+        {}, {"selected_paths": paths}, tmp_path / "quality-disabled.jpg", tmp_path / "quality-disabled-work",
+        OutputConfig(), threading.Event(),
+    )
+    assert disabled_enfuser.kwargs["focus_mask_mode"] == "quality"
+    assert disabled_enfuser.kwargs["focus_edge_ownership"] is False
+    assert disabled_enfuser.kwargs["focus_surface_tone"] is False
 
     gate_enfuser = RecordingEnfuser()
     gate_backend = HuginEnfuseBackend(

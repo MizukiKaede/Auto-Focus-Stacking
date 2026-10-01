@@ -6,7 +6,7 @@ import numpy as np
 
 from ..utils.performance import diagnostic, timed
 
-SURFACE_TONE_VERSION = "material-source-tone-v16"
+SURFACE_TONE_VERSION = "material-paired-tone-v17"
 
 
 def _materials(rgb):
@@ -53,7 +53,6 @@ class SurfaceToneHarmonizer:
         self.materials = []
         self.probe_min = self.probe_max = self.probe_count = None
         self.reference_probe = self.drifting_materials = None
-        self.reference_fields = {}
 
     @timed("surface_tone_statistics")
     def observe(self, index, rgb):
@@ -128,21 +127,19 @@ class SurfaceToneHarmonizer:
             core = _pure_core(mask, saturation, self.scale, coloured=material <= 12)
             if np.count_nonzero(core) < 64:
                 continue
-            if material not in self.reference_fields:
-                self.reference_fields[material] = _normalised_colour(
-                    self.reference_rgb, self.reference_cores[material], max(1.0, 32 * self.scale))
-            reference_field, reference_density = self.reference_fields[material]
-            # Compare on the same spatial scale. Different blur radii would
-            # mistake real printed structure for a frame's colour drift.
-            field, density = _normalised_colour(small, core, max(1.0, 32 * self.scale))
-            delta = reference_field - field
+            # Compare the same physical samples in both planes. Independently
+            # normalised cores move with defocus and saturation; on a shaded
+            # surface their different sampling positions invent a colour shift.
+            common = core & self.reference_cores[material]
+            residual = self.reference_rgb.astype(np.float32) - small.astype(np.float32)
+            delta, density = _normalised_colour(residual, common, max(1.0, 32 * self.scale))
             magnitude = np.max(np.abs(delta), axis=2)
             # Continuous confidence avoids threshold contours in the colour
             # field. Larger mismatches can describe a displaced feature.
-            valid = mask & (reference_density > 1e-6) & (density > 0.2)
+            valid = mask & (density > 1e-6)
             alpha = np.clip((magnitude - 1.0) / 3.0, 0, 1)
             alpha *= np.clip((40.0 - magnitude) / 20.0, 0, 1)
-            alpha *= np.clip(reference_density / 0.02, 0, 1)
+            alpha *= np.clip(density / 0.2, 0, 1)
             offset[valid] = delta[valid] * alpha[valid, None]
             confidence[valid] = 1
         height, width = rgb.shape[:2]

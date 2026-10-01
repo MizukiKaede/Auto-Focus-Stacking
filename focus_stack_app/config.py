@@ -171,6 +171,9 @@ class RuntimeConfig:
     quality_printed_edge_guard: bool = True
     # Validated on the three requested full-size stacks; explicit False rolls back.
     quality_surface_tone: bool = True
+    # Hugin-only repairs; independent of the Quality backend's switches.
+    hugin_edge_ownership: bool = True
+    hugin_surface_tone: bool = True
 
     def __post_init__(self) -> None:
         if not 1 <= int(self.max_hugin_workers) <= 6:

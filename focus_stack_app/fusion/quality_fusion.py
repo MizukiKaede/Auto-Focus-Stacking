@@ -286,6 +286,7 @@ class SurfaceBoundaryOwnership:
         self.maximum_pixels = int(maximum_pixels)
         self.support_radius = int(support_radius)
         self.best = self.confidence = self.owner = self.band = self.texture = self.interior = None
+        self.owner_focus = self.neutral_focus = None
 
     def observe(self, index, rgb, score=None):
         from .focus_masks import _filled_chromatic_silhouette
@@ -328,6 +329,15 @@ class SurfaceBoundaryOwnership:
         # step than a sharp one. Rank evidence at the physical edge using the
         # existing high-frequency focus score, before extending it to fringes.
         focus = cv2.resize(score, size, interpolation=cv2.INTER_AREA)
+        # A nearby painted rim may focus at a different depth from neutral
+        # metal or engraving. Its propagated owner must not replace sharper
+        # detail at the target itself. Keep this short core local to this
+        # guard; expanding it would also protect defocused printing fringes.
+        luma = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
+        clearance = max(1, int(np.ceil(4 * scale)))
+        neutral = cv2.erode(np.uint8((chroma < 45) & (luma > 30) & (luma < 235)),
+                            np.ones((2 * clearance + 1,) * 2, np.uint8)) != 0
+        neutral_focus = np.where(neutral, focus, 0)
         strength = _nearest_edge_support(
             colour_strength * np.sqrt(np.maximum(focus, 0)), edge, radius)
         band_radius = radius
@@ -341,11 +351,15 @@ class SurfaceBoundaryOwnership:
             self.texture = texture
             self.interior = silhouette
             self.scale = scale
+            self.owner_focus = focus.copy()
+            self.neutral_focus = neutral_focus
         else:
             better = (strength > self.best) | ((strength == self.best) & (index < self.owner))
             self.best[better] = strength[better]
             self.confidence[better] = confidence[better]
             self.owner[better] = index
+            self.owner_focus[better] = focus[better]
+            np.maximum(self.neutral_focus, neutral_focus, out=self.neutral_focus)
             self.band |= band
             self.texture |= texture
             self.interior |= silhouette
@@ -359,8 +373,10 @@ class SurfaceBoundaryOwnership:
         size = (labels.shape[1], labels.shape[0])
         clearance = max(1, int(np.ceil(8 * self.scale)))
         interior = cv2.dilate(self.interior, np.ones((2 * clearance + 1,) * 2, np.uint8)) != 0
+        neutral_detail = ((self.neutral_focus > 0)
+                          & (self.owner_focus < 0.7 * self.neutral_focus))
         active = cv2.resize(np.uint8((self.band != 0) & (self.confidence > 0.002)
-                                    & (self.best > 0) & interior), size,
+                                    & (self.best > 0) & interior & ~neutral_detail), size,
                             interpolation=cv2.INTER_NEAREST) != 0
         active &= ~texture
         owner = cv2.resize(self.owner, size, interpolation=cv2.INTER_NEAREST)
@@ -369,7 +385,9 @@ class SurfaceBoundaryOwnership:
         result[active] = owner[active]
         diagnostic("surface_boundary_ownership", changed_pixels=int(np.count_nonzero(changed)),
                    guarded_pixels=int(np.count_nonzero(active)), support_radius=self.support_radius,
-                   band_radius=self.support_radius, version="focused-chromatic-silhouette-ownership-v3")
+                   band_radius=self.support_radius,
+                   neutral_detail_veto_pixels=int(np.count_nonzero(neutral_detail)),
+                   version="focused-chromatic-silhouette-ownership-v4-neutral-detail")
         return result
 
     def texture_protection(self, shape):

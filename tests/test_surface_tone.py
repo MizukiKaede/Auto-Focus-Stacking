@@ -223,6 +223,45 @@ class SurfaceToneHarmonizerTests(unittest.TestCase):
 
         self.assertTrue(np.array_equal(corrected, displaced))
 
+    def test_shaded_colour_keeps_its_gradient_when_purity_support_moves(self):
+        yy, xx = np.indices((192, 384))
+        t = xx / 383.0
+        reference = np.stack((20 + 60*t, 120 + 90*t, 135 + 90*t), axis=2)
+        reference += (((xx + yy) % 3) - 1)[:, :, None]
+        reference = np.rint(reference).astype(np.uint8)
+        drifted = (reference.astype(np.int16) - 10).astype(np.uint8)
+        harmonizer = SurfaceToneHarmonizer(0)
+        _observe(harmonizer, [(0, reference), (1, drifted)])
+        corrected = harmonizer.correct(drifted, index=1, materials="colour")
+        # Assert colour and shading where paired samples provide support.
+        # The separate sparse-support test checks the intentional fade.
+        region = np.s_[32:160, 40:220]
+        error = corrected[region].astype(np.int16) - reference[region].astype(np.int16)
+        self.assertLess(float(np.abs(error).mean()), 1.0)
+        # The shadow and highlight remain distinct rather than flattening the
+        # surface to a global colour or adding a second illumination slope.
+        gradient = float(corrected[96, 210, 1]) - float(corrected[96, 50, 1])
+        expected_gradient = float(reference[96, 210, 1]) - float(reference[96, 50, 1])
+        self.assertGreater(gradient, 30)
+        self.assertLess(abs(gradient - expected_gradient), 2)
+        self.assertLess(int(np.max(np.abs(np.diff(error[64, :, 1])))), 3)
+
+    def test_sparse_colour_support_fades_without_an_on_off_contour(self):
+        reference = np.full((192, 384, 3), (190, 35, 45), np.uint8)
+        reference[32:160, 145:245] = (185, 95, 100)
+        reference[80:112, 290:320] = (240, 240, 240)
+        drifted = reference.copy()
+        coloured = np.max(reference, axis=2) - np.min(reference, axis=2) > 50
+        drifted[coloured] = (reference[coloured].astype(np.int16) - 10).astype(np.uint8)
+        harmonizer = SurfaceToneHarmonizer(0)
+        _observe(harmonizer, [(0, reference), (1, drifted)])
+        corrected = harmonizer.correct(drifted, index=1, materials="colour")
+        added = corrected[96, 110:270, 0].astype(np.int16) - drifted[96, 110:270, 0]
+        self.assertGreaterEqual(int(added.max()), 9)
+        self.assertLessEqual(int(added.min()), 5)
+        self.assertLessEqual(int(np.max(np.abs(np.diff(added)))), 2)
+        self.assertTrue(np.array_equal(corrected[80:112, 290:320], drifted[80:112, 290:320]))
+
 
 if __name__ == "__main__":
     unittest.main()

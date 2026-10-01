@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from copy import copy
 from dataclasses import dataclass, replace
 import logging
 import math
@@ -256,17 +257,18 @@ class HuginEnfuseBackend(FusionBackend):
             self.logger.info("Hugin alignment attempt level=%s input_order=%s work_dir=%s", level, paths, attempt_dir)
             try:
                 if isinstance(self.aligner, AlignImageStack):
+                    # Each worker owns its retry configuration. The runner
+                    # and logger may be shared, but never temporarily replace
+                    # the shared adapter's config across a subprocess wait.
+                    attempt_aligner = copy(self.aligner)
                     original = self.aligner.config
                     preset_args = ("--align-to-first",) if preset in {"first", "reference_first"} else ()
-                    self.aligner.config = replace(
+                    attempt_aligner.config = replace(
                         original, optimize_field_of_view=True, optimize_scale=True,
                         crop_to_fit=True, optimize_centre=centre,
                         extra_args=tuple(original.extra_args) + preset_args + tuple(extra),
                     )
-                    try:
-                        alignment = self.aligner.align(paths, work_dir=attempt_dir, cancel_event=cancel_event)
-                    finally:
-                        self.aligner.config = original
+                    alignment = attempt_aligner.align(paths, work_dir=attempt_dir, cancel_event=cancel_event)
                 else:
                     alignment = self.aligner.align(paths, work_dir=attempt_dir, cancel_event=cancel_event)
                     if len(tuple(alignment.aligned_paths)) != len(paths):
@@ -323,12 +325,14 @@ class HuginEnfuseBackend(FusionBackend):
                                             if reference is not None and _same_path(path, Path(reference))), None)
                     if reference_index is None and mask_mode == "gate":
                         raise ValueError("Hugin texture gate requires a selected preview reference")
-                    # Quality's compatibility rule uses aligned input zero;
-                    # only the optional gate needs the geometric reference.
+                    # Hugin's repair statistics use the selected preview
+                    # reference in the actual aligned input order.
                     if reference_index is None:
                         reference_index = 0
                     fuse_kwargs.update(focus_mask_mode=mask_mode, focus_reference_index=reference_index,
-                                       focus_gate_edge_mode=_value(self.runtime_config, "quality_gate_edge_mode", "localized"))
+                                       focus_gate_edge_mode=_value(self.runtime_config, "quality_gate_edge_mode", "localized"),
+                                       focus_edge_ownership=bool(_value(self.runtime_config, "hugin_edge_ownership", True)),
+                                       focus_surface_tone=bool(_value(self.runtime_config, "hugin_surface_tone", True)))
             fused = self.enfuser.fuse(
                 alignment.aligned_paths, output_path, **fuse_kwargs,
             )
@@ -646,7 +650,7 @@ class QualityFusionBackend(FusionBackend):
         if rebuilt_registration:
             diagnostics += ("PREVIEW_REGISTRATION_REBUILT",)
         if surface_tone is not None:
-            diagnostics += ("MATERIAL_SOURCE_SURFACE_TONE_V16",)
+            diagnostics += ("MATERIAL_PAIRED_SURFACE_TONE_V17",)
         return FusionResult(Path(final), self.name, alignment_status="PREVIEW_TRANSFORMS", diagnostics=diagnostics)
 
 

@@ -34,9 +34,8 @@ class EnfuseConfig:
     timeout_seconds: float | None = 60 * 60
     jpeg_quality: int = 100
     full_resolution_focus_masks: bool = True
-    # Auto keeps single-level silhouette protection for stable tones, and
-    # uses five levels when flat surfaces drift in colour between frames.
-    # An explicit integer overrides this choice.
+    # Auto uses one level after material correction. Unrepaired masks use
+    # five levels when flat tones drift. An explicit integer overrides auto.
     focus_blend_levels: int | None = None
     focus_gray_cache_bytes: int = 256 * 1024**2
 
@@ -135,6 +134,8 @@ class Enfuser:
         focus_mask_mode: str = "legacy",
         focus_reference_index: int = 0,
         focus_gate_edge_mode: str = "localized",
+        focus_edge_ownership: bool = True,
+        focus_surface_tone: bool = True,
     ) -> EnfuseResult:
         paths = tuple(Path(item) for item in aligned_paths)
         if not paths:
@@ -185,12 +186,33 @@ class Enfuser:
 
             with stage("focus_masks_inclusive", frames=len(paths)):
                 aligned_loader = image_loader or (lambda i: load_rgb(paths[i]))
-                tone_monitor = SurfaceToneMonitor() if self.config.focus_blend_levels is None else None
+                repair = None
+                if focus_mask_mode != "legacy" and (focus_edge_ownership or focus_surface_tone):
+                    from .focus_repair import HuginFocusRepair
+                    repair = HuginFocusRepair(
+                        focus_reference_index, edge_ownership=focus_edge_ownership,
+                        surface_tone=focus_surface_tone,
+                        stabilize_texture=focus_mask_mode == "quality",
+                        edge_mode=focus_gate_edge_mode,
+                    )
+                # Material correction replaces automatic multiband colour
+                # smoothing. An explicit level count remains caller-owned.
+                tone_monitor = (SurfaceToneMonitor() if self.config.focus_blend_levels is None
+                                and not (repair is not None and repair.tone is not None) else None)
                 texture = None
                 if focus_mask_mode == "gate":
                     from ..fusion.quality_fusion import FlatTextureStatistics
                     texture = FlatTextureStatistics(focus_reference_index, edge_mode=focus_gate_edge_mode)
-                support = (7 if focus_mask_mode != "legacy" or self.config.focus_blend_levels == 1 else 39)
+                support = (39 if self.config.focus_blend_levels is not None
+                           and self.config.focus_blend_levels > 1 else
+                           (7 if focus_mask_mode != "legacy" or self.config.focus_blend_levels == 1 else 39))
+
+                def observe_frame(index, rgb, gray, score):
+                    if texture is not None:
+                        texture.observe(index, rgb, gray, score)
+                    if repair is not None:
+                        repair.observe(index, rgb, gray, score)
+
                 labels = build_focus_labels(
                     len(paths), aligned_loader, cancel_event=cancel_event,
                     protect_chromatic_edges=focus_mask_mode == "legacy",
@@ -201,7 +223,7 @@ class Enfuser:
                     # A rectangular max filter keeps this linear-time without
                     # storing another full-resolution score/label pyramid.
                     focus_support_radius=support,
-                    frame_observer=texture.observe if texture else None,
+                    frame_observer=observe_frame if texture is not None or repair is not None else None,
                 )
                 if texture is not None:
                     labels, protected = texture.apply(labels)
@@ -209,9 +231,13 @@ class Enfuser:
                 elif focus_mask_mode == "quality":
                     from ..fusion.quality_fusion import stabilize_neutral_labels
                     labels = stabilize_neutral_labels(labels, aligned_loader(0))
+                if repair is not None:
+                    labels = repair.apply(labels)
                 diagnostic("hugin_focus_mask_configuration", mode=focus_mask_mode,
                            focus_support_radius=support, reference_index=focus_reference_index,
-                           protect_chromatic_edges=focus_mask_mode == "legacy")
+                           protect_chromatic_edges=focus_mask_mode == "legacy",
+                           edge_ownership=bool(repair is not None and repair.boundary is not None),
+                           surface_tone=bool(repair is not None and repair.tone is not None))
                 digits = len(str(len(paths)))
                 for index in range(len(paths)):
                     if cancel_event is not None and cancel_event.is_set():
@@ -220,6 +246,11 @@ class Enfuser:
                     with stage("focus_mask_tiff_write", frame=index):
                         Image.fromarray(mask).save(work / f"hardmask-{index + 1:0{digits}}.tif", compression="tiff_deflate")
                 del labels, mask
+                if repair is not None:
+                    render_paths = repair.corrected_inputs(
+                        paths, aligned_loader, work, cancel_event=cancel_event,
+                    )
+                    command = self.build_command(render_paths, temporary)
             # Use the default relative templates: custom template arguments
             # crash some Windows Enfuse builds. Enfuse pads
             # mask numbers to the number of digits in the input count.
@@ -227,7 +258,7 @@ class Enfuser:
             if not any(arg == "-l" or arg.startswith(("--levels", "-l")) for arg in self.config.extra_args):
                 blend_levels = self.config.focus_blend_levels
                 if blend_levels is None:
-                    blend_levels = 5 if tone_monitor.needs_multiband else 1
+                    blend_levels = 5 if tone_monitor is not None and tone_monitor.needs_multiband else 1
                 options.append(f"--levels={blend_levels}")
                 self.logger.info("Focus blend levels=%s flat_surface_tone_drift=%s",
                                  blend_levels, bool(tone_monitor and tone_monitor.needs_multiband))

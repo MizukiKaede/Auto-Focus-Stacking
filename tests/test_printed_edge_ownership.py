@@ -285,6 +285,27 @@ def test_external_rim_prefers_focus_over_a_larger_colour_step():
     assert np.all(labels[:, :20] == 0)
 
 
+def test_coloured_rim_does_not_retake_sharper_neutral_detail_at_another_depth():
+    from focus_stack_app.fusion.quality_fusion import SurfaceBoundaryOwnership
+
+    painted = np.full((192, 320, 3), 240, np.uint8)
+    painted[90:180, 30:290] = (35, 205, 215)
+    painted[65:90, 60:260] = (160, 160, 160)
+    metal = painted.copy()
+    metal[70:89, 90:230:8] = (105, 105, 105)
+    paint_focus = np.full((192, 320), 1e-6, np.float32)
+    paint_focus[90:] = 0.04
+    metal_focus = np.full((192, 320), 1e-5, np.float32)
+    metal_focus[65:90, 60:260] = 0.01
+    guard = SurfaceBoundaryOwnership()
+    guard.observe(0, painted, paint_focus)
+    guard.observe(1, metal, metal_focus)
+    labels = guard.apply(np.ones((192, 320), np.uint16))
+
+    assert np.all(labels[82:86, 80:240] == 1)
+    assert np.count_nonzero(labels[96:108, 80:240] == 0) > 0.8 * 12 * 160
+
+
 @pytest.mark.parametrize("variant,expected", [
     ("legacy", False), ("gain", False), ("gate", True), ("clean", True),
 ])
