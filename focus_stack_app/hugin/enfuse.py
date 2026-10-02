@@ -186,6 +186,12 @@ class Enfuser:
 
             with stage("focus_masks_inclusive", frames=len(paths)):
                 aligned_loader = image_loader or (lambda i: load_rgb(paths[i]))
+                alignment_refiner = None
+                if focus_mask_mode != "legacy" and (focus_edge_ownership or focus_surface_tone):
+                    from .alignment_refinement import HuginAlignmentRefiner
+                    alignment_refiner = HuginAlignmentRefiner(aligned_loader, focus_reference_index)
+                    alignment_refiner.prepare(len(paths))
+                    aligned_loader = alignment_refiner.load
                 repair = None
                 if focus_mask_mode != "legacy" and (focus_edge_ownership or focus_surface_tone):
                     from .focus_repair import HuginFocusRepair
@@ -223,16 +229,19 @@ class Enfuser:
                     # A rectangular max filter keeps this linear-time without
                     # storing another full-resolution score/label pyramid.
                     focus_support_radius=support,
+                    # Hugin's final repair owns printing after texture and
+                    # boundary ownership; retain the raw mask builder's default.
+                    printed_edge_guard=False,
                     frame_observer=observe_frame if texture is not None or repair is not None else None,
                 )
                 if texture is not None:
                     labels, protected = texture.apply(labels)
                     del texture, protected
-                elif focus_mask_mode == "quality":
+                elif focus_mask_mode == "quality" and not (repair is not None and repair.texture is not None):
                     from ..fusion.quality_fusion import stabilize_neutral_labels
                     labels = stabilize_neutral_labels(labels, aligned_loader(0))
                 if repair is not None:
-                    labels = repair.apply(labels)
+                    labels = repair.apply(labels, load_aligned=aligned_loader)
                 diagnostic("hugin_focus_mask_configuration", mode=focus_mask_mode,
                            focus_support_radius=support, reference_index=focus_reference_index,
                            protect_chromatic_edges=focus_mask_mode == "legacy",
@@ -249,6 +258,7 @@ class Enfuser:
                 if repair is not None:
                     render_paths = repair.corrected_inputs(
                         paths, aligned_loader, work, cancel_event=cancel_event,
+                        force_rewrite=alignment_refiner is not None,
                     )
                     command = self.build_command(render_paths, temporary)
             # Use the default relative templates: custom template arguments

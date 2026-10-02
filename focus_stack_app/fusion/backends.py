@@ -492,14 +492,18 @@ class QualityFusionBackend(FusionBackend):
         surface_tone = None
         surface_boundary = None
         printed_guard = None
+        valid_sources = None
+        if variant in {"gate", "clean"}:
+            from .opencv_v20 import ValidSourceOwnership
+            valid_sources = ValidSourceOwnership()
         if variant in {"gate", "clean"} and _value(self.runtime_config, "quality_printed_edge_guard", False):
             from .quality_fusion import PrintedEdgeOwnership
             printed_guard = PrintedEdgeOwnership()
         if variant in {"gate", "clean"} and _value(self.runtime_config, "quality_surface_tone", False):
             from .surface_tone import SurfaceToneHarmonizer
             surface_tone = SurfaceToneHarmonizer(fusion_reference)
-            from .quality_fusion import SurfaceBoundaryOwnership
-            surface_boundary = SurfaceBoundaryOwnership()
+            from .opencv_v20 import OpenCVBoundaryOwnership
+            surface_boundary = OpenCVBoundaryOwnership()
         use_gain = (variant == "gain" or (variant in {"gate", "clean"} and
                                          _value(self.runtime_config, "quality_exposure_gain", False)))
         # Seed the reference once for the sequential pass; diagnostics and
@@ -537,6 +541,8 @@ class QualityFusionBackend(FusionBackend):
                 matrix, source_analysis_shape, source.shape[:2],
                 reference_analysis_shape, (height, width),
             )
+            if valid_sources is not None:
+                valid_sources.register(local, full_matrix, source.shape[:2])
             if gain_model is not None:
                 if pass_number == 2 and local not in gain_model.gains:
                     raise RuntimeError("second Quality pass lacks the first pass brightness gain")
@@ -573,11 +579,14 @@ class QualityFusionBackend(FusionBackend):
 
             def observe_frame(index, rgb, gray, score):
                 nonlocal compatibility_mask
+                valid = None
+                if valid_sources is not None:
+                    valid = valid_sources.observe(index, score)
                 if printed_guard is not None:
                     printed_guard.observe(index, rgb, gray, score)
                 if surface_tone is not None:
                     surface_tone.observe(index, rgb)
-                    surface_boundary.observe(index, rgb, score)
+                    surface_boundary.observe(index, rgb, score, valid=valid)
                 if texture is not None:
                     texture.observe(index, rgb, gray, score)
                 elif execution == "streaming" and index == 0:
@@ -621,6 +630,8 @@ class QualityFusionBackend(FusionBackend):
             if printed_guard is not None:
                 labels = printed_guard.apply(labels, protected_texture=(
                     surface_boundary.texture_protection(labels.shape) if surface_boundary is not None else None))
+            if valid_sources is not None:
+                labels = valid_sources.apply(labels)
             pass_number = 2
             def load_blend_frame(index):
                 rgb = cache.for_blend(index)
@@ -651,6 +662,8 @@ class QualityFusionBackend(FusionBackend):
             diagnostics += ("PREVIEW_REGISTRATION_REBUILT",)
         if surface_tone is not None:
             diagnostics += ("MATERIAL_PAIRED_SURFACE_TONE_V17",)
+        if valid_sources is not None:
+            diagnostics += ("OPENCV_VALID_SOURCE_LOCAL_DETAIL_V20_ASTRA",)
         return FusionResult(Path(final), self.name, alignment_status="PREVIEW_TRANSFORMS", diagnostics=diagnostics)
 
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Focus Stack 修复"
+  short_description: "追溯真实融合输入与错误来源，隔离候选并做定向实图回归，保留通过版本"
+  default_prompt: "使用 $focus-stack-repair 分析并修复 Focus Stack Assistant 的融合缺陷，复用实际选片和矩阵，并对指定样本做隔离候选与实图回归。"
