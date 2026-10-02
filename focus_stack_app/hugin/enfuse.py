@@ -65,6 +65,26 @@ class EnfuseError(RuntimeError):
         super().__init__(message)
 
 
+def _prepare_alignment_refiner(image_loader, preparation_image_loader, reference_index, frame_count):
+    """Prepare residual transforms without consuming reusable TIFF decodes.
+
+    The preparation scan needs to inspect every aligned frame before any
+    transformed frame can be returned. A caller may provide a non-consuming
+    loader for that scan, then keep the normal consuming loader for the focus
+    and repair passes.
+    """
+    from .alignment_refinement import HuginAlignmentRefiner
+
+    prepare_loader = preparation_image_loader or image_loader
+    refiner = HuginAlignmentRefiner(prepare_loader, reference_index)
+    refiner.prepare(frame_count)
+    # Keep the established forward-consumption behavior once all affine
+    # decisions are fixed. This lets the caller release bounded cached frames
+    # as focus labels are computed.
+    refiner.loader = image_loader
+    return refiner
+
+
 class Enfuser:
     """Run Enfuse and atomically publish the final output."""
 
@@ -131,6 +151,10 @@ class Enfuser:
         cleanup_on_success: bool = True,
         output_config: OutputConfig | None = None,
         image_loader=None,
+        preparation_image_loader=None,
+        refined_frame_cache_bytes: int = 0,
+        refined_frame_cache_shared_budget=None,
+        tone_tiff_compression: str = "tiff_deflate",
         focus_mask_mode: str = "legacy",
         focus_reference_index: int = 0,
         focus_gate_edge_mode: str = "localized",
@@ -138,6 +162,11 @@ class Enfuser:
         focus_surface_tone: bool = True,
     ) -> EnfuseResult:
         paths = tuple(Path(item) for item in aligned_paths)
+        refined_frame_cache_bytes = int(refined_frame_cache_bytes)
+        if refined_frame_cache_bytes < 0:
+            raise ValueError("refined frame cache limit cannot be negative")
+        if tone_tiff_compression not in {"raw", "tiff_deflate"}:
+            raise ValueError("tone_tiff_compression must be raw or tiff_deflate")
         if not paths:
             raise ValueError("At least one aligned image is required for enfuse")
         if focus_mask_mode not in {"legacy", "quality", "gate"}:
@@ -188,79 +217,106 @@ class Enfuser:
                 aligned_loader = image_loader or (lambda i: load_rgb(paths[i]))
                 alignment_refiner = None
                 if focus_mask_mode != "legacy" and (focus_edge_ownership or focus_surface_tone):
-                    from .alignment_refinement import HuginAlignmentRefiner
-                    alignment_refiner = HuginAlignmentRefiner(aligned_loader, focus_reference_index)
-                    alignment_refiner.prepare(len(paths))
+                    alignment_refiner = _prepare_alignment_refiner(
+                        aligned_loader, preparation_image_loader,
+                        focus_reference_index, len(paths),
+                    )
                     aligned_loader = alignment_refiner.load
-                repair = None
-                if focus_mask_mode != "legacy" and (focus_edge_ownership or focus_surface_tone):
-                    from .focus_repair import HuginFocusRepair
-                    repair = HuginFocusRepair(
-                        focus_reference_index, edge_ownership=focus_edge_ownership,
-                        surface_tone=focus_surface_tone,
-                        stabilize_texture=focus_mask_mode == "quality",
-                        edge_mode=focus_gate_edge_mode,
-                    )
-                # Material correction replaces automatic multiband colour
-                # smoothing. An explicit level count remains caller-owned.
-                tone_monitor = (SurfaceToneMonitor() if self.config.focus_blend_levels is None
-                                and not (repair is not None and repair.tone is not None) else None)
-                texture = None
-                if focus_mask_mode == "gate":
-                    from ..fusion.quality_fusion import FlatTextureStatistics
-                    texture = FlatTextureStatistics(focus_reference_index, edge_mode=focus_gate_edge_mode)
-                support = (39 if self.config.focus_blend_levels is not None
-                           and self.config.focus_blend_levels > 1 else
-                           (7 if focus_mask_mode != "legacy" or self.config.focus_blend_levels == 1 else 39))
+                refined_frame_cache = None
+                try:
+                    if alignment_refiner is not None and refined_frame_cache_bytes > 0:
+                        from ..fusion.aligned_cache import AlignedFrameCache
+                        height, width = alignment_refiner.shape
+                        refined_frame_cache = AlignedFrameCache(
+                            alignment_refiner.load,
+                            max_bytes=refined_frame_cache_bytes,
+                            working_bytes=height * width * 80,
+                            shared_budget=refined_frame_cache_shared_budget,
+                        )
+                        # The residual matrices are fixed before this cache is
+                        # created. Reuse those exact refined RGB frames for
+                        # focus/repair, then consume them in blend order.
+                        aligned_loader = refined_frame_cache.for_focus
+                    repair = None
+                    if focus_mask_mode != "legacy" and (focus_edge_ownership or focus_surface_tone):
+                        from .focus_repair import HuginFocusRepair
+                        repair = HuginFocusRepair(
+                            focus_reference_index, edge_ownership=focus_edge_ownership,
+                            surface_tone=focus_surface_tone,
+                            stabilize_texture=focus_mask_mode == "quality",
+                            edge_mode=focus_gate_edge_mode,
+                        )
+                    # Material correction replaces automatic multiband colour
+                    # smoothing. An explicit level count remains caller-owned.
+                    tone_monitor = (SurfaceToneMonitor() if self.config.focus_blend_levels is None
+                                    and not (repair is not None and repair.tone is not None) else None)
+                    texture = None
+                    if focus_mask_mode == "gate":
+                        from ..fusion.quality_fusion import FlatTextureStatistics
+                        texture = FlatTextureStatistics(focus_reference_index, edge_mode=focus_gate_edge_mode)
+                    support = (39 if self.config.focus_blend_levels is not None
+                               and self.config.focus_blend_levels > 1 else
+                               (7 if focus_mask_mode != "legacy" or self.config.focus_blend_levels == 1 else 39))
 
-                def observe_frame(index, rgb, gray, score):
+                    def observe_frame(index, rgb, gray, score):
+                        if texture is not None:
+                            texture.observe(index, rgb, gray, score)
+                        if repair is not None:
+                            repair.observe(index, rgb, gray, score)
+
+                    labels = build_focus_labels(
+                        len(paths), aligned_loader, cancel_event=cancel_event,
+                        protect_chromatic_edges=focus_mask_mode == "legacy",
+                        gray_cache_bytes=self.config.focus_gray_cache_bytes, tone_monitor=tone_monitor,
+                        # Five-level blending reaches beyond the old seven-pixel
+                        # ownership band and can mix a defocused white letter's
+                        # rim into red print. Cover an extra 32 source pixels.
+                        # A rectangular max filter keeps this linear-time without
+                        # storing another full-resolution score/label pyramid.
+                        focus_support_radius=support,
+                        # Hugin's final repair owns printing after texture and
+                        # boundary ownership; retain the raw mask builder's default.
+                        printed_edge_guard=False,
+                        frame_observer=observe_frame if texture is not None or repair is not None else None,
+                    )
                     if texture is not None:
-                        texture.observe(index, rgb, gray, score)
+                        labels, protected = texture.apply(labels)
+                        del texture, protected
+                    elif focus_mask_mode == "quality" and not (repair is not None and repair.texture is not None):
+                        from ..fusion.quality_fusion import stabilize_neutral_labels
+                        labels = stabilize_neutral_labels(labels, aligned_loader(0))
                     if repair is not None:
-                        repair.observe(index, rgb, gray, score)
-
-                labels = build_focus_labels(
-                    len(paths), aligned_loader, cancel_event=cancel_event,
-                    protect_chromatic_edges=focus_mask_mode == "legacy",
-                    gray_cache_bytes=self.config.focus_gray_cache_bytes, tone_monitor=tone_monitor,
-                    # Five-level blending reaches beyond the old seven-pixel
-                    # ownership band and can mix a defocused white letter's
-                    # rim into red print. Cover an extra 32 source pixels.
-                    # A rectangular max filter keeps this linear-time without
-                    # storing another full-resolution score/label pyramid.
-                    focus_support_radius=support,
-                    # Hugin's final repair owns printing after texture and
-                    # boundary ownership; retain the raw mask builder's default.
-                    printed_edge_guard=False,
-                    frame_observer=observe_frame if texture is not None or repair is not None else None,
-                )
-                if texture is not None:
-                    labels, protected = texture.apply(labels)
-                    del texture, protected
-                elif focus_mask_mode == "quality" and not (repair is not None and repair.texture is not None):
-                    from ..fusion.quality_fusion import stabilize_neutral_labels
-                    labels = stabilize_neutral_labels(labels, aligned_loader(0))
-                if repair is not None:
-                    labels = repair.apply(labels, load_aligned=aligned_loader)
-                diagnostic("hugin_focus_mask_configuration", mode=focus_mask_mode,
-                           focus_support_radius=support, reference_index=focus_reference_index,
-                           protect_chromatic_edges=focus_mask_mode == "legacy",
-                           edge_ownership=bool(repair is not None and repair.boundary is not None),
-                           surface_tone=bool(repair is not None and repair.tone is not None))
-                digits = len(str(len(paths)))
-                for index in range(len(paths)):
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise EnfuseError("Enfuse cancelled while generating focus masks")
-                    mask = (labels == index).astype("uint8") * 255
-                    with stage("focus_mask_tiff_write", frame=index):
-                        Image.fromarray(mask).save(work / f"hardmask-{index + 1:0{digits}}.tif", compression="tiff_deflate")
-                del labels, mask
-                if repair is not None:
-                    render_paths = repair.corrected_inputs(
-                        paths, aligned_loader, work, cancel_event=cancel_event,
-                        force_rewrite=alignment_refiner is not None,
-                    )
-                    command = self.build_command(render_paths, temporary)
+                        labels = repair.apply(labels, load_aligned=aligned_loader)
+                    diagnostic("hugin_focus_mask_configuration", mode=focus_mask_mode,
+                               focus_support_radius=support, reference_index=focus_reference_index,
+                               protect_chromatic_edges=focus_mask_mode == "legacy",
+                               edge_ownership=bool(repair is not None and repair.boundary is not None),
+                               surface_tone=bool(repair is not None and repair.tone is not None))
+                    digits = len(str(len(paths)))
+                    for index in range(len(paths)):
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise EnfuseError("Enfuse cancelled while generating focus masks")
+                        mask = (labels == index).astype("uint8") * 255
+                        with stage("focus_mask_tiff_write", frame=index):
+                            Image.fromarray(mask).save(work / f"hardmask-{index + 1:0{digits}}.tif", compression="tiff_deflate")
+                    del labels, mask
+                    if repair is not None:
+                        tone_loader = (refined_frame_cache.for_blend
+                                       if refined_frame_cache is not None else aligned_loader)
+                        render_paths = repair.corrected_inputs(
+                            paths, tone_loader, work, cancel_event=cancel_event,
+                            force_rewrite=alignment_refiner is not None,
+                            tone_tiff_compression=tone_tiff_compression,
+                        )
+                        command = self.build_command(render_paths, temporary)
+                finally:
+                    if refined_frame_cache is not None:
+                        try:
+                            diagnostic("hugin_refined_frame_cache", **refined_frame_cache.stats)
+                        except Exception:
+                            self.logger.warning("Unable to record refined-frame cache stats", exc_info=True)
+                        finally:
+                            refined_frame_cache.clear()
             # Use the default relative templates: custom template arguments
             # crash some Windows Enfuse builds. Enfuse pads
             # mask numbers to the number of digits in the input count.

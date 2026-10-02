@@ -150,11 +150,11 @@ class RuntimeConfig:
     crop_ratio_max: float = 1.75
     min_alignment_tiff_bytes: int = 128
     min_fusion_output_bytes: int = 128
-    opencv_aligned_cache_bytes: int = 1024**3
+    opencv_aligned_cache_bytes: int = 2 * 1024**3
     # Zero selects an adaptive CPU/memory budget.
     focus_analysis_workers: int = 0
     # Appended to preserve positional compatibility with earlier callers.
-    aligned_tiff_cache_bytes: int = 512 * 1024**2
+    aligned_tiff_cache_bytes: int = 1024**3
     registration_diagnostics: bool = True
     # The P1 representative checkpoint passed; each old stage remains an A/B preset.
     quality_variant: str = "gate"
@@ -174,6 +174,14 @@ class RuntimeConfig:
     # Hugin-only repairs; independent of the Quality backend's switches.
     hugin_edge_ownership: bool = True
     hugin_surface_tone: bool = True
+    # One process-wide retained-RGB cap shared by both fusion paths.
+    # Per-group limits and the existing available-memory reserve still apply.
+    fusion_cache_budget_bytes: int = 3 * 1024**3
+    # Candidate-only switch: disable to restore synchronous Quality blending.
+    quality_blend_prefetch: bool = True
+    # Hugin's corrected intermediate TIFFs trade disk space for CPU time.
+    # Direct Enfuser/repair API calls keep their historical deflate default.
+    hugin_tone_tiff_compression: str = "raw"
 
     def __post_init__(self) -> None:
         if not 1 <= int(self.max_hugin_workers) <= 6:
@@ -215,6 +223,10 @@ class RuntimeConfig:
             raise ValueError("opencv_aligned_cache_bytes cannot be negative")
         if int(self.aligned_tiff_cache_bytes) < 0:
             raise ValueError("aligned_tiff_cache_bytes cannot be negative")
+        if int(self.fusion_cache_budget_bytes) < 0:
+            raise ValueError("fusion_cache_budget_bytes cannot be negative")
+        if self.hugin_tone_tiff_compression not in {"raw", "tiff_deflate"}:
+            raise ValueError("hugin_tone_tiff_compression must be raw or tiff_deflate")
 
 
 @dataclass(slots=True)

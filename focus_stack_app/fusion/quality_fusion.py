@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+from .statistics_native import flat_noise, chroma_map
 from ..utils.performance import timed
 
 
@@ -109,7 +110,7 @@ class FlatTextureStatistics:
         gradient = cv2.magnitude(cv2.Sobel(mean, cv2.CV_32F, 1, 0), cv2.Sobel(mean, cv2.CV_32F, 0, 1))
         response = cv2.resize(score, self.size, interpolation=cv2.INTER_AREA)
         small_rgb = cv2.resize(rgb, self.size, interpolation=cv2.INTER_AREA)
-        chroma = small_rgb.max(axis=2) - small_rgb.min(axis=2)
+        chroma = chroma_map(small_rgb)
         if self.max_response is None:
             self.max_response, self.max_variance, self.max_gradient = response, variance, gradient
             self.max_chroma = chroma
@@ -127,38 +128,8 @@ class FlatTextureStatistics:
             full_chroma = cv2.max(r, cv2.max(g, b)) - cv2.min(r, cv2.min(g, b))
             self.neutral = (gray < 235) & (full_chroma < 65)
         # Sample compact maps, with a separate noise distribution per luma bin.
-        bins = (small[::4, ::4] // 16).astype(np.uint8)
-        vs, gs, fs = variance[::4, ::4], gradient[::4, ::4], response[::4, ::4]
-        frame_focus = np.zeros(16, np.float32)
-        frame_variance = np.zeros(16, np.float32)
-        frame_gradient = np.zeros(16, np.float32)
-        for band in range(16):
-            selected = bins == band
-            if np.count_nonzero(selected) < 64:
-                continue
-            flat = selected & (vs <= np.percentile(vs[selected], 35))
-            if np.count_nonzero(flat) < 32:
-                continue
-            self.samples[band] += np.count_nonzero(flat)
-            frame_focus[band] = self._noise_upper(fs[flat])
-            frame_variance[band] = self._noise_upper(vs[flat])
-            frame_gradient[band] = self._noise_upper(gs[flat])
-        np.maximum(self.focus_floor, frame_focus, out=self.focus_floor)
-        np.maximum(self.variance_floor, frame_variance, out=self.variance_floor)
-        np.maximum(self.gradient_floor, frame_gradient, out=self.gradient_floor)
-        # A tiny fringe can cross an adjacent brightness bin with too few
-        # samples. Use the more conservative adjacent-bin noise ceiling;
-        # genuinely unobserved luma ranges remain unknown and protected.
-        observed = frame_focus > 0
-        for band in range(16):
-            if observed[band]:
-                continue
-            adjacent = [b for b in (band - 1, band + 1) if 0 <= b < 16 and observed[b]]
-            if adjacent:
-                self.noise_fallback_counts[band] += 1
-                frame_focus[band] = max(frame_focus[b] for b in adjacent)
-                frame_variance[band] = max(frame_variance[b] for b in adjacent)
-                frame_gradient[band] = max(frame_gradient[b] for b in adjacent)
+        frame_focus, frame_variance, frame_gradient = flat_noise(
+            self, small, variance, gradient, response)
         # Compare each frame to its own luma/noise bin before taking a union.
         # Comparing every maximum to the reference luma bin confuses real
         # exposure drift with detail and can protect an entire white backdrop.
@@ -299,7 +270,7 @@ class SurfaceBoundaryOwnership:
         scale = min(0.5, (self.maximum_pixels / (height * width)) ** 0.5)
         size = (max(1, int(width * scale)), max(1, int(height * scale)))
         small = cv2.resize(rgb, size, interpolation=cv2.INTER_AREA)
-        chroma = small.max(axis=2) - small.min(axis=2)
+        chroma = chroma_map(small)
         count, parts, stats, _ = cv2.connectedComponentsWithStats(np.uint8(chroma >= 65), 8)
         retained = np.zeros(count, np.uint8)
         retained[1:] = stats[1:, cv2.CC_STAT_AREA] >= max(64, round(chroma.size * 0.001))
@@ -421,7 +392,7 @@ class PrintedEdgeOwnership:
         size = (max(1, int(rgb.shape[1] * scale)), max(1, int(rgb.shape[0] * scale)))
         small = cv2.resize(rgb, size, interpolation=cv2.INTER_AREA)
         luma = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
-        chroma = small.max(axis=2) - small.min(axis=2)
+        chroma = chroma_map(small)
         coloured = (chroma >= 65) & (luma >= 30)
         filled = _filled_chromatic_silhouette(coloured.astype(np.uint8))
         # A clipped character can open its white island to the image border.

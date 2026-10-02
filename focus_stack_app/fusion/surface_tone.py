@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+from .statistics_native import (probe_update, material_classes, masked_colour,
+                                normalize_colour, update_offset, apply_colour)
 
 from ..utils.performance import diagnostic, timed
 
@@ -12,17 +14,13 @@ SURFACE_TONE_VERSION = "material-paired-tone-v17"
 def _materials(rgb):
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    hue = ((hsv[:, :, 0].astype(np.uint16) + 15) // 30) % 6
-    coloured = hsv[:, :, 1] >= 50
-    classes = (1 + hue + 6 * (gray < 64)).astype(np.uint8)
-    classes[~coloured] = 13 + (gray[~coloured] >= 64) + (gray[~coloured] >= 160)
-    return classes
+    return material_classes(hsv, gray)
 
 
 def _normalised_colour(rgb, mask, sigma):
     density = cv2.GaussianBlur(mask.astype(np.float32), (0, 0), sigma)
-    field = cv2.GaussianBlur(rgb.astype(np.float32) * mask[:, :, None], (0, 0), sigma)
-    field /= np.maximum(density[:, :, None], 1e-6)
+    field = cv2.GaussianBlur(masked_colour(rgb, mask), (0, 0), sigma)
+    normalize_colour(field, density)
     return field, density
 
 
@@ -66,11 +64,7 @@ class SurfaceToneHarmonizer:
             self.probe_min = np.full((16, *probe.shape), 255, np.uint8)
             self.probe_max = np.zeros((16, *probe.shape), np.uint8)
             self.probe_count = np.zeros((16, *probe.shape[:2]), np.uint16)
-        for material in np.unique(probe_classes):
-            mask = probe_classes == material
-            self.probe_min[material][mask] = np.minimum(self.probe_min[material][mask], probe[mask])
-            self.probe_max[material][mask] = np.maximum(self.probe_max[material][mask], probe[mask])
-            self.probe_count[material][mask] += 1
+        probe_update(probe_classes, probe, self.probe_min, self.probe_max, self.probe_count)
         if int(index) != self.reference_index:
             return
         self.reference_probe = probe_classes.copy()
@@ -120,6 +114,7 @@ class SurfaceToneHarmonizer:
         saturation = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)[:, :, 1]
         offset = np.zeros((*classes.shape, 3), np.float32)
         confidence = np.zeros(classes.shape, np.uint8)
+        residual = None
         for material in active_materials:
             mask = classes == material
             if not np.any(mask):
@@ -131,33 +126,17 @@ class SurfaceToneHarmonizer:
             # normalised cores move with defocus and saturation; on a shaded
             # surface their different sampling positions invent a colour shift.
             common = core & self.reference_cores[material]
-            residual = self.reference_rgb.astype(np.float32) - small.astype(np.float32)
+            if residual is None:
+                residual = self.reference_rgb.astype(np.float32) - small.astype(np.float32)
             delta, density = _normalised_colour(residual, common, max(1.0, 32 * self.scale))
-            magnitude = np.max(np.abs(delta), axis=2)
-            # Continuous confidence avoids threshold contours in the colour
-            # field. Larger mismatches can describe a displaced feature.
-            valid = mask & (density > 1e-6)
-            alpha = np.clip((magnitude - 1.0) / 3.0, 0, 1)
-            alpha *= np.clip((40.0 - magnitude) / 20.0, 0, 1)
-            alpha *= np.clip(density / 0.2, 0, 1)
-            offset[valid] = delta[valid] * alpha[valid, None]
-            confidence[valid] = 1
+            update_offset(classes, material, delta, density, offset, confidence)
         height, width = rgb.shape[:2]
         field = cv2.resize(offset, (width, height), interpolation=cv2.INTER_LINEAR)
         valid = cv2.resize(confidence, (width, height), interpolation=cv2.INTER_NEAREST) != 0
         full_classes = _materials(rgb)
         kernel = np.ones((3, 3), np.uint8)
         valid &= cv2.erode(full_classes, kernel) == cv2.dilate(full_classes, kernel)
-        result = rgb.copy()
-        changed = 0
-        for y in range(0, height, 128):
-            rows = slice(y, min(height, y + 128))
-            active = valid[rows]
-            if not np.any(active):
-                continue
-            values = np.rint(np.clip(rgb[rows].astype(np.float32) + field[rows], 0, 255)).astype(np.uint8)
-            changed += int(np.count_nonzero(active & np.any(values != rgb[rows], axis=2)))
-            result[rows][active] = values[active]
+        result, changed = apply_colour(rgb, field, valid)
         diagnostic("surface_tone_frame", frame=index, corrected_pixels=changed,
                    materials=materials or "all", version=SURFACE_TONE_VERSION)
         return result

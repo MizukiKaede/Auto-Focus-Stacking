@@ -49,6 +49,15 @@ def _value(obj: Any, name: str, default: Any = None) -> Any:
     return getattr(obj, name, default)
 
 
+def _report_cache_then_clear(cache: Any, diagnostic_name: str) -> None:
+    """Always release a fusion cache, even if its diagnostic sink fails."""
+    try:
+        if hasattr(cache, "stats"):
+            diagnostic(diagnostic_name, **cache.stats)
+    finally:
+        cache.clear()
+
+
 def _image_info(path: Path) -> tuple[int, int, str, int]:
     from PIL import Image
     with Image.open(path) as image:
@@ -228,12 +237,15 @@ class HuginEnfuseBackend(FusionBackend):
             levels = (((), False), ((), False), (("--corr=0.8",), False),
                       (("-d", "--corr=0.8"), False))
         from .aligned_cache import AlignedTIFFImageCache, DEFAULT_ALIGNED_TIFF_CACHE_BYTES
+        from ..utils.shared_cache_budget import process_global_cache_budget
 
         aligned_cache = AlignedTIFFImageCache(
             max_bytes=int(_value(
                 self.runtime_config, "aligned_tiff_cache_bytes",
                 DEFAULT_ALIGNED_TIFF_CACHE_BYTES,
             )),
+            shared_budget=process_global_cache_budget(
+                int(_value(self.runtime_config, "fusion_cache_budget_bytes", 3 * 1024**3))),
         )
         diagnostics: list[str] = []
         if preset == "reference_first":
@@ -295,7 +307,12 @@ class HuginEnfuseBackend(FusionBackend):
                 self.logger.info("Hugin alignment validated level=%s aligned_tiff_count=%s crop_ratio=%.4f", level, len(alignment.aligned_paths), crop_ratio)
                 break
             except Exception as exc:
-                aligned_cache.clear()
+                try:
+                    if hasattr(aligned_cache, "stats"):
+                        diagnostic("aligned_tiff_cache_attempt", attempt=level,
+                                   **aligned_cache.stats)
+                finally:
+                    aligned_cache.clear()
                 failed_alignment = getattr(exc, "result", None)
                 if failed_alignment is not None:
                     previous_attempt = failed_alignment
@@ -317,6 +334,17 @@ class HuginEnfuseBackend(FusionBackend):
                 fuse_kwargs["image_loader"] = (
                     lambda index: aligned_cache.load(alignment.aligned_paths[index])
                 )
+                fuse_kwargs["preparation_image_loader"] = (
+                    lambda index: aligned_cache.peek(alignment.aligned_paths[index])
+                )
+                fuse_kwargs["refined_frame_cache_bytes"] = int(_value(
+                    self.runtime_config, "aligned_tiff_cache_bytes",
+                    DEFAULT_ALIGNED_TIFF_CACHE_BYTES,
+                ))
+                fuse_kwargs["refined_frame_cache_shared_budget"] = aligned_cache.shared_budget
+                fuse_kwargs["tone_tiff_compression"] = str(_value(
+                    self.runtime_config, "hugin_tone_tiff_compression", "raw",
+                ))
                 fuse_kwargs["cleanup_on_success"] = not (Path(work_dir) / ".keep").exists()
                 mask_mode = _value(self.runtime_config, "hugin_focus_mask_mode", "legacy")
                 if mask_mode != "legacy":
@@ -337,7 +365,7 @@ class HuginEnfuseBackend(FusionBackend):
                 alignment.aligned_paths, output_path, **fuse_kwargs,
             )
         finally:
-            aligned_cache.clear()
+            _report_cache_then_clear(aligned_cache, "aligned_tiff_cache")
         final = Path(fused.output_path)
         minimum_output_bytes = int(self._threshold("min_fusion_output_bytes", 128)) if isinstance(self.enfuser, Enfuser) else 1
         if not final.is_file() or final.stat().st_size < minimum_output_bytes:
@@ -376,8 +404,14 @@ class QualityFusionBackend(FusionBackend):
 
     def __init__(self, *, aligned_cache_bytes=None, runtime_config=None):
         from .aligned_cache import DEFAULT_ALIGNED_CACHE_BYTES
-        self.aligned_cache_bytes = DEFAULT_ALIGNED_CACHE_BYTES if aligned_cache_bytes is None else int(aligned_cache_bytes)
-        self.runtime_config = runtime_config
+        self.runtime_config = (runtime_config.get("runtime", runtime_config)
+                               if isinstance(runtime_config, Mapping)
+                               else getattr(runtime_config, "runtime", runtime_config))
+        configured_cache_bytes = _value(self.runtime_config, "opencv_aligned_cache_bytes", None)
+        if aligned_cache_bytes is None:
+            aligned_cache_bytes = (DEFAULT_ALIGNED_CACHE_BYTES if configured_cache_bytes is None
+                                   else configured_cache_bytes)
+        self.aligned_cache_bytes = int(aligned_cache_bytes)
         if self.aligned_cache_bytes < 0:
             raise ValueError("aligned cache limit cannot be negative")
 
@@ -563,9 +597,12 @@ class QualityFusionBackend(FusionBackend):
             from .quality_streaming import MemoryReferenceFrames
             cache = MemoryReferenceFrames(load_aligned, working_bytes=width * height * 80)
         else:
+            from ..utils.shared_cache_budget import process_global_cache_budget
             cache = AlignedFrameCache(
                 load_aligned, max_bytes=0 if execution == "streaming" else self.aligned_cache_bytes,
                 working_bytes=width * height * 80,
+                shared_budget=process_global_cache_budget(
+                    int(_value(self.runtime_config, "fusion_cache_budget_bytes", 3 * 1024**3))),
             )
         try:
             texture = None
@@ -633,6 +670,8 @@ class QualityFusionBackend(FusionBackend):
             if valid_sources is not None:
                 labels = valid_sources.apply(labels)
             pass_number = 2
+            blend_prefetch = bool(_value(self.runtime_config, "quality_blend_prefetch", True))
+
             def load_blend_frame(index):
                 rgb = cache.for_blend(index)
                 # Remove each material's source drift before focus ownership
@@ -642,14 +681,18 @@ class QualityFusionBackend(FusionBackend):
                     rgb = surface_tone.correct(rgb, index)
                 return rgb
             with stage("quality_pass_2", second_decode=execution == "streaming",
-                       second_warp=execution == "streaming"):
+                       second_warp=execution == "streaming",
+                       blend_prefetch=blend_prefetch if execution != "streaming" else None):
                 if execution == "streaming":
                     from .quality_streaming import blend_focus_narrow
                     result = blend_focus_narrow(len(paths), load_blend_frame, labels, cancel_event=cancel_event)
                 else:
-                    result = blend_focus_pyramid(len(paths), load_blend_frame, labels, cancel_event=cancel_event)
+                    result = blend_focus_pyramid(
+                        len(paths), load_blend_frame, labels, cancel_event=cancel_event,
+                        prefetch=blend_prefetch,
+                    )
         finally:
-            cache.clear()
+            _report_cache_then_clear(cache, "aligned_frame_cache")
         del labels
         if cancel_event.is_set():
             raise RuntimeError("Quality fusion cancelled")

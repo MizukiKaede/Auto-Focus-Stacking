@@ -68,7 +68,10 @@ class HuginFocusRepair:
             labels = self.target_detail.apply(labels, raw_labels, load_aligned)
         return labels
 
-    def corrected_inputs(self, paths, load_aligned, work_dir, *, cancel_event=None, force_rewrite=False):
+    def corrected_inputs(self, paths, load_aligned, work_dir, *, cancel_event=None, force_rewrite=False,
+                         tone_tiff_compression="tiff_deflate"):
+        if tone_tiff_compression not in {"raw", "tiff_deflate"}:
+            raise ValueError("tone_tiff_compression must be raw or tiff_deflate")
         if self.tone is None and not force_rewrite:
             return paths
         from PIL import Image
@@ -87,7 +90,7 @@ class HuginFocusRepair:
             output_dir.mkdir(parents=True, exist_ok=True)
             target = output_dir / f"frame-{index:04d}.tif"
             with stage("hugin_surface_tone_tiff_write", frame=index):
-                Image.fromarray(corrected).save(target, compression="tiff_deflate")
+                Image.fromarray(corrected).save(target, compression=tone_tiff_compression)
             corrected_paths.append(target)
         diagnostic("hugin_surface_tone_inputs", frames=len(paths),
                    corrected_tiff_count=sum(a != b for a, b in zip(paths, corrected_paths)),

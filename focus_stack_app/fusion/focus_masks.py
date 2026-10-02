@@ -708,7 +708,8 @@ def focus_weight(labels, index):
 
 
 @timed("fusion")
-def blend_focus_pyramid(count, load_aligned, labels, *, cancel_event=None, levels=1):
+def blend_focus_pyramid(count, load_aligned, labels, *, cancel_event=None, levels=1,
+                        prefetch=True):
     """Blend focus winners without adding dark/bright silhouette halos.
 
     The default is a convex RGB blend with a one-pixel transition. Combining
@@ -722,27 +723,46 @@ def blend_focus_pyramid(count, load_aligned, labels, *, cancel_event=None, level
     if levels < 1:
         raise ValueError("focus blend levels must be at least 1")
     accumulators = []
-    for index in range(count):
-        if cancel_event is not None and cancel_event.is_set():
-            raise RuntimeError("focus fusion cancelled")
-        pixels = load_aligned(index).astype(np.float32)
-        weight = focus_weight(labels, index)
-        for level in range(levels):
-            last = level == levels - 1 or min(pixels.shape[:2]) <= 2
-            if not last:
-                smaller = cv2.pyrDown(pixels)
-                detail = pixels - cv2.pyrUp(smaller, dstsize=(pixels.shape[1], pixels.shape[0]))
-            else:
-                detail = pixels
-            contribution = detail * weight[..., None]
-            if index == 0:
-                accumulators.append(contribution)
-            else:
-                accumulators[level] += contribution
-            if last:
-                break
-            pixels = smaller
-            weight = cv2.pyrDown(weight)
+    if prefetch:
+        frame_iterator = _ordered_prefetched_frames(count, load_aligned, cancel_event)
+    else:
+        def synchronous_frames():
+            for index in range(count):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RuntimeError("focus fusion cancelled")
+                yield index, load_aligned(index)
+
+        frame_iterator = synchronous_frames()
+    try:
+        for index, rgb in frame_iterator:
+            # The historical synchronous path checked cancellation before
+            # loading each frame. Keep that boundary; prefetched frames also
+            # need a check after their background load has completed.
+            if prefetch and cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("focus fusion cancelled")
+            pixels = rgb.astype(np.float32)
+            del rgb
+            weight = focus_weight(labels, index)
+            for level in range(levels):
+                last = level == levels - 1 or min(pixels.shape[:2]) <= 2
+                if not last:
+                    smaller = cv2.pyrDown(pixels)
+                    detail = pixels - cv2.pyrUp(smaller, dstsize=(pixels.shape[1], pixels.shape[0]))
+                else:
+                    detail = pixels
+                contribution = detail * weight[..., None]
+                if index == 0:
+                    accumulators.append(contribution)
+                else:
+                    accumulators[level] += contribution
+                if last:
+                    break
+                pixels = smaller
+                weight = cv2.pyrDown(weight)
+    finally:
+        close = getattr(frame_iterator, "close", None)
+        if callable(close):
+            close()
     result = accumulators.pop()
     for detail in reversed(accumulators):
         result = cv2.pyrUp(result, dstsize=(detail.shape[1], detail.shape[0])) + detail

@@ -116,6 +116,99 @@ def test_stable_background_tone_tie_uses_smallest_source_index():
     assert np.unique(labels).tolist() == [0]
 
 
+def test_focus_blend_prefetch_preserves_rgb_and_source_order():
+    frames = _frames((31, 37), count=4)
+    yy, xx = np.indices(frames[0].shape[:2])
+    labels = ((yy * 3 + xx) % len(frames)).astype(np.uint16)
+
+    expected = blend_focus_pyramid(
+        len(frames), lambda index: frames[index], labels, levels=2, prefetch=False,
+    )
+
+    requested = []
+    active = maximum_active = 0
+    lock = threading.Lock()
+
+    def loader(index):
+        nonlocal active, maximum_active
+        with lock:
+            requested.append(index)
+            active += 1
+            maximum_active = max(maximum_active, active)
+        try:
+            return frames[index]
+        finally:
+            with lock:
+                active -= 1
+
+    actual = blend_focus_pyramid(
+        len(frames), loader, labels, levels=2, prefetch=True,
+    )
+
+    _exact(actual, expected)
+    assert requested == list(range(len(frames)))
+    assert maximum_active == 1
+
+
+def test_focus_blend_prefetch_cancel_closes_worker_and_disabled_path_is_sync():
+    frames = _frames((13, 17), count=3)
+    labels = _labels_for("dense", frames[0].shape[:2], count=len(frames))
+    caller = threading.current_thread()
+    synchronous_threads = []
+    sync_result = blend_focus_pyramid(
+        len(frames),
+        lambda index: (synchronous_threads.append(threading.current_thread()), frames[index])[1],
+        labels,
+        prefetch=False,
+    )
+    assert synchronous_threads == [caller] * len(frames)
+
+    cancel = threading.Event()
+    worker_threads = []
+
+    def cancelling_loader(index):
+        worker_threads.append(threading.current_thread())
+        if index == 1:
+            cancel.set()
+        return frames[index]
+
+    with pytest.raises(RuntimeError, match="cancelled"):
+        blend_focus_pyramid(
+            len(frames), cancelling_loader, labels, cancel_event=cancel, prefetch=True,
+        )
+    assert cancel.is_set()
+    assert worker_threads
+    assert all(not worker.is_alive() for worker in worker_threads)
+
+    pre_cancelled = threading.Event()
+    pre_cancelled.set()
+    loaded = []
+    with pytest.raises(RuntimeError, match="cancelled"):
+        blend_focus_pyramid(
+            len(frames), lambda index: loaded.append(index), labels,
+            cancel_event=pre_cancelled, prefetch=False,
+        )
+    assert loaded == []
+    assert sync_result.shape == frames[0].shape
+
+
+def test_focus_blend_prefetch_loader_exception_joins_worker():
+    frames = _frames((11, 15), count=3)
+    labels = _labels_for("boundary", frames[0].shape[:2], count=len(frames))
+    worker_threads = []
+
+    def failing_loader(index):
+        worker_threads.append(threading.current_thread())
+        if index == 1:
+            raise ValueError("decode failed")
+        return frames[index]
+
+    with pytest.raises(ValueError, match="decode failed"):
+        blend_focus_pyramid(len(frames), failing_loader, labels, prefetch=True)
+    assert worker_threads
+    assert all(not worker.is_alive() for worker in worker_threads)
+
+
 def test_quality_jpeg_semaphore_limits_read_only_and_allows_decode_overlap(tmp_path, monkeypatch):
     paths = [tmp_path / "a.jpg", tmp_path / "b.jpg"]
     for path in paths:
