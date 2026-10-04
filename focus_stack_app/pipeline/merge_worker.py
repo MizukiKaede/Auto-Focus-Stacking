@@ -402,12 +402,15 @@ class StackMergeService:
                     runtime_config=(runtime.get("runtime", runtime) if isinstance(runtime, Mapping)
                                     else getattr(runtime, "runtime", runtime)),
                 )
+            elif self.requested_backend == "fast":
+                from ..fusion.fast_backend import FastFusionBackend
+                self.backend = FastFusionBackend(runtime_config=runtime)
             elif self.requested_backend == "hugin_enfuse":
                 self.backend = HuginEnfuseBackend(
                     self.aligner, self.enfuser, runtime_config=runtime, logger=self.logger,
                 )
             else:
-                raise ValueError("fusion_backend must be quality or hugin_enfuse")
+                raise ValueError("fusion_backend must be quality, fast or hugin_enfuse")
         self.repository = repository
         self.cache_dir = Path(cache_dir) if cache_dir is not None else self.output_dir / ".stack_cache"
         self.temp_root = self.cache_dir / "temp"

@@ -330,8 +330,9 @@ try:  # PySide6 remains optional for headless tests and package imports.
             self.backend_combo = QComboBox()
             self.backend_combo.setObjectName("fusionBackend")
             self.backend_combo.addItem("高质量合成引擎（全分辨率内存融合·推荐）", "quality")
+            self.backend_combo.addItem("Fast 快速合成（C++）", "fast")
             self.backend_combo.addItem("实验模式（Hugin 对齐 / Enfuse 合成）", "hugin_enfuse")
-            self.backend_combo.setToolTip("高质量：全分辨率内存对齐与边缘一致性融合；实验：Hugin 对齐及 Enfuse 合成。")
+            self.backend_combo.setToolTip("高质量：全分辨率内存对齐与边缘一致性融合；Fast：快速焦点融合；实验：Hugin 对齐及 Enfuse 合成。")
             self.backend_combo.setCurrentIndex(0)
             advanced_form.addRow("合成引擎", self.backend_combo)
 

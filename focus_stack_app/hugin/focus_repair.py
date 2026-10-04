@@ -10,7 +10,7 @@ from pathlib import Path
 from ..utils.performance import diagnostic, stage
 
 
-HUGIN_FOCUS_REPAIR_VERSION = "hugin-material-ownership-v6-stack-consistent-local-detail"
+HUGIN_FOCUS_REPAIR_VERSION = "hugin-material-ownership-v7-interior-texture-detail"
 
 
 class HuginFocusRepair:
@@ -20,6 +20,7 @@ class HuginFocusRepair:
         self.texture = None
         self.exterior = None
         self.target_detail = None
+        self.interior_texture = None
         if stabilize_texture:
             from ..fusion.quality_fusion import FlatTextureStatistics
             self.texture = FlatTextureStatistics(reference_index, edge_mode=edge_mode)
@@ -31,6 +32,8 @@ class HuginFocusRepair:
             self.exterior = ExteriorRimOwnership()
             from .target_detail import NeutralTargetDetail
             self.target_detail = NeutralTargetDetail()
+            from .interior_texture_detail import InteriorTextureDetail
+            self.interior_texture = InteriorTextureDetail()
         if surface_tone:
             from ..fusion.surface_tone import SurfaceToneHarmonizer
             self.tone = SurfaceToneHarmonizer(reference_index)
@@ -47,6 +50,7 @@ class HuginFocusRepair:
             self.printed.observe(index, rgb, gray, score)
             self.exterior.observe(index, rgb)
             self.target_detail.observe(index, rgb, gray, score)
+            self.interior_texture.observe(index, rgb, gray, score)
         if self.tone is not None:
             self.tone.observe(index, rgb)
 
@@ -58,7 +62,12 @@ class HuginFocusRepair:
         # Run after Hugin's texture regularizer. Ink and its adjacent
         # paint fringe must retain one continuous source at the final step.
         if self.boundary is not None:
+            boundary_input = labels
             labels = self.boundary.apply(labels)
+            if self.interior_texture is not None and load_aligned is not None:
+                labels = self.interior_texture.apply(
+                    labels, boundary_input, load_aligned, self.exterior.interior,
+                )
             labels = self.printed.apply(
                 labels, protected_texture=self.boundary.texture_protection(labels.shape),
             )
