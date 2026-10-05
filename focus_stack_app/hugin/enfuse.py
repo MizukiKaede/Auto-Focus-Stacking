@@ -65,7 +65,8 @@ class EnfuseError(RuntimeError):
         super().__init__(message)
 
 
-def _prepare_alignment_refiner(image_loader, preparation_image_loader, reference_index, frame_count):
+def _prepare_alignment_refiner(image_loader, preparation_image_loader, reference_index, frame_count,
+                               *, cpu_budget=12, cancel_event=None):
     """Prepare residual transforms without consuming reusable TIFF decodes.
 
     The preparation scan needs to inspect every aligned frame before any
@@ -75,14 +76,52 @@ def _prepare_alignment_refiner(image_loader, preparation_image_loader, reference
     """
     from .alignment_refinement import HuginAlignmentRefiner
 
+    if cancel_event is not None and cancel_event.is_set():
+        raise EnfuseError("Enfuse cancelled while preparing alignment")
     prepare_loader = preparation_image_loader or image_loader
     refiner = HuginAlignmentRefiner(prepare_loader, reference_index)
-    refiner.prepare(frame_count)
+    refiner.cpu_budget = cpu_budget
+    try:
+        if cpu_budget == 12 and cancel_event is None:
+            refiner.prepare(frame_count)
+        else:
+            refiner.prepare(frame_count, cancel_event=cancel_event)
+    except InterruptedError as exc:
+        raise EnfuseError("Enfuse cancelled while preparing alignment") from exc
     # Keep the established forward-consumption behavior once all affine
     # decisions are fixed. This lets the caller release bounded cached frames
     # as focus labels are computed.
     refiner.loader = image_loader
     return refiner
+
+
+def _write_hard_masks(labels, frame_count, work, *, cpu_budget=12, cancel_event=None):
+    from PIL import Image
+    from ..fusion.fast_cpp import hard_mask, runtime_info
+    from .parallel import bounded_map, validate_budget
+
+    validate_budget(cpu_budget)
+    if cancel_event is not None and cancel_event.is_set():
+        raise EnfuseError("Enfuse cancelled while generating focus masks")
+    work = Path(work)
+    work.mkdir(parents=True, exist_ok=True)
+    digits = len(str(frame_count))
+    def write(index):
+        mask = hard_mask(labels, index)
+        if cancel_event is not None and cancel_event.is_set():
+            raise InterruptedError("Hugin focus-mask export cancelled")
+        with stage("focus_mask_tiff_write", frame=index):
+            Image.fromarray(mask).save(work / f"hardmask-{index + 1:0{digits}}.tif",
+                                       compression="tiff_deflate")
+
+    try:
+        for _ in bounded_map(write, range(frame_count), workers=cpu_budget,
+                             cpu_budget=cpu_budget, cancel_event=cancel_event,
+                             working_bytes=labels.size * 3):
+            pass
+    except InterruptedError as exc:
+        raise EnfuseError("Enfuse cancelled while generating focus masks") from exc
+    diagnostic("hugin_native_execution", **runtime_info())
 
 
 class Enfuser:
@@ -160,8 +199,11 @@ class Enfuser:
         focus_gate_edge_mode: str = "localized",
         focus_edge_ownership: bool = True,
         focus_surface_tone: bool = True,
+        hugin_parallel_cpu_budget: int = 12,
     ) -> EnfuseResult:
         paths = tuple(Path(item) for item in aligned_paths)
+        from .parallel import validate_budget
+        validate_budget(hugin_parallel_cpu_budget)
         refined_frame_cache_bytes = int(refined_frame_cache_bytes)
         if refined_frame_cache_bytes < 0:
             raise ValueError("refined frame cache limit cannot be negative")
@@ -209,7 +251,6 @@ class Enfuser:
             and self.config.exposure_weight == self.config.saturation_weight == self.config.entropy_weight == 0
             and not any(arg.startswith(mask_options) for arg in self.config.extra_args)
         ):
-            from PIL import Image
             from ..fusion.focus_masks import build_focus_labels, SurfaceToneMonitor
             from ..utils.image_io import load_rgb
 
@@ -220,6 +261,7 @@ class Enfuser:
                     alignment_refiner = _prepare_alignment_refiner(
                         aligned_loader, preparation_image_loader,
                         focus_reference_index, len(paths),
+                        cpu_budget=hugin_parallel_cpu_budget, cancel_event=cancel_event,
                     )
                     aligned_loader = alignment_refiner.load
                 refined_frame_cache = None
@@ -292,14 +334,9 @@ class Enfuser:
                                protect_chromatic_edges=focus_mask_mode == "legacy",
                                edge_ownership=bool(repair is not None and repair.boundary is not None),
                                surface_tone=bool(repair is not None and repair.tone is not None))
-                    digits = len(str(len(paths)))
-                    for index in range(len(paths)):
-                        if cancel_event is not None and cancel_event.is_set():
-                            raise EnfuseError("Enfuse cancelled while generating focus masks")
-                        mask = (labels == index).astype("uint8") * 255
-                        with stage("focus_mask_tiff_write", frame=index):
-                            Image.fromarray(mask).save(work / f"hardmask-{index + 1:0{digits}}.tif", compression="tiff_deflate")
-                    del labels, mask
+                    _write_hard_masks(labels, len(paths), work,
+                                      cpu_budget=hugin_parallel_cpu_budget, cancel_event=cancel_event)
+                    del labels
                     if repair is not None:
                         tone_loader = (refined_frame_cache.for_blend
                                        if refined_frame_cache is not None else aligned_loader)

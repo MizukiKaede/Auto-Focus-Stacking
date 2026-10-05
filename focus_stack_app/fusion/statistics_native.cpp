@@ -5,8 +5,12 @@
 #include <cstdint>
 #include <limits>
 #define API extern "C" __declspec(dllexport)
+#include "native_threads.h"
+API int statistics_core_abi() { return 1; }
 API void probe_update(const uint8_t* classes, const uint8_t* rgb, uint8_t* lo, uint8_t* hi, uint16_t* count, int64_t n) {
+    NATIVE_FOR(n)
     for (int64_t i=0;i<n;++i) {
+        if(classes[i]>=16) continue;
         const int64_t p=int64_t(classes[i])*n+i;
         ++count[p];
         for(int c=0;c<3;++c) { lo[p*3+c]=std::min(lo[p*3+c],rgb[i*3+c]); hi[p*3+c]=std::max(hi[p*3+c],rgb[i*3+c]); }
@@ -30,7 +34,7 @@ API void flat_noise(const uint8_t* bins,const float* vs,const float* gs,const fl
                     float* ff,float* fv,float* fg,int64_t* samples,int64_t* fallbacks,
                     float* focus_floor,float* variance_floor,float* gradient_floor) {
     std::array<std::vector<int64_t>,16> groups;
-    for(int64_t i=0;i<n;++i) groups[bins[i]].push_back(i);
+    for(int64_t i=0;i<n;++i) if(bins[i]<16) groups[bins[i]].push_back(i);
     for(int b=0;b<16;++b) {
         ff[b]=fv[b]=fg[b]=0;
         const auto& indices=groups[b];
@@ -67,6 +71,7 @@ API void flat_noise(const uint8_t* bins,const float* vs,const float* gs,const fl
     }
 }
 API void chroma_map(const uint8_t* rgb,uint8_t* chroma,int64_t n) {
+    NATIVE_FOR(n)
     for(int64_t i=0;i<n;++i) {
         auto p=rgb+3*i;
         chroma[i]=std::max(p[0],std::max(p[1],p[2]))-std::min(p[0],std::min(p[1],p[2]));
@@ -75,15 +80,18 @@ API void chroma_map(const uint8_t* rgb,uint8_t* chroma,int64_t n) {
 
 // Pixel loops retain NumPy float32 operation order; no fast-math or FMA.
 API void material_classes(const uint8_t* hsv,const uint8_t* gray,uint8_t* out,int64_t n) {
+    NATIVE_FOR(n)
     for(int64_t i=0;i<n;++i) {
         if(hsv[3*i+1]>=50) out[i]=1+((unsigned(hsv[3*i])+15)/30)%6+6*(gray[i]<64);
         else out[i]=13+(gray[i]>=64)+(gray[i]>=160);
     }
 }
 API void masked_colour(const float* rgb,const uint8_t* mask,float* out,int64_t n) {
+    NATIVE_FOR(n)
     for(int64_t i=0;i<n;++i) for(int c=0;c<3;++c) out[3*i+c]=rgb[3*i+c]*float(mask[i]);
 }
 API void normalize_colour(float* field,const float* density,int64_t n) {
+    NATIVE_FOR(n)
     for(int64_t i=0;i<n;++i) {
         const float d=std::max(density[i],1e-6f);
         for(int c=0;c<3;++c) field[3*i+c]=field[3*i+c]/d;
@@ -92,6 +100,7 @@ API void normalize_colour(float* field,const float* density,int64_t n) {
 static float clip01(float v) {return std::max(0.0f,std::min(1.0f,v));}
 API void update_offset(const uint8_t* classes,uint8_t material,const float* delta,const float* density,
                        float* offset,uint8_t* confidence,int64_t n) {
+    NATIVE_FOR(n)
     for(int64_t i=0;i<n;++i) if(classes[i]==material && density[i]>1e-6f) {
         const float magnitude=std::max(std::abs(delta[3*i]),std::max(std::abs(delta[3*i+1]),std::abs(delta[3*i+2])));
         float alpha=clip01((magnitude-1.0f)/3.0f);
@@ -103,6 +112,7 @@ API void update_offset(const uint8_t* classes,uint8_t material,const float* delt
 }
 API int64_t apply_colour(const uint8_t* rgb,const float* field,const uint8_t* valid,uint8_t* out,int64_t n) {
     int64_t changed=0;
+    NATIVE_SUM(n, changed)
     for(int64_t i=0;i<n;++i) {
         bool different=false;
         for(int c=0;c<3;++c) {

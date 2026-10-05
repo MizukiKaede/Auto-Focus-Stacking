@@ -33,8 +33,8 @@ class InteriorTextureDetail:
         xx = cv2.GaussianBlur(gx * gx, (0, 0), 3.0)
         xy = cv2.GaussianBlur(gx * gy, (0, 0), 3.0)
         yy = cv2.GaussianBlur(gy * gy, (0, 0), 3.0)
-        coherence = np.sqrt((xx - yy) ** 2 + 4.0 * xy * xy) / np.maximum(xx + yy, 1e-8)
-        textured = (energy > (6.0 / 255.0) ** 2) & (coherence < 0.6)
+        from ..fusion.fast_cpp import structure_tensor_texture
+        textured = structure_tensor_texture(xx, yy, xy, energy)
         if self.best is None:
             self.best = score.copy()
             self.owner = np.full(score.shape, index, np.uint16)

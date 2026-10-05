@@ -21,7 +21,7 @@ class ExteriorRimOwnership:
 
     def observe(self, index, rgb):
         from ..fusion.focus_masks import _filled_chromatic_silhouette, focus_response
-        from ..fusion.quality_fusion import _nearest_edge_support
+        from ..fusion.fast_cpp import nearest_support as _nearest_edge_support
 
         height, width = rgb.shape[:2]
         self.scale = min(0.5, (self.maximum_pixels / (height * width)) ** 0.5)

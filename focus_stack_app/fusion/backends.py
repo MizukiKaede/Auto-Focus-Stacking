@@ -1,5 +1,6 @@
 """The production quality backend and the experimental Hugin backend."""
 from __future__ import annotations
+from .native_runtime import native_fusion
 
 from abc import ABC, abstractmethod
 from copy import copy
@@ -331,6 +332,9 @@ class HuginEnfuseBackend(FusionBackend):
                 "output_config": output_config,
             }
             if isinstance(self.enfuser, Enfuser):
+                fuse_kwargs["hugin_parallel_cpu_budget"] = _value(
+                    self.runtime_config, "hugin_parallel_cpu_budget", 12,
+                )
                 fuse_kwargs["image_loader"] = (
                     lambda index: aligned_cache.load(alignment.aligned_paths[index])
                 )
@@ -416,6 +420,7 @@ class QualityFusionBackend(FusionBackend):
             raise ValueError("aligned cache limit cannot be negative")
 
     @profiled_fusion
+    @native_fusion
     def fuse(self, group, analysis, output_path, work_dir, output_config, cancel_event) -> FusionResult:
         import cv2
         import numpy as np

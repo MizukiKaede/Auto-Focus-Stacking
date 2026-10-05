@@ -1,0 +1,49 @@
+{
+  "compiler": "mingw",
+  "compiler_version": "g++.exe (MinGW-W64 x86_64-msvcrt-posix-seh, built by Brecht Sanders) 13.1.0",
+  "commands": [
+    [
+      "C:\\Strawberry\\c\\bin\\g++.exe",
+      "-std=c++17",
+      "-O2",
+      "-fno-fast-math",
+      "-ffp-contract=off",
+      "-shared",
+      "-static-libgcc",
+      "-static-libstdc++",
+      "-fopenmp",
+      "D:\\TEMP\\code\\diagnostics\\hugin_native_20261005_v1\\candidate\\src\\focus_stack_app\\fusion\\fast_core.cpp",
+      "-o",
+      "D:\\TEMP\\code\\diagnostics\\hugin_native_20261005_v1\\candidate\\src\\focus_stack_app\\native-build-275zlq0w\\fast_core.dll"
+    ],
+    [
+      "C:\\Strawberry\\c\\bin\\g++.exe",
+      "-std=c++17",
+      "-O2",
+      "-fno-fast-math",
+      "-ffp-contract=off",
+      "-shared",
+      "-static-libgcc",
+      "-static-libstdc++",
+      "-fopenmp",
+      "D:\\TEMP\\code\\diagnostics\\hugin_native_20261005_v1\\candidate\\src\\focus_stack_app\\fusion\\statistics_native.cpp",
+      "-o",
+      "D:\\TEMP\\code\\diagnostics\\hugin_native_20261005_v1\\candidate\\src\\focus_stack_app\\native-build-275zlq0w\\statistics_native.dll"
+    ]
+  ],
+  "openmp": "on",
+  "architecture": "x64",
+  "dependencies": {
+    "libgomp-1.dll": "C:\\Strawberry\\c\\bin\\libgomp-1.dll",
+    "libwinpthread-1.dll": "C:\\Strawberry\\c\\bin\\libwinpthread-1.dll",
+    "libdl.dll": "C:\\Strawberry\\c\\bin\\libdl.dll",
+    "libgcc_s_seh-1.dll": "C:\\Strawberry\\c\\bin\\libgcc_s_seh-1.dll"
+  },
+  "output": "D:\\TEMP\\code\\diagnostics\\hugin_native_20261005_v1\\candidate\\src\\focus_stack_app\\fusion",
+  "hugin_adoption_libraries": [
+    "fast_core.dll"
+  ],
+  "statistics_native_dll": "Preserved byte-for-byte from task-start snapshot; statistics source unchanged",
+  "hugin_parallel_cpu_budget_default": 12,
+  "hugin_budget12_change": "Python scheduling/defaults only; compiled DLLs preserved from frozen source"
+}

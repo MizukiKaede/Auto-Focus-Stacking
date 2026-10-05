@@ -73,6 +73,20 @@ tests/          自动化测试
 Fast 使用随项目附带的 Windows 64 位 `fast_core.dll`，版本为 `fast-cpp-v4-print-statistics`；
 原高质量、Hugin/Enfuse 的算法及默认参数保持不变。
 
+Quality/Fast 的原生库无法加载时，会记录原因并使用相同算法的 NumPy/OpenCV 实现继续合成，
+耗时可能增加。详情见 [原生构建与降级说明](docs/native_kernels.md)。
+Windows x64 可执行 `python build_cpp.py --compiler auto --openmp on` 构建两个库，
+默认保存到 `build/native`，不会自动替换随应用附带的 DLL。
+
+### 本版 Hugin / Enfuse 改动
+
+- Hugin 外沿归属复用 Fast C++ 内核中的 `nearest_support`；内部纹理的结构张量相干性判定和焦点硬蒙版生成改用原生 C++ 算子。
+- 硬蒙版仍输出 0/255、Deflate 压缩的 TIFF；蒙版任务受进程共享的 12 CPU 预算和内存准入限制，取消时会停止提交后续任务并等待在途任务退出。
+- 残差 ECC 按合成组逐帧串行执行，组与组之间仍可并行；保留 OpenCV 线程设置及原有残差验收门槛，任一帧不通过时整组回退到 Hugin 原坐标。
+- 引用对话中的定向验收：7 项检查通过；00522 的 50 帧复测中，首轮对齐通过，49 次 ECC 串行完成且无异常，14 帧未通过原残差门槛并按原规则回退。未执行完整融合或本版整批速度测试。
+- 历史 3.4 批次曾比 3.3 慢；这些记录不是最终串行 ECC 版本的性能结论，因此本版不宣称整批提速。
+
 完整实现与系统说明见 [技术文档](docs/技术文档.md)、[技术架构](docs/技术架构.md) 及 [重构UI说明](docs/重构ui.md)。
 
-本地照片、生成结果、诊断日志、缓存、虚拟环境和运行时依赖不会提交到 Git。
+本地照片、生成结果、诊断日志、缓存、虚拟环境和 `.runtime-deps` 开发依赖不会提交到 Git。
+原生内核所需的可分发 DLL 与许可证随应用打包。

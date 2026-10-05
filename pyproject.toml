@@ -28,7 +28,7 @@ include = ["focus_stack_app*"]
 
 [tool.setuptools.package-data]
 "focus_stack_app.ui" = ["icons/*.svg"]
-"focus_stack_app.fusion" = ["statistics_native.dll", "statistics_native.cpp", "fast_core.dll", "fast_core.cpp"]
+"focus_stack_app.fusion" = ["*.dll", "*.cpp", "*.h", "build_manifest.json", "native_runtime_licenses/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

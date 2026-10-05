@@ -1,4 +1,5 @@
 """Independent Fast backend; existing backends remain unchanged."""
+from .native_runtime import native_fusion
 from pathlib import Path
 from typing import Mapping
 from .backends import FusionBackend, FusionResult, _value
@@ -16,6 +17,7 @@ class FastFusionBackend(FusionBackend):
                                else getattr(runtime_config, "runtime", runtime_config))
 
     @profiled_fusion
+    @native_fusion
     def fuse(self, group, analysis, output_path, work_dir, output_config, cancel_event):
         import numpy as np
         from PIL import Image

@@ -151,7 +151,9 @@ def test_quality_mode_repairs_sources_before_real_enfuse_command(
     )
 
     assert result.ok
-    assert steps == ["regularizer", "texture", "boundary", "printed", "tone_inputs"]
+    # Quality-mode Hugin repairs own texture stabilization through
+    # HuginFocusRepair.texture, so the separate neutral-label pass is skipped.
+    assert steps == ["texture", "boundary", "printed", "tone_inputs"]
     command = runner.commands[-1]
     assert f"--levels={expected_levels}" in command
     inputs = [Path(item) for item in command[command.index("-o") + 2:]]

@@ -182,8 +182,17 @@ class RuntimeConfig:
     # Hugin's corrected intermediate TIFFs trade disk space for CPU time.
     # Direct Enfuser/repair API calls keep their historical deflate default.
     hugin_tone_tiff_compression: str = "raw"
+    # 0: accepted per-mode automatic budget; 1: serial; >1: bounded opt-in.
+    native_threads: int = 0
+    # Shared across Hugin preparation tasks in this process, including ECC teams.
+    hugin_parallel_cpu_budget: int = 12
 
     def __post_init__(self) -> None:
+        if (type(self.hugin_parallel_cpu_budget) is not int
+                or not 1 <= self.hugin_parallel_cpu_budget <= 12):
+            raise ValueError("hugin_parallel_cpu_budget must be an integer between 1 and 12")
+        if not isinstance(self.native_threads, int) or self.native_threads < 0:
+            raise ValueError("native_threads must be a nonnegative integer")
         if not 1 <= int(self.max_hugin_workers) <= 6:
             raise ValueError("max_hugin_workers must be between 1 and 6")
         if not 0 <= int(self.focus_analysis_workers) <= 10:

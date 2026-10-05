@@ -4,15 +4,32 @@
 #include <cstring>
 #include <vector>
 #define API extern "C" __declspec(dllexport)
+#include "native_threads.h"
 using U8 = uint8_t;
 using U16 = uint16_t;
 using I64 = int64_t;
 
 API int fast_core_abi() { return 3; }
+API void structure_tensor_texture(const float* xx,const float* yy,const float* xy,
+                                  const float* energy,U8* out,I64 n) {
+    const float threshold=float((6.0/255.0)*(6.0/255.0));
+    NATIVE_FOR(n)
+    for(I64 i=0;i<n;++i) {
+        const float diff=xx[i]-yy[i];
+        const float coherence=std::sqrt(diff*diff+4.0f*xy[i]*xy[i])
+                              /std::max(xx[i]+yy[i],1e-8f);
+        out[i]=energy[i]>threshold && coherence<0.6f;
+    }
+}
+// Parallelism is across TIFFs. Never multiply that by an inner OpenMP team.
+API void hard_mask(const U16* labels,U16 index,U8* out,I64 n) {
+    for(I64 i=0;i<n;++i) out[i]=labels[i]==index ? 255 : 0;
+}
 static U8 byte_round(float v) {
     return U8(std::min(255.0f, std::max(0.0f, std::nearbyint(v))));
 }
 API void rgb_chroma(const U8* rgb, U8* out, int h, int w, I64 stride) {
+    NATIVE_FOR(I64(h)*w)
     for (int y=0;y<h;++y) for(int x=0;x<w;++x) {
         const U8* p=rgb+y*stride+x*3;
         out[I64(y)*w+x]=std::max({p[0],p[1],p[2]})-std::min({p[0],p[1],p[2]});
@@ -20,12 +37,14 @@ API void rgb_chroma(const U8* rgb, U8* out, int h, int w, I64 stride) {
 }
 API void independent_detail(const float* detail,const float* broad,const float* gradient,
                             float floor,U8* out,I64 n) {
+    NATIVE_FOR(n)
     for(I64 i=0;i<n;++i)
         out[i]=detail[i]>floor && (detail[i]>2.0f*broad[i] || detail[i]>16.0f*gradient[i]);
 }
 API void focus_fields(const float* xx,const float* yy,const float* xy,const float* gradient,
                       const float* variance,const float* detail,float floor,
                       float* base,float* sharp,U8* texture,I64 n) {
+    NATIVE_FOR(n)
     for(I64 i=0;i<n;++i) {
         const float trace=xx[i]+yy[i], d=xx[i]-yy[i];
         base[i]=0.65f*gradient[i]+0.35f*trace+0.10f*std::max(variance[i],0.0f);
@@ -39,6 +58,7 @@ API void proxy_winners(const U8* valid,const U8* evidence,const U8* texture,
                        const float* score,const float* detail,U16 index,
                        float* best,U16* labels,float* detail_best,U16* detail_owner,
                        float* local_best,U16* local_owner,U8* textured,U8* local_better,I64 n) {
+    NATIVE_FOR(n)
     for(I64 i=0;i<n;++i) {
         local_better[i]=0;
         if(!valid[i]) continue;
@@ -53,6 +73,7 @@ API void proxy_winners(const U8* valid,const U8* evidence,const U8* texture,
 API void preserve_detail(U16* result,const U16* propagated,const float* propagated_detail,
                          const float* local_best,const U16* local_owner,const U8* active,
                          U8* independent,I64 n) {
+    NATIVE_FOR(n)
     for(I64 i=0;i<n;++i) {
         independent[i]=active[i] && local_best[i]>0.0f && propagated_detail[i]<0.7f*local_best[i];
         if(active[i]) result[i]=independent[i]?local_owner[i]:propagated[i];
@@ -60,6 +81,7 @@ API void preserve_detail(U16* result,const U16* propagated,const float* propagat
 }
 API void neutral_seed_filter(const I64* positions,const float* details,const float* local_best,
                              const U8* chroma,const U8* foreground,const U8* material,U8* use,I64 n) {
+    NATIVE_FOR(n)
     for(I64 j=0;j<n;++j) {
         const I64 i=positions[j];
         use[j]=local_best[i]>0.0f && chroma[i]<65 && foreground[i] && material[i]
@@ -68,6 +90,7 @@ API void neutral_seed_filter(const I64* positions,const float* details,const flo
 }
 API void neutral_update(const U8* targets,const U8* material,const float* strength,
                          float* best,U16* owner,U8* chroma,U16 index,I64 n) {
+    NATIVE_FOR(n)
     for(I64 i=0;i<n;++i) if(targets[i] && material[i] && strength[i]>best[i]) {
         best[i]=strength[i];owner[i]=index;chroma[i]=0;
     }
@@ -75,12 +98,14 @@ API void neutral_update(const U8* targets,const U8* material,const float* streng
 API void neutral_apply(U16* result,const U16* owner,const float* best,const U8* chroma,
                         const U8* protected_pixels,I64* counts,I64 n) {
     I64 guarded=0,changed=0;
+    NATIVE_SUM(n, guarded, changed)
     for(I64 i=0;i<n;++i) if(best[i]>1e-6f && chroma[i]<65 && !protected_pixels[i]) {
         ++guarded;changed+=result[i]!=owner[i];result[i]=owner[i];
     }
     counts[0]=guarded;counts[1]=changed;
 }
 API void support_inputs(const float* strength,const U8* edge,float* present,float* masked,I64 n) {
+    NATIVE_FOR(n)
     for(I64 i=0;i<n;++i) {present[i]=edge[i]?1.0f:0.0f;masked[i]=strength[i]*present[i];}
 }
 API int nearest_support(const U8* present,const float* density,const float* averaged,
@@ -92,6 +117,7 @@ API int nearest_support(const U8* present,const float* density,const float* aver
         for(I64 i=0;i<n;++i) if(present[i])
             values[nearest[i]]=averaged[i]/std::max(density[i],1e-6f);
         const float denominator=std::max(2.0f,radius/4.0f);
+    NATIVE_FOR(n)
         for(I64 i=0;i<n;++i) {
             const float weight=std::min(1.0f,std::max(0.0f,(radius+1.0f-distance[i])/denominator));
             out[i]=values[nearest[i]]*weight;
@@ -101,12 +127,14 @@ API int nearest_support(const U8* present,const float* density,const float* aver
 }
 API void contour_energy(const float* gradient,const float* detail,const U8* seeds,
                          float* present,float* weighted,I64 n) {
+    NATIVE_FOR(n)
     for(I64 i=0;i<n;++i) {
         present[i]=seeds[i]?1.0f:0.0f;
         weighted[i]=gradient[i]*std::sqrt(std::max(detail[i],0.0f))*present[i];
     }
 }
 API void normalize_field(float* field,const float* density,I64 n) {
+    NATIVE_FOR(n)
     for(I64 i=0;i<n;++i) field[i]/=std::max(density[i],1e-6f);
 }
 API void native_rank(float* best,U16* owner,float* reference_score,const U8* mask,
@@ -171,17 +199,20 @@ API void render_destroy(void* p) {delete static_cast<Render*>(p);}
 API I64 render_seams(void* p) {return I64(static_cast<Render*>(p)->seam.size());}
 API I64 render_owner(void* p,U16 index,U8* owner) {
     auto& s=*static_cast<Render*>(p);I64 count=0;
+    NATIVE_SUM(s.n, count)
     for(I64 i=0;i<s.n;++i) {owner[i]=s.labels[i]==index;count+=owner[i];}
     return count;
 }
 API void render_add(void* p,U16 index,const U8* rgb,const U8* valid,
                      const float* feather,U8* output) {
     auto& s=*static_cast<Render*>(p);
+    NATIVE_FOR(s.n)
     for(I64 i=0;i<s.n;++i) if(s.labels[i]==index && !s.band[i] && valid[i]) {
         std::memcpy(output+i*3,rgb+i*3,3);s.copied[i]=1;
     }
     if(!feather) return;
-    for(size_t j=0;j<s.seam.size();++j) {
+    NATIVE_FOR(I64(s.seam.size()))
+    for(I64 j=0;j<I64(s.seam.size());++j) {
         const I64 i=s.seam[j];const float weight=feather[i]*float(valid[i]);
         for(int c=0;c<3;++c) s.colors[j*3+c]+=float(rgb[i*3+c])*weight;
         s.weights[j]+=weight;
@@ -189,10 +220,14 @@ API void render_add(void* p,U16 index,const U8* rgb,const U8* valid,
 }
 API I64 render_finish(void* p,U8* output) {
     auto& s=*static_cast<Render*>(p);
-    for(size_t j=0;j<s.seam.size();++j) if(s.weights[j]>1e-8f) {
+    NATIVE_FOR(I64(s.seam.size()))
+    for(I64 j=0;j<I64(s.seam.size());++j) if(s.weights[j]>1e-8f) {
         const I64 i=s.seam[j];
         for(int c=0;c<3;++c) output[i*3+c]=byte_round(s.colors[j*3+c]/s.weights[j]);
         s.copied[i]=1;
     }
-    I64 missing=0;for(auto v:s.copied) missing+=!v;return missing;
+    I64 missing=0;
+    NATIVE_SUM(s.n, missing)
+    for(I64 i=0;i<s.n;++i) missing+=!s.copied[i];
+    return missing;
 }

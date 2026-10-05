@@ -77,7 +77,11 @@ def _make_harness(candidate_package, monkeypatch, tmp_path, *, repair_failure=No
             records["refined_load"].append(index)
             return self.consumer_loader(index)
 
-    def prepare_refiner(consumer_loader, preparation_loader, reference_index, count):
+    def prepare_refiner(consumer_loader, preparation_loader, reference_index, count,
+                        *, cpu_budget=12, cancel_event=None):
+        assert cpu_budget in (6, 12)
+        records["prepare_cpu_budget"] = cpu_budget
+        records["prepare_cancel_event"] = cancel_event
         assert preparation_loader is not None
         prep_order = [reference_index, *(i for i in range(count) if i != reference_index)]
         for index in prep_order:
@@ -206,10 +210,8 @@ def _make_harness(candidate_package, monkeypatch, tmp_path, *, repair_failure=No
 
 
 def _fuse(harness, tmp_path, *, cancel_event=None, edge=True, tone=True,
-          tone_tiff_compression="tiff_deflate"):
-    return harness.enfuser.fuse(
-        harness.paths,
-        tmp_path / "output.tif",
+          tone_tiff_compression="tiff_deflate", hugin_cpu_budget=None):
+    kwargs = dict(
         work_dir=tmp_path / "work",
         cleanup_on_success=False,
         image_loader=lambda index: harness.images[index],
@@ -223,18 +225,27 @@ def _fuse(harness, tmp_path, *, cancel_event=None, edge=True, tone=True,
         focus_surface_tone=tone,
         cancel_event=cancel_event,
     )
+    if hugin_cpu_budget is not None:
+        kwargs["hugin_parallel_cpu_budget"] = hugin_cpu_budget
+    return harness.enfuser.fuse(harness.paths, tmp_path / "output.tif", **kwargs)
 
 
 @pytest.mark.parametrize("compression", ["tiff_deflate", "raw"])
+@pytest.mark.parametrize("configured_budget", [None, 6])
 def test_refined_cache_starts_after_prepare_and_reuses_focus_repair_and_tone(
-    candidate_package, monkeypatch, tmp_path, compression,
+    candidate_package, monkeypatch, tmp_path, compression, configured_budget,
 ):
     harness = _make_harness(candidate_package, monkeypatch, tmp_path)
 
-    result = _fuse(harness, tmp_path, tone_tiff_compression=compression)
+    result = _fuse(
+        harness, tmp_path, tone_tiff_compression=compression,
+        hugin_cpu_budget=configured_budget,
+    )
 
     assert result.ok
     assert harness.records["prepare"] == [1, 0]
+    assert harness.records["prepare_cpu_budget"] == (12 if configured_budget is None else configured_budget)
+    assert harness.records["prepare_cancel_event"] is None
     assert harness.records["focus"] == [0, 1]
     assert harness.records["repair_observe"] == [0, 1]
     assert harness.records["repair_apply"] == [0, 1]
@@ -271,6 +282,8 @@ def test_refined_cache_releases_shared_budget_on_repair_error_or_cancellation(
     with pytest.raises(expected):
         _fuse(harness, tmp_path, cancel_event=cancel_event)
 
+    assert harness.records["prepare_cpu_budget"] == 12
+    assert harness.records["prepare_cancel_event"] is cancel_event
     assert len(harness.caches) == 1
     assert harness.caches[0].bytes_used == 0
     assert harness.budget.bytes_used == 0

@@ -514,54 +514,53 @@ def render_fast_stream(paths, indices, transforms, analysis_shapes,
     boundary[:-1, :] |= dy
     radius_kernel = np.ones((2 * seam_radius + 1, 2 * seam_radius + 1), np.uint8)
     band = cv2.dilate(boundary, radius_kernel) != 0
-    accumulator = cpp.RenderAccumulator(labels, band)
-    seam_count = accumulator.seam_count
-    output = None
-    decoded = 0
-    fallback = 0
-    order = [reference_index] + [i for i in range(len(paths)) if i != reference_index]
-    for local in order:
-        _check_cancel(cancel_event)
-        owner, owner_count = accumulator.owner(local)
-        encoded = encoded_sources.pop(local)
-        if not owner_count and local != reference_index and (native is None or not native.tiles):
-            continue
-        index = indices[local]
-        with stage("fast_full_decode", frame=local):
-            source = _read_rgb_image(encoded)
-        del encoded
-        decoded += 1
-        matrix = scaled_matrix(transforms[index], analysis_shapes[index], source.shape[:2],
-                               reference_analysis_shape, full_shape)
-        with stage("fast_full_warp", frame=local):
-            aligned = cv2.warpPerspective(source, matrix, (w, h), flags=cv2.INTER_CUBIC,
-                                          borderMode=cv2.BORDER_REFLECT_101)
-            valid = _warp_valid(source.shape[:2], matrix, full_shape)
-        del source
-        if native is not None:
-            with stage('fast_native_boundary_rank', frame=local):
-                native.rank(aligned, valid, local)
-        if tone_model is not None:
+    with cpp.RenderAccumulator(labels, band) as accumulator:
+        seam_count = accumulator.seam_count
+        output = None
+        decoded = 0
+        fallback = 0
+        order = [reference_index] + [i for i in range(len(paths)) if i != reference_index]
+        for local in order:
             _check_cancel(cancel_event)
-            with stage("fast_paired_tone", frame=local):
-                aligned = tone_model.correct(aligned, local)
-        if native is not None:
-            native.capture_corrected(aligned)
-        if output is None:
-            output = aligned.copy()  # Explicit reference fallback, including true black pixels.
-        with stage("fast_copy_and_seam", frame=local):
-            feather = None
-            if seam_count and owner_count:
-                feather = cv2.GaussianBlur(owner.astype(np.float32),
-                                          (2 * seam_radius + 1, 2 * seam_radius + 1),
-                                          sigmaX=max(0.6, seam_radius / 2))
-            accumulator.add(local, aligned, valid, feather, output)
-            del feather
-        del aligned, valid
-    _check_cancel(cancel_event)
-    with stage("fast_finish_seams"):
-        fallback = accumulator.finish(output)
-    accumulator.close()
+            owner, owner_count = accumulator.owner(local)
+            encoded = encoded_sources.pop(local)
+            if not owner_count and local != reference_index and (native is None or not native.tiles):
+                continue
+            index = indices[local]
+            with stage("fast_full_decode", frame=local):
+                source = _read_rgb_image(encoded)
+            del encoded
+            decoded += 1
+            matrix = scaled_matrix(transforms[index], analysis_shapes[index], source.shape[:2],
+                                   reference_analysis_shape, full_shape)
+            with stage("fast_full_warp", frame=local):
+                aligned = cv2.warpPerspective(source, matrix, (w, h), flags=cv2.INTER_CUBIC,
+                                              borderMode=cv2.BORDER_REFLECT_101)
+                valid = _warp_valid(source.shape[:2], matrix, full_shape)
+            del source
+            if native is not None:
+                with stage('fast_native_boundary_rank', frame=local):
+                    native.rank(aligned, valid, local)
+            if tone_model is not None:
+                _check_cancel(cancel_event)
+                with stage("fast_paired_tone", frame=local):
+                    aligned = tone_model.correct(aligned, local)
+            if native is not None:
+                native.capture_corrected(aligned)
+            if output is None:
+                output = aligned.copy()  # Explicit reference fallback, including true black pixels.
+            with stage("fast_copy_and_seam", frame=local):
+                feather = None
+                if seam_count and owner_count:
+                    feather = cv2.GaussianBlur(owner.astype(np.float32),
+                                              (2 * seam_radius + 1, 2 * seam_radius + 1),
+                                              sigmaX=max(0.6, seam_radius / 2))
+                accumulator.add(local, aligned, valid, feather, output)
+                del feather
+            del aligned, valid
+        _check_cancel(cancel_event)
+        with stage("fast_finish_seams"):
+            fallback = accumulator.finish(output)
     if native is not None:
         with stage('fast_native_boundary_finish'):
             output = native.finish(output)

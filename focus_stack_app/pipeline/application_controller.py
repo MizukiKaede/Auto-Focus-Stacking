@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from ..utils.performance import timed, BatchMemory
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import inspect
 import io
 import logging
@@ -1727,6 +1727,9 @@ class ApplicationController:
                 ),
                 current_opencv_threads=current_opencv_threads,
             )
+            if self.options.fusion_backend == "hugin_enfuse":
+                focus_budget = replace(focus_budget, opencv_threads=min(
+                    focus_budget.opencv_threads, int(getattr(runtime, "hugin_parallel_cpu_budget", 12))))
             self.logger.info(
                 "Focus analysis budget requested_workers=%s effective_workers=%s "
                 "opencv_threads=%s logical_cpus=%s cpu_budget=%s memory_worker_cap=%s "
