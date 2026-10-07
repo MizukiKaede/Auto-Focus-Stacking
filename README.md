@@ -1,4 +1,4 @@
-# Focus Stack Assistant · main 常规版
+# Auto Focus Stack Assistant · main 常规版
 
 Focus Stack Assistant 是一个用于焦点堆栈摄影的桌面工具，帮助整理照片、分析焦点覆盖范围、完成图像对齐，并生成焦点合成结果。
 
