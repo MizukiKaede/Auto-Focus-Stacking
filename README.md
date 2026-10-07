@@ -210,7 +210,7 @@ tests/          自动化测试
 `align_image_stack` 与 `enfuse`；程序会按显式路径、`HUGIN_BIN` 等环境变量、
 项目自带运行时和系统路径查找。旧配置值 `opencv` 仍映射到高质量模式；`fast` 现在选择独立的 Fast 模式。
 
-在界面高级设置的“合成引擎”中选择 **Fast 快速合成（C++）**。默认仍为高质量模式。
+默认为高质量模式。
 Fast 使用随项目附带的 Windows 64 位 `fast_core.dll`，版本为 `fast-cpp-v4-print-statistics`；
 原高质量、Hugin/Enfuse 的算法及默认参数保持不变。
 
