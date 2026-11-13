@@ -275,8 +275,11 @@ def select_whole_frame(
                 if progress:
                     progress(index + 1, len(paths))
     registration_seconds = time.perf_counter() - registration_started
-    best = np.maximum.reduce(scores)
+    best = scores[0].copy()
+    for score in scores[1:]:
+        np.maximum(best, score, out=best)
     useful = best > max(float(best.max()) * 0.002, 1e-7)
+    useful_count = max(1, int(useful.sum()))
     threshold = best * 0.90
     sharp_masks = [(score >= threshold) & useful for score in scores]
     covered = np.zeros_like(useful)
@@ -288,18 +291,18 @@ def select_whole_frame(
         uncovered = ~covered
         counts = {index: int(np.count_nonzero(sharp_masks[index] & uncovered)) for index in options}
         candidate = max(options, key=lambda index: (counts[index], qualities[index], -index))
-        gain = counts[candidate] / max(1, int(useful.sum()))
+        gain = counts[candidate] / useful_count
         if selected and gain < 0.0005:
             break
         selected.append(candidate)
         gains[candidate] = gain
         covered |= sharp_masks[candidate]
-        if np.count_nonzero(covered) / max(1, int(useful.sum())) >= 0.9995:
+        if np.count_nonzero(covered) / useful_count >= 0.9995:
             break
     if reference_index not in selected:
         selected.append(reference_index)
     selected.sort()
-    coverage = float(np.count_nonzero(covered) / max(1, int(useful.sum())))
+    coverage = float(np.count_nonzero(covered) / useful_count)
     return {
         "paths": paths,
         "selected_indices": selected,

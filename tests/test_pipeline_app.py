@@ -521,6 +521,39 @@ class PipelineSmokeTests(unittest.TestCase):
         self.assertEqual(summary.results, [0, 1, 3, 4])
         self.assertEqual(events[-1].stage, PipelineStage.COMPLETE)
 
+    def test_summary_results_follow_input_order_when_merge_completion_is_out_of_order(self):
+        groups = [{"id": index, "images": ["a", "b"]} for index in range(4)]
+        first_started = threading.Event()
+        second_finished = threading.Event()
+        completion_order = []
+        completion_lock = threading.Lock()
+
+        def merge(job):
+            index = job.sequence_index
+            if index == 0:
+                first_started.set()
+                assert second_finished.wait(5)
+                time.sleep(0.05)
+            elif index == 1:
+                assert first_started.wait(5)
+                with completion_lock:
+                    completion_order.append(index)
+                second_finished.set()
+                return index
+            with completion_lock:
+                completion_order.append(index)
+            return index
+
+        self.assertIsNone(AnalysisJob({"id": "unindexed"}).sequence_index)
+        summary = PipelineCoordinator(
+            config=PipelineConfig(queue_size=4, merge_workers=2, parallel=True),
+            analyzer=lambda group: {"needs_merge": True, "selected_indices": [0, 1]},
+            merger=merge,
+        ).run(groups)
+
+        self.assertLess(completion_order.index(1), completion_order.index(0))
+        self.assertEqual(summary.results, [0, 1, 2, 3])
+
     def test_cancel_does_not_leave_controller_running(self):
         groups = [{"id": i} for i in range(20)]
 

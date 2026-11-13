@@ -1,11 +1,9 @@
 """Production group-level analysis orchestration.
 
-``GroupAnalyzer`` is the bridge between scene grouping and the bounded
-analysis/merge pipeline.  It intentionally owns no full-resolution image
-collection: one analysis image is decoded, registered against the selected
-reference, converted to a compact focus map, scored, and released before the
-next image is read.  Only compact maps and light metadata remain until
-deduplication/coverage selection finishes.
+``GroupAnalyzer`` bridges scene grouping and the bounded analysis/merge
+pipeline. Production selection uses calibrated whole-frame ECC and a bounded
+preview cache. Hugin ordering is optional and cached independently of selection;
+standalone stage helpers remain available for library callers.
 """
 
 from __future__ import annotations
@@ -23,13 +21,13 @@ import os
 from os import PathLike
 from pathlib import Path
 import threading
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from .coverage_selector import CoverageConfig, select_focus_images
-from .focus_cluster import FocusClusterConfig, deduplicate_focus_maps, focus_map_distance
-from .focus_map import FocusMapConfig, compute_focus_map, decompress_focus_map
+from .focus_cluster import FocusClusterConfig, deduplicate_focus_maps
+from .focus_map import FocusMapConfig, compute_focus_map
 from .quality import QualityConfig, score_image
-from .registration import RegistrationConfig, load_image, register_images, resolve_image_path, warp_image
+from .registration import RegistrationConfig, register_images, resolve_image_path
 from .types import ImageQuality, RegistrationResult
 
 
@@ -208,27 +206,6 @@ def _path_for_item(item: Any) -> Path | None:
         return None
 
 
-def _identity_result() -> RegistrationResult:
-    try:
-        import numpy as np
-        matrix = np.eye(3, dtype=np.float32)
-    except ImportError:  # pragma: no cover - package requires NumPy
-        matrix = None
-    return RegistrationResult(
-        matrix=matrix, model="identity", valid=True,
-        inlier_ratio=1.0, confidence=1.0, message="reference image",
-    )
-
-
-def _matrix_json(result: RegistrationResult | None) -> Any:
-    if result is None or result.matrix is None:
-        return None
-    try:
-        return result.matrix.tolist()
-    except AttributeError:
-        return result.matrix
-
-
 def _focus_array(value: Any) -> Any:
     """Accept either a compact array or a ``FocusMapResult``-like wrapper."""
 
@@ -260,17 +237,6 @@ def _deserialize_focus_map(data: bytes) -> Any:
             if key in archive:
                 return archive[key].copy()
     raise ValueError("focus-map cache does not contain a map array")
-
-
-def _compact_shape(source_shape: tuple[int, int], long_edge: int) -> tuple[int, int]:
-    """Return the deterministic map shape for one analysis image."""
-
-    height, width = (max(1, int(source_shape[0])), max(1, int(source_shape[1])))
-    edge = int(long_edge)
-    if edge <= 0 or max(height, width) <= edge:
-        return height, width
-    scale = float(edge) / float(max(height, width))
-    return max(1, int(round(height * scale))), max(1, int(round(width * scale)))
 
 
 def _stable_cache_value(value: Any) -> Any:
@@ -494,79 +460,6 @@ def _load_or_create_cached_map(
     return value, cache_path
 
 
-def _warp_focus_map(focus_map: Any, registration: RegistrationResult,
-                    source_shape: tuple[int, int],
-                    target_shape: tuple[int, int],
-                    reference_shape: tuple[int, int] | None = None) -> Any:
-    """Warp a compact raw map while scaling an analysis-resolution matrix."""
-
-    import numpy as np
-    # Cache/config may use uint16 to halve disk/RAM cost.  Convert that
-    # representation before geometric operations; otherwise an identity map
-    # would expose 0..65535 values and a warped map would be clipped to 1.
-    values = decompress_focus_map(_focus_array(focus_map)).astype(np.float32, copy=False)
-
-    def resize_values(arr: Any) -> Any:
-        if arr.shape == target_shape:
-            return arr
-        try:
-            import cv2
-            return cv2.resize(arr, (target_shape[1], target_shape[0]), interpolation=cv2.INTER_AREA)
-        except ImportError:
-            ys = np.minimum(
-                (np.arange(target_shape[0]) * arr.shape[0] / target_shape[0]).astype(int),
-                arr.shape[0] - 1,
-            )
-            xs = np.minimum(
-                (np.arange(target_shape[1]) * arr.shape[1] / target_shape[1]).astype(int),
-                arr.shape[1] - 1,
-            )
-            return arr[ys[:, None], xs[None, :]]
-
-    matrix = getattr(registration, "matrix", None)
-    if matrix is None or getattr(registration, "model", "identity") == "identity":
-        return resize_values(values).astype(np.float16, copy=False)
-    matrix = np.asarray(matrix, dtype=np.float32)
-    if matrix.shape == (2, 3):
-        converted = np.eye(3, dtype=np.float32)
-        converted[:2] = matrix
-        matrix = converted
-    if matrix.shape != (3, 3):
-        return resize_values(values).astype(np.float16, copy=False)
-    sh, sw = source_shape
-    rh, rw = reference_shape or source_shape
-    th, tw = target_shape
-    mh, mw = values.shape[:2]
-    # H maps source analysis pixels to reference analysis pixels.  Convert it
-    # to source-map -> reference-map coordinates.  The map and source images
-    # may have different aspect/resolution, so both scale factors matter.
-    source_map_to_analysis = np.diag([
-        max(1.0, float(sw)) / max(1.0, float(mw)),
-        max(1.0, float(sh)) / max(1.0, float(mh)), 1.0,
-    ]).astype(np.float32)
-    reference_analysis_to_map = np.diag([
-        max(1.0, float(tw)) / max(1.0, float(rw)),
-        max(1.0, float(th)) / max(1.0, float(rh)), 1.0,
-    ]).astype(np.float32)
-    map_matrix = reference_analysis_to_map @ matrix @ source_map_to_analysis
-    try:
-        warped = warp_image(
-            values,
-            RegistrationResult(
-                matrix=map_matrix,
-                model=registration.model,
-                valid=registration.valid,
-            ),
-            output_shape=target_shape,
-        )
-        return np.clip(warped, 0.0, 1.0).astype(np.float16)
-    except Exception:
-        # OpenCV is optional for the rest of the analysis; if it is missing or
-        # rejects a degenerate transform, retain a correctly sized best-effort
-        # map instead of poisoning the next candidate with a shape mismatch.
-        return resize_values(values).astype(np.float16, copy=False)
-
-
 class GroupAnalyzer:
     """Analyze one :class:`SceneGroup` with bounded image memory.
 
@@ -584,14 +477,17 @@ class GroupAnalyzer:
         ``database`` so ``preserve_cache=False`` can disable reuse while
         retaining normal analysis persistence.
     cache:
-        Optional ``DiskCache``-compatible object.  Cached maps are raw
-        image-coordinate maps and are transformed into the current group's
-        reference coordinates on each run.
+        Optional ``DiskCache``-compatible object retained for library callers.
+        Production whole-frame selection uses ``plan_cache`` instead.
+    require_alignment_order:
+        Compute Hugin's registration-friendly input order. Defaults to True
+        for standalone callers; the application disables it for Quality/Fast.
     """
 
     def __init__(self, config: Any = None, *, database: Any = None,
                  cache: Any = None, analysis_cache: Any = None,
                  plan_cache: Any = None,
+                 require_alignment_order: bool = True,
                  logger: logging.Logger | None = None,
                  loader: Callable[..., Any] | None = None,
                  focus_analysis_workers: int | None = None,
@@ -605,6 +501,7 @@ class GroupAnalyzer:
         self.database = database
         self.cache = cache if cache is not None else analysis_cache
         self.plan_cache = plan_cache
+        self.require_alignment_order = bool(require_alignment_order)
         self.logger = logger or logging.getLogger(__name__)
         self.loader = loader
         if focus_analysis_workers is not None and not 1 <= int(focus_analysis_workers) <= 10:
@@ -623,22 +520,6 @@ class GroupAnalyzer:
         self.cluster_config = cluster_config if cluster_config is not None else self.config
         self.coverage_config = coverage_config if coverage_config is not None else self.config
 
-    def _load_analysis(self, item: Any) -> Any:
-        source_path = _path_for_item(item)
-        edge = int(
-            _setting(self.config, "focus_analysis_long_edge", 1600, "analysis_long_edge")
-        )
-        if self.loader is not None:
-            try:
-                image = self.loader(item, max_long_edge=edge)
-            except TypeError:
-                image = self.loader(item)
-            from .registration import resize_for_analysis
-            return resize_for_analysis(image, edge)
-        if source_path is not None:
-            return load_image(source_path, max_long_edge=edge)
-        from .registration import resize_for_analysis
-        return resize_for_analysis(item, edge)
 
     # Public stage boundaries make the unified analysis pipeline independently
     # testable without reintroducing mode-specific analyzers.
@@ -733,19 +614,6 @@ class GroupAnalyzer:
             values["coverage_target"] = float(target)
         return CoverageConfig(**values)
 
-    def _minimum_stack_images(self) -> int:
-        """Return the smallest selected set allowed for a confirmed scene."""
-
-        value = _setting(
-            self.config,
-            "minimum_stack_images",
-            1,
-            "minimum_merge_images",
-        )
-        try:
-            return max(1, int(value))
-        except (TypeError, ValueError):
-            return 1
 
     def _minimum_stack_group_size(self) -> int:
         """Return the smallest scene cardinality eligible for fusion."""
@@ -1023,7 +891,9 @@ class GroupAnalyzer:
                 if restored is not None:
                     plan, order_result = restored
                     cache_hit = True
-                    order_refresh_needed = payload.get("ordering_version") != ORDERING_PLAN_VERSION
+                    order_refresh_needed = self.require_alignment_order and (
+                        order_result is None or payload.get("ordering_version") != ORDERING_PLAN_VERSION
+                    )
             except Exception:
                 self.logger.warning(
                     "selection plan cache read failed group_id=%s", gid, exc_info=True,
@@ -1073,12 +943,13 @@ class GroupAnalyzer:
                     progress_callback, group, paths[current - 1], current - 1, total,
                 ),
             )
-            selected_set_for_order = set(plan["selected_indices"])
-            selected_capture = [index for index in capture_indices if index in selected_set_for_order]
-            selected_previews = [load_path(paths[index], 512) for index in selected_capture]
-            order_result = self.build_alignment_order(
-                selected_previews, capture_order=selected_capture,
-            )
+            if self.require_alignment_order:
+                selected_set_for_order = set(plan["selected_indices"])
+                selected_capture = [index for index in capture_indices if index in selected_set_for_order]
+                selected_previews = [load_path(paths[index], 512) for index in selected_capture]
+                order_result = self.build_alignment_order(
+                    selected_previews, capture_order=selected_capture,
+                )
             self.logger.info(
                 "selection plan cache status=miss group_id=%s key=%s decode_count=%s "
                 "frame_cache_enabled=%s frame_cache_peak_bytes=%s requested_workers=%s "
@@ -1110,13 +981,20 @@ class GroupAnalyzer:
                             }
                         },
                         "order": json_compatible(order_result),
-                        "ordering_version": ORDERING_PLAN_VERSION,
+                        "ordering_version": ORDERING_PLAN_VERSION if order_result is not None else None,
                     },
                 )
             except Exception:
                 self.logger.warning(
                     "selection plan cache write failed group_id=%s", gid, exc_info=True,
                 )
+        if not self.require_alignment_order:
+            order_result = {
+                "alignment_order": [],
+                "alignment_order_confidence": 0.0,
+                "alignment_order_diagnostics": {"code": "NOT_REQUESTED", "edges": []},
+                "alignment_order_fallback_used": False,
+            }
         assert plan is not None and order_result is not None
         selected_indices = list(plan["selected_indices"])
         selected_set = set(selected_indices)
@@ -1239,14 +1117,13 @@ class GroupAnalyzer:
     @staticmethod
     def _restore_selection_plan(
         payload: Any, image_count: int,
-    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
-        """Validate and normalise a path-free JSON selection cache record."""
+    ) -> tuple[dict[str, Any], dict[str, Any] | None] | None:
+        """Restore selection independently of an optional Hugin ordering plan."""
 
         if not isinstance(payload, Mapping):
             return None
         raw_plan = payload.get("plan")
-        raw_order = payload.get("order")
-        if not isinstance(raw_plan, Mapping) or not isinstance(raw_order, Mapping):
+        if not isinstance(raw_plan, Mapping):
             return None
         try:
             selected = [int(value) for value in raw_plan["selected_indices"]]
@@ -1260,9 +1137,7 @@ class GroupAnalyzer:
             preview_shape = [int(value) for value in raw_plan["preview_shape"]]
             errors = {int(key): str(value) for key, value in dict(raw_plan["errors"]).items()}
             gains = {int(key): float(value) for key, value in dict(raw_plan["gains"]).items()}
-            alignment_order = [int(value) for value in raw_order["alignment_order"]]
             coverage = float(raw_plan["coverage"])
-            order_confidence = float(raw_order["alignment_order_confidence"])
             if (
                 image_count < 1
                 or len(matrices) != image_count
@@ -1283,9 +1158,6 @@ class GroupAnalyzer:
                 or any(not math.isfinite(value) for value in gains.values())
                 or not math.isfinite(coverage)
                 or not 0.0 <= coverage <= 1.0
-                or set(alignment_order) != set(selected)
-                or len(set(alignment_order)) != len(alignment_order)
-                or not math.isfinite(order_confidence)
             ):
                 return None
             plan = dict(raw_plan)
@@ -1300,6 +1172,21 @@ class GroupAnalyzer:
                 "gains": gains,
                 "coverage": coverage,
             })
+            return plan, GroupAnalyzer._restore_order(payload.get("order"), selected)
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None
+
+    @staticmethod
+    def _restore_order(raw_order: Any, selected: Sequence[int]) -> dict[str, Any] | None:
+        if not isinstance(raw_order, Mapping):
+            return None
+        try:
+            alignment_order = [int(value) for value in raw_order["alignment_order"]]
+            order_confidence = float(raw_order["alignment_order_confidence"])
+            if (set(alignment_order) != set(selected)
+                    or len(set(alignment_order)) != len(alignment_order)
+                    or not math.isfinite(order_confidence)):
+                return None
             order = dict(raw_order)
             order["alignment_order"] = alignment_order
             order["alignment_order_confidence"] = order_confidence
@@ -1308,9 +1195,68 @@ class GroupAnalyzer:
             )
             if not isinstance(order.get("alignment_order_diagnostics"), Mapping):
                 return None
-            return plan, order
+            return order
         except (KeyError, TypeError, ValueError, OverflowError):
             return None
+
+    def ensure_alignment_order(
+        self, group: Any, analysis: Mapping[str, Any], *,
+        cancel_event: threading.Event | None = None,
+    ) -> dict[str, Any]:
+        """Complete recovered Hugin metadata without changing selection or geometry."""
+        result = dict(analysis)
+        if not self.require_alignment_order or not result.get("needs_merge", True):
+            return result
+        selected = list(result.get("selected_paths", ()))
+        if len(selected) < 2:
+            return result
+
+        def key(path: Any) -> str:
+            return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+        selected_keys = [key(path) for path in selected]
+        ordered = list(result.get("alignment_order", ()) or ())
+        if (len(ordered) == len(selected) and len(set(selected_keys)) == len(selected)
+                and {key(path) for path in ordered} == set(selected_keys)):
+            return result
+        indices = list(result.get("selected_indices", range(len(selected))))
+        if len(indices) != len(selected) or len(set(indices)) != len(indices):
+            raise ValueError("recovered selected paths and indices disagree")
+        capture = {key(path): index for index, path in enumerate(result.get("capture_order", selected))}
+        positions = sorted(range(len(selected)), key=lambda i: capture.get(selected_keys[i], len(capture) + i))
+        items = {
+            key(path): item for item in _items_for_group(group, self.database)
+            if (path := _path_for_item(item)) is not None
+        }
+        from ..utils.image_io import load_rgb
+        event = cancel_event or threading.Event()
+        previews = []
+        for position in positions:
+            if event.is_set():
+                raise GroupAnalysisCancelled("ordering cancelled")
+            path = selected[position]
+            if self.loader is None:
+                preview = load_rgb(path, 512)
+            else:
+                item = items.get(selected_keys[position], path)
+                try:
+                    preview = self.loader(item, max_long_edge=512)
+                except TypeError:
+                    preview = self.loader(item)
+            previews.append(preview)
+        order = self.build_alignment_order(previews, capture_order=[indices[i] for i in positions])
+        if event.is_set():
+            raise GroupAnalysisCancelled("ordering cancelled")
+        by_index = dict(zip(indices, selected))
+        result.update(order)
+        result["alignment_order_indices"] = order["alignment_order"]
+        result["alignment_order"] = [str(by_index[index]) for index in order["alignment_order"]]
+        self._persist_status(
+            group, "SELECTED", alignment_order=result["alignment_order"],
+            alignment_order_confidence=result["alignment_order_confidence"],
+            alignment_order_fallback_used=result["alignment_order_fallback_used"],
+        )
+        return result
 
     def _classify_without_focus(
         self,
@@ -1455,408 +1401,20 @@ class GroupAnalyzer:
                 group, items, reason=reason, merge_status=merge_status,
             )
         minimum_similarity = self._group_minimum_scene_similarity(group)
-        unstable = (
-            minimum_similarity is not None
-            and self._minimum_stack_stability() > 0
-            and minimum_similarity < self._minimum_stack_stability()
-        )
-        if not unstable:
-            return self._analyze_established_scene_selection(
-                group, items, cancel_event, progress_callback,
-            )
-        self._persist_status(group, "ANALYZING_FOCUS", image_count=len(items))
-        paths: list[Path | None] = [_path_for_item(item) for item in items]
         minimum_stability = self._minimum_stack_stability()
-        minimum_similarity = self._group_minimum_scene_similarity(group)
-        too_small = total < minimum_group_size
-        too_unstable = (
-            minimum_stability > 0.0
-            and minimum_similarity is not None
-            and minimum_similarity < minimum_stability
-        )
-        if too_small or too_unstable:
-            if too_small:
-                reason = (
-                    f"scene has {total} image(s); at least {minimum_group_size} similar images are required for fusion"
-                )
-                merge_status = "NO_MERGE_TOO_SMALL"
-            else:
-                reason = (
+        if minimum_stability > 0 and minimum_similarity is not None and minimum_similarity < minimum_stability:
+            self._persist_status(group, "ANALYZING_FOCUS", image_count=len(items))
+            return self._classify_without_focus(
+                group, items,
+                reason=(
                     "scene changes too much between adjacent frames "
                     f"(minimum similarity {minimum_similarity:.3f}; required {minimum_stability:.3f})"
-                )
-                merge_status = "NO_MERGE_UNSTABLE"
-            return self._classify_without_focus(
-                group, items, reason=reason, merge_status=merge_status,
+                ),
+                merge_status="NO_MERGE_UNSTABLE",
             )
-        focus_config = self._focus_config()
-        focus_cache_namespace = _focus_map_cache_namespace(focus_config)
-        quality_config = self._quality_config()
-        maps: list[Any | None] = []
-        map_paths: list[Path | None] = []
-        registrations: list[RegistrationResult | None] = []
-        analysis_shapes: list[tuple[int, int] | None] = [None] * total
-        qualities: list[ImageQuality] = []
-        image_errors: list[str | None] = [None] * total
-        scene_scores: list[float | None] = [None] * total
-        # Reference choice is a separate whole-group pre-registration stage.
-        # It deliberately precedes focus-map construction and is not reused as
-        # the later fusion input-order decision.
-        from .alignment_order import choose_preview_reference
-        preview_edge = int(_setting(self.config, "scene_preview_long_edge", 512, "preview_long_edge"))
-        preview_images: list[Any | None] = []
-        for item in items:
-            try:
-                if self.loader is not None:
-                    try:
-                        preview_images.append(self.loader(item, max_long_edge=preview_edge))
-                    except TypeError:
-                        preview_images.append(self.loader(item))
-                else:
-                    preview_images.append(load_image(item, max_long_edge=preview_edge))
-            except Exception as exc:
-                self.logger.warning("Preview pre-registration load failed for %s: %s", _path_for_item(item) or item, exc)
-                preview_images.append(None)
-        preview_positions = [index for index, image in enumerate(preview_images) if image is not None]
-        preview_edges = self.analyze_pairwise_registration(
-            [preview_images[index] for index in preview_positions],
-        ) if preview_positions else []
-        local_reference, preview_diagnostics = choose_preview_reference(len(preview_positions), preview_edges)
-        preview_reference_index = preview_positions[local_reference] if preview_positions else 0
-        preview_edge_rows = []
-        from dataclasses import asdict
-        for edge in preview_edges:
-            row = asdict(edge)
-            row["left"] = preview_positions[edge.left]
-            row["right"] = preview_positions[edge.right]
-            preview_edge_rows.append(row)
-        preview_diagnostics["edges"] = preview_edge_rows
-
-        reference: Any = None
-        reference_shape: tuple[int, int] | None = None
-        reference_map_shape: tuple[int, int] | None = None
-        comparisons = list(_group_value(group, "comparisons", default=()) or ())
-        try:
-            reference = self._load_analysis(items[preview_reference_index])
-            reference_shape = tuple(int(v) for v in reference.shape[:2])
-        except Exception as exc:
-            self.logger.warning("Chosen preview reference could not be decoded: %s", exc)
-            reference = None
-        for index, item in enumerate(items):
-            path = paths[index]
-            if cancel_event.is_set():
-                break
-            self._emit_progress(progress_callback, group, path, index, total)
-            source = None
-            registration: RegistrationResult | None = None
-            try:
-                source = reference if index == preview_reference_index and reference is not None else self._load_analysis(item)
-                analysis_shapes[index] = tuple(int(v) for v in source.shape[:2])
-                reference_candidate = index == preview_reference_index or reference is None
-                candidate_reference_shape = (
-                    tuple(int(v) for v in source.shape[:2])
-                    if reference_candidate else reference_shape
-                )
-                if index == preview_reference_index or reference is None:
-                    registration = _identity_result()
-                else:
-                    registration = self.align_preview(reference, source)
-                raw_map = None
-                use_cache = bool(_setting(self.config, "cache_focus_maps", True))
-                if path is not None and use_cache and self.cache is not None:
-                    raw_map, map_path = _load_or_create_cached_map(
-                        self.cache, path,
-                        lambda source=source: compute_focus_map(source, focus_config),
-                        namespace=focus_cache_namespace,
-                    )
-                else:
-                    raw_map = compute_focus_map(source, focus_config)
-                    # ``cache_focus_maps=False`` means there is no durable
-                    # artifact to advertise to the manifest/database.
-                    map_path = None
-                raw_map = _focus_array(raw_map)
-                target_map_shape = reference_map_shape
-                if target_map_shape is None:
-                    # Do not let a stale cache entry silently override the
-                    # current output resolution.  Cache files are keyed by
-                    # source fingerprint for reuse, while the requested map
-                    # shape remains a run-time analysis setting.
-                    target_map_shape = _compact_shape(
-                        candidate_reference_shape or tuple(int(v) for v in source.shape[:2]),
-                        int(_setting(focus_config, "output_long_edge", 512)),
-                    )
-                aligned_map = _warp_focus_map(
-                    raw_map, registration, tuple(int(v) for v in source.shape[:2]), target_map_shape,
-                    reference_shape=candidate_reference_shape,
-                )
-                quality = score_image(source, aligned_map, registration, quality_config)
-                if reference_candidate:
-                    # A corrupt/unsupported first frame must not become the
-                    # registration anchor for every later frame.  Promote it
-                    # only after map and quality stages have succeeded.
-                    reference = source
-                    preview_reference_index = index
-                    reference_shape = candidate_reference_shape
-                    reference_map_shape = target_map_shape
-                maps.append(aligned_map)
-                map_paths.append(map_path)
-                qualities.append(quality)
-                registrations.append(registration)
-                if index < len(comparisons):
-                    scene_scores[index + 1] = float(
-                        _item_value(comparisons[index], "confidence", default=0.0) or 0.0
-                    )
-            except Exception as exc:
-                # A corrupt frame should remain archivable and visible in the
-                # manifest; continue the group with a zero evidence map.
-                self.logger.warning("Focus analysis failed for %s: %s", path or item, exc)
-                image_errors[index] = str(exc)
-                maps.append(None)
-                map_paths.append(
-                    _cache_path(self.cache, path, focus_cache_namespace)
-                    if path is not None and self.cache is not None else None
-                )
-                registrations.append(registration or _identity_result())
-                qualities.append(ImageQuality(score=0.0))
-            finally:
-                # ``source`` is deliberately local; releasing it here keeps a
-                # full analysis frame out of the next iteration.
-                source = None
-                # ``maps`` owns the compact aligned result.  Drop transient
-                # raw/aligned aliases so a cache decode and the next frame do
-                # not overlap longer than necessary.
-                raw_map = None
-                aligned_map = None
-        if len(maps) < total:
-            # Cancellation returns a partial, explicitly marked result rather
-            # than silently pretending the group completed.
-            for index in range(len(maps), total):
-                maps.append(None)
-                map_paths.append(None)
-                registrations.append(_identity_result())
-                qualities.append(ImageQuality(score=0.0))
-                image_errors[index] = "cancelled"
-        if not maps:
-            raise ValueError(f"group {gid!r} contains no analyzable images")
-        import numpy as np
-        # Keep map dimensions consistent and fill decode failures with zero
-        # evidence after the first successful map establishes the shape.
-        valid_map = next((value for value in maps if value is not None), None)
-        if valid_map is None:
-            valid_map = np.zeros((1, 1), dtype=np.float16)
-        valid_map = np.asarray(valid_map)
-        maps = [valid_map.copy() if value is None else value for value in maps]
-        quality_scores = [float(value.score) for value in qualities]
-        # Decode failures remain in the manifest/archive set, but never win a
-        # focus representative while at least one image was analyzable.  Map
-        # clustering then uses local candidate positions and is translated
-        # back to stable group indices for coverage/reason persistence.
-        candidate_indices = [index for index in range(total) if not image_errors[index]]
-        if not candidate_indices:
-            candidate_indices = list(range(total))
-        candidate_maps = [maps[index] for index in candidate_indices]
-        candidate_qualities = [quality_scores[index] for index in candidate_indices]
-        dedup_local = self.remove_duplicate_focus(candidate_maps, candidate_qualities)
-        representatives = [candidate_indices[index] for index in dedup_local.representative_indices]
-        if not representatives:
-            representatives = [max(candidate_indices, key=lambda i: quality_scores[i])]
-        coverage = self.select_frames(
-            [maps[index] for index in representatives],
-            [quality_scores[index] for index in representatives],
-            candidate_indices=representatives,
+        return self._analyze_established_scene_selection(
+            group, items, cancel_event, progress_callback,
         )
-        selected_indices = list(coverage.selected_indices)
-        if not selected_indices:
-            selected_indices = [representatives[0]]
-        # Scene grouping has already established that these frames share the
-        # same composition.  Focus-map metrics are intentionally aggressive
-        # about duplicate removal, but for a captured bracket they can score
-        # every frame as redundant and incorrectly suppress fusion.  Keep the
-        # most different remaining compact map(s) up to the configured floor.
-        required_inputs = min(len(candidate_indices), self._minimum_stack_images())
-        minimum_stack_additions: dict[int, float] = {}
-        while len(selected_indices) < required_inputs:
-            remaining = [index for index in candidate_indices if index not in selected_indices]
-            if not remaining:
-                break
-
-            def difference_from_selection(index: int) -> tuple[float, float, int]:
-                distance = min(
-                    focus_map_distance(maps[index], maps[selected])
-                    for selected in selected_indices
-                )
-                # Prefer the higher-quality frame only when its focus-map
-                # difference is tied, then retain capture order determinism.
-                return float(distance), float(quality_scores[index]), -int(index)
-
-            extra = max(remaining, key=difference_from_selection)
-            minimum_stack_additions[extra] = difference_from_selection(extra)[0]
-            selected_indices.append(extra)
-        # A single frame trivially covers the only available scene, even if it
-        # is texture-free and its map is all zeros.
-        if total == 1 or len(representatives) == 1:
-            final_coverage = 1.0
-        else:
-            final_coverage = float(coverage.coverage)
-        selected_set = set(selected_indices)
-        duplicate_reasons = {
-            candidate_indices[index]: reason
-            for index, reason in dedup_local.reasons.items()
-        }
-        reasons: dict[int, str] = {}
-        gains: dict[int, float] = {}
-        for index in range(total):
-            if image_errors[index]:
-                reasons[index] = f"analysis failed: {image_errors[index]}"
-                gains[index] = 0.0
-            elif index in selected_set:
-                if index in minimum_stack_additions:
-                    reasons[index] = (
-                        "retained as the most distinct frame for minimum focus-stack input count"
-                    )
-                    gains[index] = float(minimum_stack_additions[index])
-                else:
-                    reasons[index] = coverage.reasons.get(index, "coverage")
-                    gains[index] = float(coverage.gains.get(index, 0.0))
-            elif index in duplicate_reasons:
-                reasons[index] = duplicate_reasons[index]
-                gains[index] = 0.0
-            else:
-                reasons[index] = coverage.reasons.get(index, "redundant; no material new coverage")
-                gains[index] = float(coverage.gains.get(index, 0.0))
-        per_image: list[dict[str, Any]] = []
-        analysis_records: list[dict[str, Any]] = []
-        for index, item in enumerate(items):
-            selected = index in selected_set
-            q = qualities[index]
-            scene_score = scene_scores[index]
-            if scene_score is None:
-                scene_score = float(_group_value(group, "confidence", default=0.0) or 0.0)
-            scene_hash = _item_value(
-                item, "scene_hash", default=_group_value(group, "scene_hash", default=None)
-            )
-            row = {
-                "index": index,
-                "image": item,
-                "path": str(paths[index]) if paths[index] is not None else "",
-                "selected": selected,
-                "selection_reason": reasons[index],
-                "reason": reasons[index],
-                "quality_score": float(q.score),
-                "quality": float(q.score),
-                "sharpness_score": float(q.sharpness),
-                "coverage_gain": float(gains[index]),
-                "gain": float(gains[index]),
-                "scene_score": float(scene_score),
-                "scene_hash": scene_hash,
-                "focus_map_path": str(map_paths[index]) if map_paths[index] is not None else None,
-                "transform": _matrix_json(registrations[index]),
-                "error": image_errors[index],
-            }
-            per_image.append(row)
-            analysis_records.append(row)
-            self._persist_image(group, item, row)
-        selected_paths = [str(paths[index]) for index in selected_indices if paths[index] is not None]
-        selected_preview_positions = [index for index in selected_indices if preview_images[index] is not None]
-        selected_preview_positions.sort(key=lambda index: (
-            _item_value(items[index], "sequence_index", default=index) is None,
-            _item_value(items[index], "sequence_index", default=index),
-            index,
-        ))
-        order_result = self.build_alignment_order(
-            [preview_images[index] for index in selected_preview_positions],
-            capture_order=selected_preview_positions,
-        ) if selected_preview_positions else {
-            "alignment_order": list(selected_indices),
-            "alignment_order_confidence": 0.0,
-            "alignment_order_diagnostics": {"code": "ALIGNMENT_ORDER_UNCERTAIN", "edges": []},
-            "alignment_order_fallback_used": True,
-        }
-        alignment_order_indices = list(order_result["alignment_order"])
-        # Any selected image whose preview failed remains eligible and is
-        # appended in SQLite capture order; the selected backend can still attempt it.
-        missing_order = [index for index in selected_indices if index not in alignment_order_indices]
-        missing_order.sort(key=lambda index: (
-            _item_value(items[index], "sequence_index", default=index) is None,
-            _item_value(items[index], "sequence_index", default=index),
-            index,
-        ))
-        alignment_order_indices.extend(missing_order)
-        alignment_order_paths = [str(paths[index]) for index in alignment_order_indices if paths[index] is not None]
-        capture_indices = sorted(range(total), key=lambda index: (
-            _item_value(items[index], "sequence_index", default=index) is None,
-            _item_value(items[index], "sequence_index", default=index),
-            index,
-        ))
-        capture_order = [str(paths[index]) for index in capture_indices if paths[index] is not None]
-        first_item = items[0]
-        first_path = paths[0]
-        first_original_value = _item_value(first_item, "original_path", default=first_path)
-        if len(items) <= 1:
-            merge_status = "NO_MERGE_SINGLE"
-        elif len(selected_indices) <= 1:
-            merge_status = "NO_MERGE_REPEATED"
-        else:
-            merge_status = "READY_FOR_MERGE"
-        cancelled = cancel_event.is_set()
-        result: dict[str, Any] = {
-            "group_id": gid,
-            "all_images": list(items),
-            "items": list(items),
-            "image_records": list(items),
-            "selected_indices": selected_indices,
-            "selected_paths": selected_paths,
-            "selected_images": selected_paths,
-            "capture_order": capture_order,
-            "preview_reference": str(paths[preview_reference_index]) if paths[preview_reference_index] is not None else preview_reference_index,
-            "preview_reference_index": preview_reference_index,
-            "pairwise_analysis_summary": preview_diagnostics,
-            "alignment_order": alignment_order_paths,
-            "alignment_order_indices": alignment_order_indices,
-            "alignment_order_confidence": order_result["alignment_order_confidence"],
-            "alignment_order_diagnostics": order_result["alignment_order_diagnostics"],
-            "alignment_order_fallback_used": order_result["alignment_order_fallback_used"],
-            "preview_transforms": [_matrix_json(value) for value in registrations],
-            "analysis_shapes": [list(value) if value is not None else None for value in analysis_shapes],
-            "reference_analysis_shape": list(reference_shape) if reference_shape is not None else None,
-            "first_original_image": first_item,
-            "first_original_path": str(first_original_value) if first_original_value is not None else "",
-            "selected_count": len(selected_indices),
-            "image_count": len(items),
-            "coverage": final_coverage,
-            "confidence": float(_group_value(group, "confidence", default=0.0) or 0.0),
-            "merge_status": merge_status,
-            "needs_merge": merge_status == "READY_FOR_MERGE",
-            "status": "CANCELLED" if cancelled else merge_status,
-            "cancelled": cancelled,
-            "quality_scores": quality_scores,
-            "qualities": quality_scores,
-            "coverage_gains": gains,
-            "gains": gains,
-            "selection_reasons": reasons,
-            "reasons": reasons,
-            "per_image": per_image,
-            "analysis_records": analysis_records,
-            "errors": {index: error for index, error in enumerate(image_errors) if error},
-            "focus_map_paths": [str(path) if path is not None else None for path in map_paths],
-        }
-        durable_status = (
-            "CANCELLED" if cancelled
-            else ("SELECTED" if result["needs_merge"] else "CLASSIFIED")
-        )
-        self._persist_status(
-            group, durable_status,
-            confidence=result["confidence"], coverage=final_coverage,
-            selected_count=len(selected_indices), image_count=len(items),
-            preview_reference=result["preview_reference"],
-            alignment_order=result["alignment_order"],
-            alignment_order_confidence=result["alignment_order_confidence"],
-            alignment_order_fallback_used=result["alignment_order_fallback_used"],
-            pairwise_analysis_summary=result["pairwise_analysis_summary"],
-            start_index=_group_value(group, "start_index", default=0),
-            end_index=_group_value(group, "end_index", default=max(0, len(items) - 1)),
-        )
-        return result
 
     analyze = analyze_group
     process = analyze_group

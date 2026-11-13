@@ -20,7 +20,9 @@ def _selection_fixture():
     right = truth.copy()
     left[:, 130:] = cv2.GaussianBlur(left[:, 130:], (0, 0), 2.0)
     right[:, :130] = cv2.GaussianBlur(right[:, :130], (0, 0), 2.0)
-    return {"a": left, "b": truth, "c": right}
+    upper_left = truth.copy()
+    upper_left[:90, :130] = cv2.GaussianBlur(upper_left[:90, :130], (0, 0), 2.0)
+    return {"a": left, "b": truth, "c": right, "d": upper_left}
 
 
 def test_selection_pixel_cache_is_exact_and_reduces_decodes_to_n():
@@ -267,7 +269,9 @@ def test_selection_plan_cache_rerun_uses_zero_image_decodes_and_file_change_inva
     database.close()
 
 
-def test_cached_selection_refreshes_only_outdated_order(tmp_path):
+@pytest.mark.parametrize("damage", ["missing", "malformed", "stale_version"])
+def test_cached_selection_refreshes_only_outdated_order(tmp_path, damage):
+    from focus_stack_app.core.alignment_order import ORDERING_PLAN_VERSION
     from focus_stack_app.core.plan_cache import SELECTION_PLAN_VERSION
 
     pixels = _selection_fixture()
@@ -285,7 +289,19 @@ def test_cached_selection_refreshes_only_outdated_order(tmp_path):
     ).fetchone()
     import json
     payload = json.loads(row["payload_json"])
-    payload.pop("ordering_version")
+    if damage == "missing":
+        payload.pop("order", None)
+        payload.pop("ordering_version", None)
+    elif damage == "malformed":
+        payload["order"] = {
+            "alignment_order": [-999],
+            "alignment_order_confidence": 0.5,
+            "alignment_order_fallback_used": False,
+            "alignment_order_diagnostics": {"code": "OK", "edges": []},
+        }
+        payload["ordering_version"] = ORDERING_PLAN_VERSION
+    else:
+        payload["ordering_version"] = "obsolete-order-version"
     database.upsert_cached_plan("selection", row["cache_key"], SELECTION_PLAN_VERSION, payload)
 
     order_loads = []
@@ -307,4 +323,77 @@ def test_cached_selection_refreshes_only_outdated_order(tmp_path):
         loader=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("decoded a current plan")),
     ).analyze_group(group)
     assert again["selection_plan_cache_hit"] is True
+    database.close()
+
+
+def test_quality_hugin_quality_order_cache_keeps_selection_and_valid_order(tmp_path):
+    from focus_stack_app.core.alignment_order import ORDERING_PLAN_VERSION
+    from focus_stack_app.core.plan_cache import SELECTION_PLAN_VERSION
+
+    pixels = _selection_fixture()
+    paths = [tmp_path / f"{name}.jpg" for name in pixels]
+    for path, image in zip(paths, pixels.values()):
+        Image.fromarray(image).save(path, quality=100, subsampling=0)
+    group = SceneGroup(3, [
+        ImageRecord.from_path(path, sequence_index=index)
+        for index, path in enumerate(paths)
+    ])
+    database = Database(tmp_path / "plans.sqlite")
+    quality_first = GroupAnalyzer(
+        plan_cache=database,
+        require_alignment_order=False,
+    ).analyze_group(group)
+    row = database._connection.execute(
+        "SELECT cache_key FROM cached_plans WHERE kind = 'selection'"
+    ).fetchone()
+    assert row is not None
+    cache_key = row["cache_key"]
+    uncached = database.get_cached_plan(
+        "selection", cache_key, algorithm_version=SELECTION_PLAN_VERSION,
+    )
+    assert uncached["order"] is None
+    assert uncached["ordering_version"] is None
+    assert quality_first["alignment_order"] == []
+    assert quality_first["alignment_order_confidence"] == 0.0
+    assert quality_first["alignment_order_diagnostics"]["code"] == "NOT_REQUESTED"
+    assert quality_first["alignment_order_fallback_used"] is False
+
+    order_loads = []
+
+    def hugin_loader(item, max_long_edge=None):
+        order_loads.append((item.path, max_long_edge))
+        return load_rgb(item.path, max_long_edge)
+
+    hugin = GroupAnalyzer(
+        plan_cache=database,
+        require_alignment_order=True,
+        loader=hugin_loader,
+    ).analyze_group(group)
+    assert hugin["selection_plan_cache_hit"] is True
+    assert hugin["selected_indices"] == quality_first["selected_indices"]
+    assert hugin["selection_decode_count"] == 0
+    assert hugin["alignment_order"]
+    assert order_loads
+    assert {edge for _, edge in order_loads} == {512}
+    stored_order = database.get_cached_plan(
+        "selection", cache_key, algorithm_version=SELECTION_PLAN_VERSION,
+    )
+    assert stored_order["ordering_version"] == ORDERING_PLAN_VERSION
+    assert stored_order["order"]["alignment_order"]
+
+    quality_again = GroupAnalyzer(
+        plan_cache=database,
+        require_alignment_order=False,
+        loader=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("a valid cached plan should not decode images")
+        ),
+    ).analyze_group(group)
+    assert quality_again["selection_plan_cache_hit"] is True
+    assert quality_again["selected_indices"] == quality_first["selected_indices"]
+    assert quality_again["alignment_order"] == []
+    retained = database.get_cached_plan(
+        "selection", cache_key, algorithm_version=SELECTION_PLAN_VERSION,
+    )
+    assert retained["ordering_version"] == ORDERING_PLAN_VERSION
+    assert retained["order"] == stored_order["order"]
     database.close()

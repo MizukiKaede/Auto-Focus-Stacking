@@ -185,8 +185,8 @@ def test_focus_map_cache_namespace_invalidates_config_and_reuses_same_fake_cache
 
 def test_group_analyzer_accepts_synthetic_loader_without_pillow_or_opencv():
     arrays = [
-        np.pad(np.ones((32, 12), np.uint8) * 220, ((0, 0), (index * 10, 20 - index * 10)))
-        for index in range(3)
+        np.pad(np.ones((32, 12), np.uint8) * 220, ((0, 0), (index * 6, 18 - index * 6)))
+        for index in range(4)
     ]
     records = [ImageRecord.from_path(f"C:/synthetic/frame_{index}.jpg", id=index + 1)
                for index in range(len(arrays))]
@@ -202,9 +202,9 @@ def test_group_analyzer_accepts_synthetic_loader_without_pillow_or_opencv():
         cluster_config=FocusClusterConfig(similarity_threshold=1.1),
     ).analyze_group(SceneGroup(group_id=16, items=records))
 
-    assert calls[:3] == [(1, 1280), (2, 1280), (3, 1280)]
-    assert {image_id for image_id, _ in calls} == {1, 2, 3}
-    assert result["image_count"] == 3
+    assert calls[:4] == [(1, 1280), (2, 1280), (3, 1280), (4, 1280)]
+    assert {image_id for image_id, _ in calls} == {1, 2, 3, 4}
+    assert result["image_count"] == 4
     assert result["selected_count"] >= 1
     assert result["preview_reference_index"] in result["selected_indices"]
     assert all("quality" in row and "gain" in row and "reason" in row
@@ -212,11 +212,11 @@ def test_group_analyzer_accepts_synthetic_loader_without_pillow_or_opencv():
 
 
 def test_group_analyzer_streams_jpegs_and_returns_merge_boundary(tmp_path):
-    paths = [tmp_path / f"frame_{index}.jpg" for index in range(3)]
+    paths = [tmp_path / f"frame_{index}.jpg" for index in range(4)]
     for index, path in enumerate(paths):
         _write_pattern(path, index)
     records = [ImageRecord.from_path(path, id=index + 1, sequence_index=index) for index, path in enumerate(paths)]
-    group = SceneGroup(group_id=17, items=records, start_index=0, end_index=2, confidence=0.91)
+    group = SceneGroup(group_id=17, items=records, start_index=0, end_index=3, confidence=0.91)
     repository = _RecordingRepository()
 
     result = _analyzer(tmp_path / "cache", repository).analyze_group(group)

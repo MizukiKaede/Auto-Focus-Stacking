@@ -193,6 +193,9 @@ class HuginEnfuseBackend(FusionBackend):
 
     @profiled_fusion
     def fuse(self, group, analysis, output_path, work_dir, output_config, cancel_event) -> FusionResult:
+        if (_value(analysis, "alignment_order_diagnostics", {}) or {}).get("code") == "NOT_REQUESTED":
+            from ..core.group_analyzer import GroupAnalyzer
+            analysis = GroupAnalyzer().ensure_alignment_order(group, analysis, cancel_event=cancel_event)
         ordered = [Path(path) for path in _value(analysis, "alignment_order", ())]
         selected = [Path(path) for path in _value(analysis, "selected_paths", ())]
         paths = ordered or selected

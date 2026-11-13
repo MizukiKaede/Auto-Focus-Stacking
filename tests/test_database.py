@@ -4,6 +4,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from focus_stack_app.storage.database import Database
 from focus_stack_app.storage.models import AnalysisRecord, GroupRecord, ImageRecord, JobRecord
@@ -26,6 +27,55 @@ class DatabaseTests(unittest.TestCase):
                 selected = database.get_selected_images(group.id or 0)
                 self.assertEqual([item.filename for item in selected], ["DSC1.JPG"])
                 self.assertEqual(database.get_analysis(first.id or 0).transform, [[1, 0], [0, 1]])
+
+    def test_image_batch_rollback_and_rescan_preserves_id_and_archive_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "DSC0001.JPG"
+            archived = root / "archive" / source.name
+            with Database(root / "database.sqlite") as database:
+                original = ImageRecord.from_path(source, file_size=12, sequence_index=0)
+                database.insert_images([original])
+                original_id = original.id
+                database.update_image_path(
+                    original_id or 0, archived, status="ARCHIVED", archive_mode="copy",
+                )
+
+                rescanned = ImageRecord.from_path(source, file_size=13, sequence_index=0)
+                ids = database.insert_images([rescanned])
+                self.assertEqual(ids, [original_id])
+                self.assertEqual(rescanned.id, original_id)
+                self.assertEqual(rescanned.current_path, str(archived))
+                self.assertEqual(rescanned.status, "ARCHIVED")
+                self.assertEqual(rescanned.archive_mode, "copy")
+
+                new_records = [
+                    ImageRecord.from_path(root / "DSC0002.JPG"),
+                    ImageRecord.from_path(root / "DSC0003.JPG"),
+                ]
+                insert_one = database.insert_image
+                attempts = 0
+
+                def insert_then_fail(record):
+                    nonlocal attempts
+                    attempts += 1
+                    identifier = insert_one(record)
+                    if attempts == 2:
+                        raise RuntimeError("force batch rollback")
+                    return identifier
+
+                with patch.object(database, "insert_image", side_effect=insert_then_fail):
+                    with self.assertRaisesRegex(RuntimeError, "force batch rollback"):
+                        database.insert_images(new_records)
+
+                self.assertIsNone(database.find_image_by_path(new_records[0].original_path))
+                self.assertIsNone(database.find_image_by_path(new_records[1].original_path))
+                persisted = database.get_image(original_id or 0)
+                self.assertIsNotNone(persisted)
+                assert persisted is not None
+                self.assertEqual(persisted.current_path, str(archived))
+                self.assertEqual(persisted.status, "ARCHIVED")
+                self.assertEqual(persisted.archive_mode, "copy")
 
     def test_archive_and_job_recovery_are_read_check_then_update(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

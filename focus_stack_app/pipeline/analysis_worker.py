@@ -22,6 +22,7 @@ class AnalysisJob:
     # must bypass Hugin/Enfuse and remain in the source directory.  Archiving
     # is allowed only after a real composite has been created.
     archive_only: bool = False
+    sequence_index: int | None = None
 
     @property
     def group_id(self) -> int | str | None:
@@ -300,7 +301,7 @@ class AnalysisWorker(threading.Thread):
 
     def run(self) -> None:
         try:
-            for group in self.groups:
+            for sequence_index, group in enumerate(self.groups):
                 if self.cancel_event.is_set():
                     self._update_job(group, stage="FOCUS_ANALYSIS", status="CANCELLED")
                     break
@@ -339,7 +340,8 @@ class AnalysisWorker(threading.Thread):
                         _set_group_state(self.repository, group, "CANCELLED")
                         self._update_job(group, stage="FOCUS_ANALYSIS", status="CANCELLED")
                         break
-                    job = AnalysisJob(group=group, analysis=result, archive_only=not _needs_merge(result, group))
+                    job = AnalysisJob(group=group, analysis=result, archive_only=not _needs_merge(result, group),
+                                      sequence_index=sequence_index)
                     _set_group_state(self.repository, group, _analysis_group_status(result, group))
                     # The analysis payload is now durable/in-memory.  A merge
                     # candidate proceeds to Hugin; a no-merge decision is
@@ -361,7 +363,7 @@ class AnalysisWorker(threading.Thread):
                     self.errors += 1
                     # Analysis failures bypass Hugin and leave every original
                     # in place.  The consumer still emits a manifest result.
-                    job = AnalysisJob(group=group, error=exc, archive_only=True)
+                    job = AnalysisJob(group=group, error=exc, archive_only=True, sequence_index=sequence_index)
                     self.failed_jobs.append(job)
                     _set_group_state(self.repository, group, "FAILED_CLASSIFICATION")
                     self._update_job(group, stage="FUSION", status="RUNNING", progress=0.35, error=exc)

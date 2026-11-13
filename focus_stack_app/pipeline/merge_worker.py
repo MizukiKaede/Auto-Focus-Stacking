@@ -320,6 +320,7 @@ class StackMergeService:
         align_image_stack_path: os.PathLike[str] | str | None = None,
         enfuse_path: os.PathLike[str] | str | None = None,
         manifest_writer: Any | None = None,
+        publish_manifest: bool = True,
         fusion_backend: str | FusionBackend = "quality",
         minimum_stack_group_size: int = 4,
         logger: logging.Logger | None = None,
@@ -429,7 +430,7 @@ class StackMergeService:
                     reason, media = "detected_ssd_unavailable_keep_cache", "UNKNOWN"
             self.logger.info("hugin temporary storage path=%s media=%s reason=%s",
                              self.temp_root, media, reason)
-        if manifest_writer is None:
+        if manifest_writer is None and publish_manifest:
             # A real pipeline should leave a durable manifest even when the
             # caller only supplied an output directory.  Import lazily to
             # preserve the low-dependency/headless construction path.
@@ -440,7 +441,7 @@ class StackMergeService:
             from ..storage.manifest import ManifestWriter
 
             manifest_writer = ManifestWriter(manifest_writer)
-        self.manifest_writer = manifest_writer
+        self.manifest_writer = manifest_writer if publish_manifest else None
 
     def _archive_map(self, all_objects: list[Any], all_paths: list[Path]) -> tuple[ArchiveResult, dict[str, Path]]:
         if self.archiver is None:
@@ -752,6 +753,7 @@ class MergeWorker(threading.Thread):
         self.finished = 0
         self.errors = 0
         self.results: list[Any] = []
+        self.indexed_results: list[tuple[int | None, Any]] = []
         self.failed_jobs: list[tuple[AnalysisJob, Exception]] = []
         self._deferred_jobs: list[AnalysisJob] = []
 
@@ -846,6 +848,7 @@ class MergeWorker(threading.Thread):
             # callback for manifests and diagnostics.
             if not (job.archive_only and job.error is not None):
                 self.results.append(result)
+                self.indexed_results.append((job.sequence_index, result))
                 self.completed += 1
             self._update_job(
                 job.group,

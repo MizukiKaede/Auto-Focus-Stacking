@@ -267,7 +267,8 @@ class PipelineCoordinator:
             summary.cancelled = self.cancel_event.is_set()
             summary.failed_analysis = list(analysis.failed_jobs)
             summary.failed_merge = [item for worker in merge_workers for item in worker.failed_jobs]
-            summary.results = [item for worker in merge_workers for item in worker.results]
+            indexed_results = [item for worker in merge_workers for item in worker.indexed_results]
+            summary.results = [result for _, result in sorted(indexed_results, key=lambda item: item[0])]
             summary.elapsed_seconds = time.monotonic() - self._started_at
             self._summary = summary
             self._ensure_manifest()

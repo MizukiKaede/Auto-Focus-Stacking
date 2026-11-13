@@ -7,16 +7,24 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 
+from PIL import Image
+
 from focus_stack_app.config import AppConfig, OutputConfig, RuntimeConfig
 from focus_stack_app.files.archiver import ArchiveMode, FileArchiver
 from focus_stack_app.hugin.align import AlignImageStack
 from focus_stack_app.hugin.enfuse import Enfuser, EnfuseConfig
 from focus_stack_app.hugin.process import CommandResult
-from focus_stack_app.pipeline.application_controller import ApplicationController, ApplicationOptions
+from focus_stack_app.pipeline.application_controller import (
+    ApplicationController,
+    ApplicationOptions,
+    _RecoveryAnalyzerAdapter,
+)
 from focus_stack_app.pipeline.merge_worker import StackMergeService
 from focus_stack_app.pipeline.events import PipelineEvent, PipelineStage
 from focus_stack_app.storage.database import Database
 from focus_stack_app.storage.models import GroupRecord, ImageRecord, JobRecord
+from focus_stack_app.core.group_analyzer import GroupAnalyzer
+from focus_stack_app.core.types import SceneGroup
 from focus_stack_app.ui.progress_panel import ProgressSnapshot
 
 
@@ -79,6 +87,181 @@ class _LoggingCommandRunner:
 
 
 class PipelineRecoveryTests(unittest.TestCase):
+    def test_recovery_adapter_computes_missing_hugin_order_without_reanalysis(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            records = [
+                ImageRecord.from_path(root / f"STACK{index}.JPG", sequence_index=index)
+                for index in range(4)
+            ]
+            paths = [str(item.path) for item in records]
+            group = SceneGroup(77, records)
+            loads = []
+
+            def loader(item, max_long_edge=None):
+                loads.append((item.path, max_long_edge))
+                return item.sequence_index
+
+            analyzer = GroupAnalyzer(require_alignment_order=True, loader=loader)
+            analyzer.build_alignment_order = lambda previews, capture_order: {
+                "alignment_order": list(reversed(capture_order)),
+                "alignment_order_confidence": 0.8,
+                "alignment_order_diagnostics": {"code": "OK", "edges": []},
+                "alignment_order_fallback_used": False,
+            }
+            stored = {
+                "group_id": 77,
+                "needs_merge": True,
+                "selected_indices": [1, 3],
+                "selected_paths": [paths[1], paths[3]],
+                "capture_order": paths,
+                "alignment_order": [],
+            }
+            adapter = _RecoveryAnalyzerAdapter(analyzer, {77: stored})
+
+            recovered = adapter.analyze_group(group)
+
+            self.assertEqual(loads, [(records[1].path, 512), (records[3].path, 512)])
+            self.assertEqual(recovered["selected_paths"], stored["selected_paths"])
+            self.assertEqual(recovered["selected_indices"], [1, 3])
+            self.assertEqual(recovered["alignment_order_indices"], [3, 1])
+            self.assertEqual(recovered["alignment_order"], [paths[3], paths[1]])
+            self.assertEqual(stored["alignment_order"], [])
+
+    def test_recovery_payload_only_rebuilds_invalid_hugin_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            output = root / "output"
+            source.mkdir()
+            output.mkdir()
+            paths = []
+            for index in range(4):
+                path = source / f"STACK{index}.JPG"
+                path.write_bytes(f"image-{index}".encode())
+                paths.append(path)
+
+            database = Database(output / ".stack_cache" / "database.sqlite")
+            images = [
+                ImageRecord.from_path(path, file_size=path.stat().st_size, sequence_index=index)
+                for index, path in enumerate(paths)
+            ]
+            database.insert_images(images)
+            record = GroupRecord(
+                first_image_id=images[0].id,
+                start_index=0,
+                end_index=3,
+                image_count=4,
+                selected_count=2,
+                status="SELECTED",
+            )
+            database.insert_group(record)
+            assert record.id is not None
+            for image in images:
+                database.set_image_group(image.id or 0, record.id)
+            selected_ids = [images[index].id or 0 for index in (1, 3)]
+            database.set_group_selection(record.id, selected_ids)
+
+            controller = ApplicationController(
+                ApplicationOptions(
+                    source_dir=source,
+                    output_dir=output,
+                    minimum_stack_group_size=2,
+                    archive_enabled=False,
+                ),
+                config=AppConfig(),
+                database=database,
+                scanner=_NoScan(),
+                analyzer=_NoAnalyze(),
+            )
+            job = JobRecord(group_id=record.id, stage="ALIGNMENT", status="RUNNING")
+            loads = []
+            order_builds = []
+
+            def loader(item, max_long_edge=None):
+                loads.append((item.path, max_long_edge))
+                return item.sequence_index
+
+            analyzer = GroupAnalyzer(require_alignment_order=True, loader=loader, database=database)
+
+            def build_order(previews, *, capture_order=None):
+                order_builds.append((list(previews), list(capture_order or ())))
+                return {
+                    "alignment_order": list(reversed(capture_order or ())),
+                    "alignment_order_confidence": 0.8,
+                    "alignment_order_diagnostics": {"code": "OK", "edges": []},
+                    "alignment_order_fallback_used": False,
+                }
+
+            analyzer.build_alignment_order = build_order
+            adapter = _RecoveryAnalyzerAdapter(analyzer, {})
+            variants = {
+                "missing": [],
+                "partial": [str(paths[1])],
+                "duplicate": [str(paths[1]), str(paths[1])],
+            }
+            selected_paths = [str(paths[1]), str(paths[3])]
+            for stored_order in variants.values():
+                database.set_group_status(
+                    record.id,
+                    "SELECTED",
+                    alignment_order=stored_order,
+                    alignment_order_confidence=0.7,
+                )
+                recovered_group, payload = controller._recovery_group_payload(
+                    job, database.get_group(record.id)
+                )
+                self.assertEqual(payload["selected_paths"], selected_paths)
+                self.assertEqual(payload["selected_indices"], [1, 3])
+                self.assertEqual(payload["alignment_order"], [])
+                self.assertEqual(payload["alignment_order_confidence"], 0.0)
+                self.assertFalse(payload["alignment_order_fallback_used"])
+                self.assertEqual(payload["alignment_order_diagnostics"]["code"], "NOT_REQUESTED")
+
+                loads.clear()
+                before_builds = len(order_builds)
+                result = _RecoveryAnalyzerAdapter(analyzer, {record.id: payload}).analyze_group(recovered_group)
+
+                self.assertEqual(loads, [(paths[1], 512), (paths[3], 512)])
+                self.assertEqual(len(order_builds), before_builds + 1)
+                self.assertEqual(order_builds[-1][1], [1, 3])
+                self.assertEqual(result["selected_paths"], selected_paths)
+                self.assertEqual(result["selected_indices"], [1, 3])
+                self.assertEqual(result["alignment_order"], [str(paths[3]), str(paths[1])])
+
+            database.set_group_status(
+                record.id,
+                "SELECTED",
+                alignment_order=[str(paths[3]), str(paths[1])],
+                alignment_order_confidence=0.9,
+            )
+            recovered_group, payload = controller._recovery_group_payload(
+                job, database.get_group(record.id)
+            )
+            loads.clear()
+            before_builds = len(order_builds)
+            result = _RecoveryAnalyzerAdapter(analyzer, {record.id: payload}).analyze_group(recovered_group)
+            self.assertEqual(payload["alignment_order_diagnostics"]["code"], "RECOVERED")
+            self.assertEqual(result["alignment_order"], [str(paths[3]), str(paths[1])])
+            self.assertEqual(loads, [])
+            self.assertEqual(len(order_builds), before_builds)
+
+            database.set_group_status(record.id, "SELECTED", alignment_order=[])
+            recovered_group, payload = controller._recovery_group_payload(
+                job, database.get_group(record.id)
+            )
+            quality_analyzer = GroupAnalyzer(require_alignment_order=False, loader=loader, database=database)
+            quality_analyzer.build_alignment_order = lambda *args, **kwargs: self.fail(
+                "Quality recovery must not recompute Hugin ordering"
+            )
+            loads.clear()
+            result = _RecoveryAnalyzerAdapter(quality_analyzer, {record.id: payload}).analyze_group(recovered_group)
+            self.assertEqual(result["alignment_order"], [])
+            self.assertEqual(result["selected_paths"], selected_paths)
+            self.assertEqual(result["selected_indices"], [1, 3])
+            self.assertEqual(loads, [])
+            database.close()
+
     def test_move_done_group_analyzed_before_crash_resumes_hugin_from_archive(self):
         """A MOVE-completed source can resume after a crash before alignment."""
 
@@ -91,7 +274,16 @@ class PipelineRecoveryTests(unittest.TestCase):
             originals = []
             for index in range(4):
                 path = source / f"STACK{index}.JPG"
-                path.write_bytes((f"jpeg-{index}-" + "x" * 32).encode())
+                image = Image.new("RGB", (64, 64))
+                pixels = image.load()
+                for y in range(64):
+                    for x in range(64):
+                        pixels[x, y] = (
+                            (x * 17 + y * 13 + index * 29 + ((x // 8 + y // 8) % 2) * 41) % 256,
+                            (x * 7 + y * 23 + index * 37 + ((x ^ y) * 3)) % 256,
+                            (x * 31 + y * 5 + index * 19 + ((x // 4 ^ y // 4) * 37)) % 256,
+                        )
+                image.save(path, format="JPEG", quality=92)
                 originals.append(path)
 
             database_path = output / ".stack_cache" / "database.sqlite"

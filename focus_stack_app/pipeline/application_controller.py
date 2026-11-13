@@ -31,7 +31,6 @@ from ..utils.concurrency import opencv_thread_budget, resolve_focus_analysis_bud
 from ..files.archiver import ArchiveMode, FileArchiver
 from ..storage.cache import CachePaths, DiskCache
 from ..storage.database import Database
-from ..storage.manifest import ManifestWriter
 from ..storage.models import GroupRecord, ImageRecord
 from .coordinator import PipelineConfig, PipelineCoordinator, PipelineSummary
 from .events import PipelineEvent, PipelineStage
@@ -425,7 +424,11 @@ class _RecoveryAnalyzerAdapter:
     def analyze_group(self, group: Any, **kwargs: Any) -> Any:
         gid = _group_id(group)
         if gid is not None and int(gid) in self.payloads:
-            return self.payloads[int(gid)]
+            result = self.payloads[int(gid)]
+            ensure_order = getattr(self.fallback, "ensure_alignment_order", None)
+            if callable(ensure_order):
+                return ensure_order(group, result, cancel_event=kwargs.get("cancel_event"))
+            return result
         callback = getattr(self.fallback, "analyze_group", None)
         if not callable(callback):
             callback = getattr(self.fallback, "analyze", self.fallback)
@@ -1016,12 +1019,12 @@ class ApplicationController:
         stored_order = list(_mapping_value(group_record, "alignment_order", default=()) or ())
         recovered_order = [resolved for value in stored_order if (resolved := recovered_current(value)) is not None]
         selected_keys = {os.path.normcase(os.path.abspath(value)) for value in selected_paths}
-        recovered_order = [value for value in recovered_order if os.path.normcase(os.path.abspath(value)) in selected_keys]
-        for value in selected_paths:
-            if os.path.normcase(os.path.abspath(value)) not in {
-                os.path.normcase(os.path.abspath(item)) for item in recovered_order
-            }:
-                recovered_order.append(value)
+        recovered_keys = [os.path.normcase(os.path.abspath(value)) for value in recovered_order]
+        if (len(recovered_order) != len(stored_order)
+                or len(recovered_keys) != len(selected_paths)
+                or len(set(recovered_keys)) != len(recovered_keys)
+                or set(recovered_keys) != selected_keys):
+            recovered_order = []
         recovered_reference = recovered_current(_mapping_value(group_record, "preview_reference", default=None))
         analysis: dict[str, Any] = {
             "group_id": int(gid),
@@ -1032,9 +1035,16 @@ class ApplicationController:
             "selected_paths": selected_paths,
             "selected_images": selected_paths,
             "capture_order": [str(path) for path in paths if path is not None],
-            "alignment_order": recovered_order or selected_paths,
-            "alignment_order_confidence": _mapping_value(group_record, "alignment_order_confidence", default=0.0),
-            "alignment_order_fallback_used": bool(_mapping_value(group_record, "alignment_order_fallback_used", default=False)),
+            "alignment_order": recovered_order,
+            "alignment_order_confidence": (
+                _mapping_value(group_record, "alignment_order_confidence", default=0.0) if recovered_order else 0.0
+            ),
+            "alignment_order_fallback_used": bool(
+                recovered_order and _mapping_value(group_record, "alignment_order_fallback_used", default=False)
+            ),
+            "alignment_order_diagnostics": {
+                "code": "RECOVERED" if recovered_order else "NOT_REQUESTED", "edges": [],
+            },
             "preview_reference": recovered_reference or str(first_path),
             "first_original_image": first,
             "first_original_path": str(_mapping_value(first, "original_path", default=first_path)),
@@ -1187,12 +1197,20 @@ class ApplicationController:
     def _persist_images(self, records: list[ImageRecord]) -> None:
         if self._database is None:
             return
+        insert_many = getattr(self._database, "insert_images", None)
+        if callable(insert_many):
+            for start in range(0, len(records), 256):
+                if self._cancel_event.is_set():
+                    raise ControllerCancelled()
+                batch = records[start:start + 256]
+                insert_many(batch)
+                self._emit(
+                    PipelineStage.SCANNING, current_file=batch[-1].path,
+                    completed=start + len(batch), total=len(records), message="保存图片记录",
+                )
+            return
         insert = getattr(self._database, "insert_image", None)
         if not callable(insert):
-            insert_many = getattr(self._database, "insert_images", None)
-            if callable(insert_many):
-                insert_many(records)
-                return
             raise ControllerError("database must expose insert_image(s)")
         for index, record in enumerate(records):
             if self._cancel_event.is_set():
@@ -1556,6 +1574,7 @@ class ApplicationController:
             database=self._database,
             cache=self._cache if self.options.preserve_cache else None,
             plan_cache=self._database if self.options.preserve_cache else None,
+            require_alignment_order=self.options.fusion_backend == "hugin_enfuse",
             loader=self._analysis_loader,
             coverage_config=CoverageConfig(
                 mode="balanced",
@@ -1569,7 +1588,6 @@ class ApplicationController:
     def _build_merger(self) -> Any:
         if self._merge_service is not None:
             return self._merge_service
-        manifest = ManifestWriter(self.output_dir / "stack_manifest.csv")
         archiver = (
             FileArchiver(self.archive_dir, self.options.archive_mode, repository=self._database, logger=self.logger)
             if self.options.archive_enabled
@@ -1588,7 +1606,7 @@ class ApplicationController:
             hugin_bin=self.options.hugin_bin,
             align_image_stack_path=self.options.align_image_stack_path,
             enfuse_path=self.options.enfuse_path,
-            manifest_writer=manifest,
+            publish_manifest=False,
             fusion_backend=self.options.fusion_backend,
             minimum_stack_group_size=self.options.minimum_stack_group_size,
             logger=self.logger,

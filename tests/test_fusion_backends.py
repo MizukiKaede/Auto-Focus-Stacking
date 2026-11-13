@@ -139,6 +139,77 @@ def test_hugin_backend_retries_in_isolated_dirs_and_preserves_order(tmp_path):
     assert any(item.startswith("CROP_RATIO_WARNING") for item in result.diagnostics)
 
 
+def test_hugin_backend_fills_alignment_order_when_quality_analysis_skips_it(tmp_path, monkeypatch):
+    import threading
+    from focus_stack_app.core.group_analyzer import GroupAnalyzer
+
+    inputs = [tmp_path / "first.jpg", tmp_path / "second.jpg"]
+    for path in inputs:
+        Image.new("RGB", (32, 32), "gray").save(path)
+    calls = []
+
+    def ensure_order(self, group, analysis, *, cancel_event=None):
+        calls.append((group, analysis, cancel_event))
+        return {
+            **analysis,
+            "alignment_order": [str(inputs[1]), str(inputs[0])],
+            "alignment_order_diagnostics": {"code": "OK", "edges": []},
+        }
+
+    monkeypatch.setattr(GroupAnalyzer, "ensure_alignment_order", ensure_order)
+
+    class Aligner:
+        def __init__(self):
+            self.calls = []
+
+        def align(self, paths, *, work_dir, cancel_event=None):
+            self.calls.append(tuple(Path(path) for path in paths))
+            work_dir = Path(work_dir)
+            work_dir.mkdir(parents=True, exist_ok=True)
+            outputs = []
+            for index in range(len(paths)):
+                output = work_dir / f"aligned{index}.tif"
+                output.write_bytes(b"aligned")
+                outputs.append(output)
+            return SimpleNamespace(
+                input_paths=tuple(paths), aligned_paths=tuple(outputs), work_dir=work_dir,
+            )
+
+    class Enfuser:
+        def __init__(self):
+            self.calls = []
+
+        def fuse(self, paths, output_path, **kwargs):
+            self.calls.append(tuple(Path(path) for path in paths))
+            output_path = Path(output_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"fused")
+            return SimpleNamespace(output_path=output_path)
+
+    aligner, enfuser = Aligner(), Enfuser()
+    backend = HuginEnfuseBackend(aligner, enfuser)
+    analysis = {
+        "selected_paths": [str(path) for path in inputs],
+        "alignment_order": [],
+        "alignment_order_diagnostics": {"code": "NOT_REQUESTED", "edges": []},
+        "first_original_path": str(inputs[0]),
+    }
+    original = dict(analysis)
+
+    result = backend.fuse(
+        {"group_id": 1}, analysis, tmp_path / "output.jpg", tmp_path / "work",
+        OutputConfig(), threading.Event(),
+    )
+
+    assert len(calls) == 1
+    assert aligner.calls == [(inputs[1], inputs[0])]
+    assert len(enfuser.calls) == 1
+    assert len(enfuser.calls[0]) == len(aligner.calls[0])
+    assert all(path.parent.name == "alignment_level_1" for path in enfuser.calls[0])
+    assert result.output_path.is_file()
+    assert analysis == original
+
+
 def test_shared_hugin_aligner_keeps_retry_args_local_during_parallel_fusions(tmp_path):
     import threading
 
