@@ -8,10 +8,10 @@ Auto-stack 是一个自动批量图片合成的 Windows 桌面应用，面向焦
 
 ## Windows 便携版下载
 
-当前 README 对应 **main 常规版**。本次打包日期：**2026-10-07**（北京时间）。
+当前 README 对应 **main 常规版**。本次打包日期：**2026-11-14**（北京时间）。
 
-- [下载本分支便携包：AutoStack-main-win64.zip](https://github.com/MizukiKaede/Auto-stack/releases/download/main-win64-2026.10.07/AutoStack-main-win64.zip)
-- [查看本版发布说明、校验值与第三方源码附件](https://github.com/MizukiKaede/Auto-stack/releases/tag/main-win64-2026.10.07)
+- [下载本分支便携包：AutoStack-main-win64.zip](https://github.com/MizukiKaede/Auto-stack/releases/download/main-win64-2026.11.14/AutoStack-main-win64.zip)
+- [查看本版发布说明、校验值与第三方源码附件](https://github.com/MizukiKaede/Auto-stack/releases/tag/main-win64-2026.11.14)
 - [查看另一分支 README](https://github.com/MizukiKaede/Auto-stack/blob/dev/README.md)
 
 适用于 **Windows 10/11 64 位**。完整解压 ZIP，然后双击 `AutoStack-main.exe` 即可启动，无需安装 Python、Hugin 或微软运行库。
@@ -24,7 +24,7 @@ Auto-stack 是一个自动批量图片合成的 Windows 桌面应用，面向焦
 
 | 版本 | 用途 | 本次便携包对应提交 | 主要区别 |
 | --- | --- | --- | --- |
-| [main 常规版](https://github.com/MizukiKaede/Auto-stack/releases/tag/main-win64-2026.10.07) | 日常使用的常规发布入口 | `67b606e` | 当前 main 分支的高质量、Fast C++、Hugin/Enfuse 流程 |
+| [main 常规版](https://github.com/MizukiKaede/Auto-stack/releases/tag/main-win64-2026.11.14) | 日常使用的常规发布入口 | `17124b6` | 包含分析流程精简、缓存复用与任务恢复修正的 main 版本 |
 | [dev 开发预览版](https://github.com/MizukiKaede/Auto-stack/releases/tag/dev-win64-2026.10.07) | 体验开发分支改动、反馈问题 | `6b09168` | 增加原生内核线程预算与降级处理，以及 Hugin 蒙版/纹理算子和调度改动 |
 
 两版都提供高质量（默认）、Fast 和实验模式。dev 的新增实现不代表每个场景都更快或效果更好；本次发布未执行照片融合回归或整批性能测试。
