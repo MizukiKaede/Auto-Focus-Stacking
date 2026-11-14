@@ -722,6 +722,8 @@ def blend_focus_pyramid(count, load_aligned, labels, *, cancel_event=None, level
     """
     if levels < 1:
         raise ValueError("focus blend levels must be at least 1")
+    from . import quality_rgb_native
+    use_native = levels == 1 and quality_rgb_native.available()
     accumulators = []
     if prefetch:
         frame_iterator = _ordered_prefetched_frames(count, load_aligned, cancel_event)
@@ -740,6 +742,15 @@ def blend_focus_pyramid(count, load_aligned, labels, *, cancel_event=None, level
             # need a check after their background load has completed.
             if prefetch and cancel_event is not None and cancel_event.is_set():
                 raise RuntimeError("focus fusion cancelled")
+            if use_native and rgb.dtype != np.uint8:
+                use_native = False
+            if use_native:
+                weight = focus_weight(labels, index)
+                if index == 0:
+                    accumulators.append(np.empty(rgb.shape, np.float32))
+                quality_rgb_native.add(rgb, weight, accumulators[0], first=index == 0)
+                del rgb, weight
+                continue
             pixels = rgb.astype(np.float32)
             del rgb
             weight = focus_weight(labels, index)
@@ -764,6 +775,11 @@ def blend_focus_pyramid(count, load_aligned, labels, *, cancel_event=None, level
         if callable(close):
             close()
     result = accumulators.pop()
+    if use_native:
+        from ..utils.performance import diagnostic
+        output = quality_rgb_native.finish(result)
+        diagnostic('quality_rgb_execution', **quality_rgb_native.runtime_info())
+        return output
     for detail in reversed(accumulators):
         result = cv2.pyrUp(result, dstsize=(detail.shape[1], detail.shape[0])) + detail
     return np.clip(np.rint(result), 0, 255).astype(np.uint8)

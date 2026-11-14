@@ -624,16 +624,18 @@ class QualityFusionBackend(FusionBackend):
 
             def observe_frame(index, rgb, gray, score):
                 nonlocal compatibility_mask
+                from .frame_features import FrameFeatures
+                features = FrameFeatures(rgb)
                 valid = None
                 if valid_sources is not None:
                     valid = valid_sources.observe(index, score)
                 if printed_guard is not None:
-                    printed_guard.observe(index, rgb, gray, score)
+                    printed_guard.observe(index, rgb, gray, score, features=features)
                 if surface_tone is not None:
-                    surface_tone.observe(index, rgb)
-                    surface_boundary.observe(index, rgb, score, valid=valid)
+                    surface_tone.observe(index, rgb, features=features)
+                    surface_boundary.observe(index, rgb, score, valid=valid, features=features)
                 if texture is not None:
-                    texture.observe(index, rgb, gray, score)
+                    texture.observe(index, rgb, gray, score, features=features)
                 elif execution == "streaming" and index == 0:
                     from .quality_fusion import neutral_mask
                     compatibility_mask = neutral_mask(rgb, gray)
@@ -677,6 +679,10 @@ class QualityFusionBackend(FusionBackend):
                     surface_boundary.texture_protection(labels.shape) if surface_boundary is not None else None))
             if valid_sources is not None:
                 labels = valid_sources.apply(labels)
+            valid_source_ownership = valid_sources is not None
+            # These observers are finished. Release their large maps before
+            # the cache's next memory check and the RGB blending allocations.
+            surface_boundary = printed_guard = valid_sources = None
             pass_number = 2
             blend_prefetch = bool(_value(self.runtime_config, "quality_blend_prefetch", True))
 
@@ -713,7 +719,7 @@ class QualityFusionBackend(FusionBackend):
             diagnostics += ("PREVIEW_REGISTRATION_REBUILT",)
         if surface_tone is not None:
             diagnostics += ("MATERIAL_PAIRED_SURFACE_TONE_V17",)
-        if valid_sources is not None:
+        if valid_source_ownership:
             diagnostics += ("OPENCV_VALID_SOURCE_LOCAL_DETAIL_V20_ASTRA",)
         return FusionResult(Path(final), self.name, alignment_status="PREVIEW_TRANSFORMS", diagnostics=diagnostics)
 

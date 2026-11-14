@@ -72,7 +72,7 @@ class ValidSourceOwnership:
         return result
 
 
-def _local_detail_statistics(small, valid=None):
+def _local_detail_statistics(small, valid=None, *, gray=None):
     """Local fine energy and robust noise evidence, with no colour class.
 
     Compare to a separate noise ceiling for each frame and brightness range.
@@ -81,7 +81,8 @@ def _local_detail_statistics(small, valid=None):
     support; choosing its own least-textured 35% would still measure engraving.
     Twice the robust upper ceiling rejects marginal grain fluctuations.
     """
-    gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
+    if gray is None:
+        gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
     luma = gray.astype(np.float32) / 255.0
     smooth = cv2.GaussianBlur(luma, (0, 0), 0.6)
     lap = cv2.Laplacian(smooth, cv2.CV_32F, ksize=3)
@@ -138,13 +139,15 @@ class OpenCVBoundaryOwnership(SurfaceBoundaryOwnership):
         super().__init__(**kwargs)
         self.local_detail_best = self.local_detail_owner = None
 
-    def observe(self, index, rgb, score=None, *, valid=None):
-        super().observe(index, rgb, score)
+    def observe(self, index, rgb, score=None, *, valid=None, features=None):
+        super().observe(index, rgb, score, features=features)
         size = (self.best.shape[1], self.best.shape[0])
-        small = cv2.resize(rgb, size, interpolation=cv2.INTER_AREA)
+        small = (cv2.resize(rgb, size, interpolation=cv2.INTER_AREA)
+                 if features is None else features.rgb(size))
         valid_small = (None if valid is None else
                        cv2.resize(valid.astype(np.float32), size, interpolation=cv2.INTER_AREA) >= 1.0)
-        response, evidence = _local_detail_statistics(small, valid_small)
+        response, evidence = _local_detail_statistics(
+            small, valid_small, gray=None if features is None else features.gray(size))
         if valid is None and score is not None:
             # The private source-footprint observer already zeros invalid
             # focus samples; reflected RGB padding must not supply evidence.

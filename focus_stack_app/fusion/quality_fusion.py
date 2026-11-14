@@ -90,7 +90,7 @@ class FlatTextureStatistics:
         mad = float(np.median(np.abs(values - median)))
         return max(np.finfo(np.float32).eps, median + 6 * 1.4826 * mad)
 
-    def observe(self, index, rgb, gray, score):
+    def observe(self, index, rgb, gray, score, *, features=None):
         h, w = gray.shape
         if self.size is None:
             scale = min(0.5, (self.maximum_pixels / (h * w)) ** 0.5)
@@ -109,8 +109,9 @@ class FlatTextureStatistics:
         # noisy pixel must not grow into a 33-pixel exclusion region.
         gradient = cv2.magnitude(cv2.Sobel(mean, cv2.CV_32F, 1, 0), cv2.Sobel(mean, cv2.CV_32F, 0, 1))
         response = cv2.resize(score, self.size, interpolation=cv2.INTER_AREA)
-        small_rgb = cv2.resize(rgb, self.size, interpolation=cv2.INTER_AREA)
-        chroma = chroma_map(small_rgb)
+        small_rgb = (cv2.resize(rgb, self.size, interpolation=cv2.INTER_AREA)
+                     if features is None else features.rgb(self.size))
+        chroma = chroma_map(small_rgb) if features is None else features.chroma(self.size)
         if self.max_response is None:
             self.max_response, self.max_variance, self.max_gradient = response, variance, gradient
             self.max_chroma = chroma
@@ -236,18 +237,8 @@ def clean_tiny_labels(labels, protected, *, maximum_area=8, cancel_event=None):
 
 def _nearest_edge_support(strength, edge, radius):
     """Extend the nearest physical edge, without borrowing a distant corner."""
-    present = edge != 0
-    if not np.any(present):
-        return np.zeros_like(strength)
-    density = cv2.GaussianBlur(present.astype(np.float32), (0, 0), 2.0)
-    averaged = cv2.GaussianBlur(strength * present, (0, 0), 2.0)
-    averaged /= np.maximum(density, 1e-6)
-    distance, nearest = cv2.distanceTransformWithLabels(
-        np.uint8(~present), cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL)
-    values = np.zeros(int(nearest.max()) + 1, np.float32)
-    values[nearest[present]] = averaged[present]
-    weight = np.clip((radius + 1.0 - distance) / max(2.0, radius / 4.0), 0, 1)
-    return values[nearest] * weight
+    from .fast_cpp import nearest_support
+    return nearest_support(strength, edge, radius)
 
 
 class SurfaceBoundaryOwnership:
@@ -259,7 +250,7 @@ class SurfaceBoundaryOwnership:
         self.best = self.confidence = self.owner = self.band = self.texture = self.interior = None
         self.owner_focus = self.neutral_focus = None
 
-    def observe(self, index, rgb, score=None):
+    def observe(self, index, rgb, score=None, *, features=None):
         from .focus_masks import _filled_chromatic_silhouette
 
         if score is None:
@@ -269,8 +260,9 @@ class SurfaceBoundaryOwnership:
         height, width = rgb.shape[:2]
         scale = min(0.5, (self.maximum_pixels / (height * width)) ** 0.5)
         size = (max(1, int(width * scale)), max(1, int(height * scale)))
-        small = cv2.resize(rgb, size, interpolation=cv2.INTER_AREA)
-        chroma = chroma_map(small)
+        small = (cv2.resize(rgb, size, interpolation=cv2.INTER_AREA)
+                 if features is None else features.rgb(size))
+        chroma = chroma_map(small) if features is None else features.chroma(size)
         count, parts, stats, _ = cv2.connectedComponentsWithStats(np.uint8(chroma >= 65), 8)
         retained = np.zeros(count, np.uint8)
         retained[1:] = stats[1:, cv2.CC_STAT_AREA] >= max(64, round(chroma.size * 0.001))
@@ -285,8 +277,12 @@ class SurfaceBoundaryOwnership:
         # the material, rather than protecting that colour fringe as texture.
         clearance = int(np.ceil(3 * low_sigma))
         core = cv2.erode(np.uint8(chroma >= 65), np.ones((2 * clearance + 1,) * 2, np.uint8))
-        low = cv2.GaussianBlur(small.astype(np.float32), (0, 0), low_sigma)
-        fine = np.mean((small.astype(np.float32) - low) ** 2, axis=2)
+        fine_rgb = small.astype(np.float32)
+        low = cv2.GaussianBlur(fine_rgb, (0, 0), low_sigma)
+        np.subtract(fine_rgb, low, out=fine_rgb)
+        np.square(fine_rgb, out=fine_rgb)
+        fine = np.mean(fine_rgb, axis=2)
+        del fine_rgb, low
         density = cv2.GaussianBlur(core.astype(np.float32), (0, 0), 3.0)
         texture = cv2.GaussianBlur(fine * core, (0, 0), 3.0)
         texture = (texture / np.maximum(density, 1e-6) > 144) & (density > 0.4)
@@ -304,7 +300,8 @@ class SurfaceBoundaryOwnership:
         # metal or engraving. Its propagated owner must not replace sharper
         # detail at the target itself. Keep this short core local to this
         # guard; expanding it would also protect defocused printing fringes.
-        luma = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
+        luma = (cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
+                if features is None else features.gray(size))
         clearance = max(1, int(np.ceil(4 * scale)))
         neutral = cv2.erode(np.uint8((chroma < 45) & (luma > 30) & (luma < 235)),
                             np.ones((2 * clearance + 1,) * 2, np.uint8)) != 0
@@ -385,14 +382,16 @@ class PrintedEdgeOwnership:
             raise ValueError("printed-edge statistics must have a positive pixel cap")
         self.best = self.owner = self.inside = None
 
-    def observe(self, index, rgb, gray, score):
+    def observe(self, index, rgb, gray, score, *, features=None):
         from .focus_masks import _filled_chromatic_silhouette
 
         scale = min(0.5, (self.maximum_pixels / (rgb.shape[0] * rgb.shape[1])) ** 0.5)
         size = (max(1, int(rgb.shape[1] * scale)), max(1, int(rgb.shape[0] * scale)))
-        small = cv2.resize(rgb, size, interpolation=cv2.INTER_AREA)
-        luma = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
-        chroma = chroma_map(small)
+        small = (cv2.resize(rgb, size, interpolation=cv2.INTER_AREA)
+                 if features is None else features.rgb(size))
+        luma = (cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
+                if features is None else features.gray(size))
+        chroma = chroma_map(small) if features is None else features.chroma(size)
         coloured = (chroma >= 65) & (luma >= 30)
         filled = _filled_chromatic_silhouette(coloured.astype(np.uint8))
         # A clipped character can open its white island to the image border.

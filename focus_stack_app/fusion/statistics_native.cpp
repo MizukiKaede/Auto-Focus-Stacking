@@ -4,9 +4,96 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <cstring>
+#include <emmintrin.h>
 #define API extern "C" __declspec(dllexport)
 #include "native_threads.h"
 API int statistics_core_abi() { return 1; }
+// Portable population count: no POPCNT/AVX requirement for the Windows build.
+static int popcount64(uint64_t value) {
+    value -= (value >> 1) & UINT64_C(0x5555555555555555);
+    value = (value & UINT64_C(0x3333333333333333)) + ((value >> 2) & UINT64_C(0x3333333333333333));
+    value = (value + (value >> 4)) & UINT64_C(0x0f0f0f0f0f0f0f0f);
+    return int((value * UINT64_C(0x0101010101010101)) >> 56);
+}
+API void coverage_counts(const uint64_t* masks, const uint64_t* covered,
+                         const int64_t* indices, int64_t* counts, int64_t words, int64_t count) {
+    for(int64_t j=0;j<count;++j) {
+        const uint64_t* mask = masks + indices[j]*words;
+        int64_t result=0;
+        for(int64_t w=0;w<words;++w) result+=popcount64(mask[w] & ~covered[w]);
+        counts[j]=result;
+    }
+}
+API int64_t coverage_add(const uint64_t* mask, uint64_t* covered, int64_t words) {
+    int64_t count=0;
+    for(int64_t w=0;w<words;++w) {
+        covered[w] |= mask[w];
+        count+=popcount64(covered[w]);
+    }
+    return count;
+}
+API void quality_rgb_add(const uint8_t* rgb, const float* weight, float* accumulator,
+                        int64_t n, int first) {
+    const __m128i zero=_mm_setzero_si128();
+    NATIVE_FOR(n)
+    for(int64_t block=0;block<n/4;++block) {
+        const int64_t i=block*4, p=i*3;
+        // Read exactly twelve bytes, including at the end of an image.
+        uint32_t last;
+        std::memcpy(&last,rgb+p+8,4);
+        const __m128i bytes=_mm_or_si128(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(rgb+p)),
+                                        _mm_slli_si128(_mm_cvtsi32_si128(int(last)),8));
+        const __m128i lo=_mm_unpacklo_epi8(bytes,zero), hi=_mm_unpackhi_epi8(bytes,zero);
+        const __m128 weights=_mm_loadu_ps(weight+i);
+        __m128 a=_mm_mul_ps(_mm_cvtepi32_ps(_mm_unpacklo_epi16(lo,zero)),
+                            _mm_shuffle_ps(weights,weights,_MM_SHUFFLE(1,0,0,0)));
+        __m128 b=_mm_mul_ps(_mm_cvtepi32_ps(_mm_unpackhi_epi16(lo,zero)),
+                            _mm_shuffle_ps(weights,weights,_MM_SHUFFLE(2,2,1,1)));
+        __m128 c=_mm_mul_ps(_mm_cvtepi32_ps(_mm_unpacklo_epi16(hi,zero)),
+                            _mm_shuffle_ps(weights,weights,_MM_SHUFFLE(3,3,3,2)));
+        if(!first) {
+            a=_mm_add_ps(_mm_loadu_ps(accumulator+p),a);
+            b=_mm_add_ps(_mm_loadu_ps(accumulator+p+4),b);
+            c=_mm_add_ps(_mm_loadu_ps(accumulator+p+8),c);
+        }
+        _mm_storeu_ps(accumulator+p,a);
+        _mm_storeu_ps(accumulator+p+4,b);
+        _mm_storeu_ps(accumulator+p+8,c);
+    }
+    for(int64_t i=(n/4)*4;i<n;++i) for(int c=0;c<3;++c) {
+        const int64_t p=3*i+c;
+        // Keep multiplication separate from addition; build disables FP contraction.
+        const float contribution=float(rgb[p])*weight[i];
+        accumulator[p]=first ? contribution : accumulator[p]+contribution;
+    }
+}
+static __m128i round_rgb4(const float* source) {
+    const __m128 value=_mm_max_ps(_mm_setzero_ps(),_mm_min_ps(_mm_set1_ps(255.0f),_mm_loadu_ps(source)));
+    const __m128i truncated=_mm_cvttps_epi32(value), one=_mm_set1_epi32(1);
+    const __m128 fraction=_mm_sub_ps(value,_mm_cvtepi32_ps(truncated)), half=_mm_set1_ps(0.5f);
+    const __m128i greater=_mm_castps_si128(_mm_cmpgt_ps(fraction,half));
+    const __m128i equal=_mm_castps_si128(_mm_cmpeq_ps(fraction,half));
+    const __m128i increment=_mm_or_si128(_mm_and_si128(greater,one),
+                                        _mm_and_si128(equal,_mm_and_si128(truncated,one)));
+    return _mm_add_epi32(truncated,increment);
+}
+API void quality_rgb_finish(const float* accumulator, uint8_t* out, int64_t n) {
+    NATIVE_FOR(n)
+    for(int64_t block=0;block<n/16;++block) {
+        const int64_t i=block*16;
+        const __m128i lo=_mm_packs_epi32(round_rgb4(accumulator+i),round_rgb4(accumulator+i+4));
+        const __m128i hi=_mm_packs_epi32(round_rgb4(accumulator+i+8),round_rgb4(accumulator+i+12));
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out+i),_mm_packus_epi16(lo,hi));
+    }
+    for(int64_t i=(n/16)*16;i<n;++i) {
+        const float value=std::max(0.0f,std::min(255.0f,accumulator[i]));
+        int rounded=int(value);
+        const float fraction=value-float(rounded);
+        rounded+=(fraction>0.5f || (fraction==0.5f && (rounded&1)));
+        out[i]=uint8_t(rounded);
+    }
+}
 API void probe_update(const uint8_t* classes, const uint8_t* rgb, uint8_t* lo, uint8_t* hi, uint16_t* count, int64_t n) {
     NATIVE_FOR(n)
     for (int64_t i=0;i<n;++i) {

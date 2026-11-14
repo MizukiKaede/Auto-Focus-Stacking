@@ -140,11 +140,12 @@ def material_classes(hsv, gray):
     return result
 
 
-def masked_colour(rgb, mask):
+def masked_colour(rgb, mask, *, out=None):
     rgb = np.ascontiguousarray(rgb, dtype=np.float32)
     shape = image(rgb, np.float32)
     mask = _mask(mask, shape)
-    result = np.empty_like(rgb)
+    result = np.empty_like(rgb) if out is None else out
+    array(result, np.float32, rgb.shape, write=True)
     if _library.available:
         _call('masked_colour', rgb, mask, result, mask.size)
     else:

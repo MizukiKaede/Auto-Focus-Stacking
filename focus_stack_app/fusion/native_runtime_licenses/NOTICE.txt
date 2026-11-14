@@ -1,0 +1,4 @@
+GCC runtimes: GNU GPL with GCC Runtime Library Exception; https://gcc.gnu.org/onlinedocs/libgomp/Copying.html
+MinGW-w64 runtime: https://github.com/mingw-w64/mingw-w64/blob/master/COPYING
+dlfcn-win32 (libdl): https://github.com/dlfcn-win32/dlfcn-win32/blob/master/COPYING
+MSVC runtime: redistribute only under the Visual Studio license terms.

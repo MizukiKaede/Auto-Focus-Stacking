@@ -11,15 +11,23 @@ from ..utils.performance import diagnostic, timed
 SURFACE_TONE_VERSION = "material-paired-tone-v17"
 
 
-def _materials(rgb):
-    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+def _materials(rgb, *, hsv=None):
+    if hsv is None:
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     return material_classes(hsv, gray)
 
 
-def _normalised_colour(rgb, mask, sigma):
-    density = cv2.GaussianBlur(mask.astype(np.float32), (0, 0), sigma)
-    field = cv2.GaussianBlur(masked_colour(rgb, mask), (0, 0), sigma)
+def _normalised_colour(rgb, mask, sigma, *, workspace=None):
+    if workspace is None:
+        density = cv2.GaussianBlur(mask.astype(np.float32), (0, 0), sigma)
+        field = cv2.GaussianBlur(masked_colour(rgb, mask), (0, 0), sigma)
+    else:
+        mask_float, masked, density, field = workspace
+        np.copyto(mask_float, mask, casting='unsafe')
+        masked_colour(rgb, mask, out=masked)
+        cv2.GaussianBlur(mask_float, (0, 0), sigma, dst=density)
+        cv2.GaussianBlur(masked, (0, 0), sigma, dst=field)
     normalize_colour(field, density)
     return field, density
 
@@ -53,7 +61,7 @@ class SurfaceToneHarmonizer:
         self.reference_probe = self.drifting_materials = None
 
     @timed("surface_tone_statistics")
-    def observe(self, index, rgb):
+    def observe(self, index, rgb, *, features=None):
         h, w = rgb.shape[:2]
         probe_scale = min(1.0, 256.0 / max(h, w))
         probe_size = (max(1, round(w * probe_scale)), max(1, round(h * probe_scale)))
@@ -70,10 +78,12 @@ class SurfaceToneHarmonizer:
         self.reference_probe = probe_classes.copy()
         self.scale = min(0.5, (self.maximum_pixels / (h * w)) ** 0.5)
         self.size = (max(1, int(w * self.scale)), max(1, int(h * self.scale)))
-        reference = cv2.resize(rgb, self.size, interpolation=cv2.INTER_AREA)
+        reference = (cv2.resize(rgb, self.size, interpolation=cv2.INTER_AREA)
+                     if features is None else features.rgb(self.size))
         self.reference_rgb = reference
-        self.classes = _materials(reference)
-        saturation = cv2.cvtColor(reference, cv2.COLOR_RGB2HSV)[:, :, 1]
+        hsv = cv2.cvtColor(reference, cv2.COLOR_RGB2HSV)
+        self.classes = _materials(reference, hsv=hsv)
+        saturation = hsv[:, :, 1]
         for material in np.unique(self.classes):
             core = _pure_core(self.classes == material, saturation, self.scale, coloured=material <= 12)
             if np.count_nonzero(core) < 64:
@@ -99,22 +109,18 @@ class SurfaceToneHarmonizer:
                    routing="material_before_blend",
                    version=SURFACE_TONE_VERSION)
 
-    @timed("surface_tone_correction")
-    def correct(self, rgb, index=None, *, materials=None):
-        if materials not in {None, "neutral", "colour"}:
-            raise ValueError("surface tone materials must be neutral, colour or None")
-        if self.drifting_materials is None:
-            self._finish_probe()
-        active_materials = [m for m in self.drifting_materials
-                            if materials is None or (m >= 13) == (materials == "neutral")]
-        if not active_materials:
-            return rgb
+    def _offset_fields(self, rgb, index, active_materials):
+        # Compact working arrays leave scope before full-resolution expansion.
         small = cv2.resize(rgb, self.size, interpolation=cv2.INTER_AREA)
-        classes = _materials(small)
-        saturation = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)[:, :, 1]
+        if index == self.reference_index and np.array_equal(small, self.reference_rgb):
+            return None, None
+        hsv = cv2.cvtColor(small, cv2.COLOR_RGB2HSV)
+        classes = _materials(small, hsv=hsv)
+        saturation = hsv[:, :, 1]
         offset = np.zeros((*classes.shape, 3), np.float32)
         confidence = np.zeros(classes.shape, np.uint8)
         residual = None
+        workspace = None
         for material in active_materials:
             mask = classes == material
             if not np.any(mask):
@@ -126,10 +132,34 @@ class SurfaceToneHarmonizer:
             # normalised cores move with defocus and saturation; on a shaded
             # surface their different sampling positions invent a colour shift.
             common = core & self.reference_cores[material]
+            if not np.any(common):
+                continue
             if residual is None:
-                residual = self.reference_rgb.astype(np.float32) - small.astype(np.float32)
-            delta, density = _normalised_colour(residual, common, max(1.0, 32 * self.scale))
+                residual = np.subtract(self.reference_rgb, small, dtype=np.float32)
+                workspace = (np.empty(classes.shape, np.float32), np.empty_like(residual),
+                             np.empty(classes.shape, np.float32), np.empty_like(residual))
+            delta, density = _normalised_colour(
+                residual, common, max(1.0, 32 * self.scale), workspace=workspace)
             update_offset(classes, material, delta, density, offset, confidence)
+        if not np.any(offset):
+            return None, None
+        return offset, confidence
+
+    @timed("surface_tone_correction")
+    def correct(self, rgb, index=None, *, materials=None):
+        if materials not in {None, "neutral", "colour"}:
+            raise ValueError("surface tone materials must be neutral, colour or None")
+        if self.drifting_materials is None:
+            self._finish_probe()
+        active_materials = [m for m in self.drifting_materials
+                            if materials is None or (m >= 13) == (materials == "neutral")]
+        if not active_materials:
+            return rgb
+        offset, confidence = self._offset_fields(rgb, index, active_materials)
+        if offset is None:
+            diagnostic("surface_tone_frame", frame=index, corrected_pixels=0,
+                       materials=materials or "all", version=SURFACE_TONE_VERSION)
+            return rgb
         height, width = rgb.shape[:2]
         field = cv2.resize(offset, (width, height), interpolation=cv2.INTER_LINEAR)
         valid = cv2.resize(confidence, (width, height), interpolation=cv2.INTER_NEAREST) != 0
