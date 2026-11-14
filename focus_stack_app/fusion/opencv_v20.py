@@ -7,7 +7,7 @@ import numpy as np
 
 from .quality_fusion import SurfaceBoundaryOwnership
 
-OPENCV_REPAIR_VERSION = "opencv-valid-source-local-detail-v20-astra"
+OPENCV_REPAIR_VERSION = "opencv-boundary-target-detail-v21-candidate2"
 
 
 class ValidSourceOwnership:
@@ -144,8 +144,12 @@ class OpenCVBoundaryOwnership(SurfaceBoundaryOwnership):
         size = (self.best.shape[1], self.best.shape[0])
         small = (cv2.resize(rgb, size, interpolation=cv2.INTER_AREA)
                  if features is None else features.rgb(size))
+        # INTER_AREA can resize a constant float32 one to 0.99999994.
+        # Resample invalid support instead: exact zero retains real interior
+        # pixels while any photographed-footprint gap still rejects the bin.
         valid_small = (None if valid is None else
-                       cv2.resize(valid.astype(np.float32), size, interpolation=cv2.INTER_AREA) >= 1.0)
+                       cv2.resize((~valid).astype(np.float32), size,
+                                  interpolation=cv2.INTER_AREA) == 0)
         response, evidence = _local_detail_statistics(
             small, valid_small, gray=None if features is None else features.gray(size))
         if valid is None and score is not None:
@@ -172,9 +176,14 @@ class OpenCVBoundaryOwnership(SurfaceBoundaryOwnership):
             self.interior, np.ones((2 * clearance + 1,) * 2, np.uint8)) != 0
         independent_detail = ((self.local_detail_best > 0)
                               & (self.local_detail_owner < 0.7 * self.local_detail_best))
+        # The inherited guard propagates inward too. Protect a coloured
+        # surface's real local detail just as we protect exterior metal.
+        size = (labels.shape[1], labels.shape[0])
+        retain = cv2.resize(np.uint8(independent_detail), size,
+                            interpolation=cv2.INTER_NEAREST) != 0
+        result[retain] = labels[retain]
         exterior = ((self.band != 0) & ~interior & (self.confidence > 0.002)
                     & (self.best > 0) & ~independent_detail)
-        size = (labels.shape[1], labels.shape[0])
         active = cv2.resize(np.uint8(exterior), size, interpolation=cv2.INTER_NEAREST) != 0
         active &= ~self.texture_protection(labels.shape)
         owner = cv2.resize(self.owner, size, interpolation=cv2.INTER_NEAREST)
@@ -184,6 +193,7 @@ class OpenCVBoundaryOwnership(SurfaceBoundaryOwnership):
                    changed_pixels=int(np.count_nonzero(changed)),
                    guarded_pixels=int(np.count_nonzero(active)),
                    independent_detail_veto_pixels=int(np.count_nonzero(independent_detail & ~interior)),
+                   interior_detail_veto_pixels=int(np.count_nonzero(independent_detail & interior)),
                    support_radius=self.support_radius,
                    noise_model="per-frame-luma-bin-median-plus-six-mad",
                    missing_bin_policy="adjacent-observed-flat-support-only",
