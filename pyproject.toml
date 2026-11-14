@@ -27,7 +27,7 @@ focus-stack = "focus_stack_app.app:main"
 include = ["focus_stack_app*"]
 
 [tool.setuptools.package-data]
-"focus_stack_app.ui" = ["icons/*.svg"]
+"focus_stack_app.ui" = ["icons/*.svg", "icons/*.ico"]
 "focus_stack_app.fusion" = ["*.dll", "*.cpp", "*.h", "build_manifest.json", "native_runtime_licenses/*"]
 
 [tool.pytest.ini_options]

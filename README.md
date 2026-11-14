@@ -6,11 +6,11 @@
 
 ## 下载与启动
 
-- [下载 Windows x64 便携包](https://github.com/MizukiKaede/Auto-Focus-Stacking/releases/download/main-win64-2026.11.14.2/AutoStack-main-win64.zip)
-- [本版发布说明、SHA-256 校验值与第三方源码](https://github.com/MizukiKaede/Auto-Focus-Stacking/releases/tag/main-win64-2026.11.14.2)
+- [下载 Windows x64 便携包](https://github.com/MizukiKaede/Auto-Focus-Stacking/releases/download/main-win64-2026.11.14.3/AutoStack-main-win64.zip)
+- [本版发布说明、SHA-256 校验值与第三方源码](https://github.com/MizukiKaede/Auto-Focus-Stacking/releases/tag/main-win64-2026.11.14.3)
 - [所有历史版本](https://github.com/MizukiKaede/Auto-Focus-Stacking/releases)
 
-本版：**2026-11-14 第二次发布**，Windows 10/11 64 位。仓库当前只维护 `main`；旧 dev 预览版仅保留为历史发布。
+本版：**2026-11-14 第三次发布**，Windows 10/11 64 位。仓库当前只维护 `main`；旧 dev 预览版仅保留为历史发布。
 
 完整解压 `AutoStack-main-win64.zip`，双击 `AutoStack-main.exe`。保留旁边的 `_internal` 文件夹，不要在 ZIP 内直接运行。便携包已包含 Python 运行环境、原生 DLL 和 Hugin/Enfuse，无需另行安装这些依赖。
 
@@ -63,6 +63,7 @@
 
 ## 本版更新与验证范围
 
+- EXE、窗口和任务栏统一使用蓝色叠层图标；透明 ICO 包含 16～256 像素共九档尺寸，适配不同显示比例。
 - 更新工作台界面：明暗主题、结果筛选、图片预览与放大、进度及资源状态展示。
 - 采用 C++ 选片覆盖计数、边缘支撑传播和单层 RGB 累加，并优化共享图像特征与融合缓冲的生命周期。
 - 精简分析流程，减少重复计算和清单写入，完善缓存复用与恢复任务的 Hugin 排序补齐。
@@ -70,7 +71,7 @@
 
 源码采用前已有一次默认设置全流程记录：465 张原片、34 组，生成 24 张成品、10 组无需融合、0 错误；24 张成品均完整解码。采用后相关定向检查为 34 项通过。该记录对应默认高质量流程，不能代表三种引擎的完整回归，也不构成所有场景的画质或性能保证。
 
-本次发布另检查便携程序启动、SVG 图标、原生 DLL、内置 Hugin/Enfuse 加载及压缩包完整性；不重复执行整批照片融合。详细范围与局限见：
+本次发布另检查便携程序启动、SVG 图标、EXE 内嵌的九档 ICO、应用与窗口图标、原生 DLL、内置 Hugin/Enfuse 加载及压缩包完整性；不重复执行整批照片融合。详细范围与局限见：
 
 - [外沿清晰度修复采用记录](docs/外沿清晰度修复验收_20261114.md)
 - [C++ 与融合缓冲优化验收](docs/融合缓冲优化验收_20261114.md)
@@ -90,6 +91,8 @@ python main.py
 安装后也可通过 `focus-stack` 启动。主要依赖为 NumPy、OpenCV、Pillow、psutil 和 PySide6；开发依赖包含 pytest。
 
 从源码使用实验模式时，可通过界面选择 Hugin 工具目录，或配置 `HUGIN_BIN`；程序也会查找项目运行时和系统路径中的 `align_image_stack` 与 `enfuse`。
+
+Windows 打包配置为 `packaging/AutoStack-main.spec`，固定输出 `AutoStack-main.exe` 并嵌入 `layers.ico`。修改原 SVG 后可运行 `python tools/generate_app_icon.py` 重新生成九档尺寸。使用 PyInstaller 打包时，通过 `AUTOSTACK_HUGIN_BIN` 指向已准备好 Hugin/Enfuse 及其运行库的目录；默认查找 `.runtime-deps/hugin/bin`。
 
 ### 原生库与测试
 

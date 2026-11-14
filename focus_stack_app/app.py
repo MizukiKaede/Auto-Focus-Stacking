@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from typing import Any, Sequence
 
 from .pipeline.application_controller import ApplicationController, ApplicationOptions
@@ -30,10 +31,12 @@ def create_application(argv: Sequence[str] | None = None) -> tuple[Any, Any]:
     """
 
     try:
+        from PySide6.QtGui import QIcon
         from PySide6.QtWidgets import QApplication
     except ImportError as exc:
         raise RuntimeError("PySide6 is required to run Focus Stack Assistant") from exc
     app = QApplication.instance() or QApplication(list(argv if argv is not None else sys.argv))
+    app.setWindowIcon(QIcon(str(Path(__file__).parent / "ui" / "icons" / "layers.ico")))
     # MainWindow's default factory is intentionally explicit here as well:
     # this documents that a bare launch is a working application, not a
     # coordinator-only demo, and makes the dependency easy to replace in a
