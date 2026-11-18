@@ -533,10 +533,13 @@ class QualityFusionBackend(FusionBackend):
         fusion_reference = selected_reference if selected_reference is not None else 0
         surface_tone = None
         surface_boundary = None
+        neutral_edges = None
         printed_guard = None
         valid_sources = None
         if variant in {"gate", "clean"}:
+            from .neutral_edge_ownership import NeutralEdgeOwnership
             from .opencv_v20 import ValidSourceOwnership
+            neutral_edges = NeutralEdgeOwnership(fusion_reference)
             valid_sources = ValidSourceOwnership()
         if variant in {"gate", "clean"} and _value(self.runtime_config, "quality_printed_edge_guard", False):
             from .quality_fusion import PrintedEdgeOwnership
@@ -629,6 +632,7 @@ class QualityFusionBackend(FusionBackend):
                 valid = None
                 if valid_sources is not None:
                     valid = valid_sources.observe(index, score)
+                    neutral_edges.observe(index, rgb, valid, features)
                 if printed_guard is not None:
                     printed_guard.observe(index, rgb, gray, score, features=features)
                 if surface_tone is not None:
@@ -678,11 +682,12 @@ class QualityFusionBackend(FusionBackend):
                 labels = printed_guard.apply(labels, protected_texture=(
                     surface_boundary.texture_protection(labels.shape) if surface_boundary is not None else None))
             if valid_sources is not None:
+                neutral_edges.apply(labels)
                 labels = valid_sources.apply(labels)
             valid_source_ownership = valid_sources is not None
             # These observers are finished. Release their large maps before
             # the cache's next memory check and the RGB blending allocations.
-            surface_boundary = printed_guard = valid_sources = None
+            surface_boundary = neutral_edges = printed_guard = valid_sources = None
             pass_number = 2
             blend_prefetch = bool(_value(self.runtime_config, "quality_blend_prefetch", True))
 

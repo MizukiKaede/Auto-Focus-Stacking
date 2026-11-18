@@ -6,11 +6,11 @@
 
 ## 下载与启动
 
-- [下载 Windows x64 便携包](https://github.com/MizukiKaede/Auto-Focus-Stacking/releases/download/main-win64-2026.11.14.3/AutoStack-main-win64.zip)
-- [本版发布说明、SHA-256 校验值与第三方源码](https://github.com/MizukiKaede/Auto-Focus-Stacking/releases/tag/main-win64-2026.11.14.3)
+- [下载 Windows x64 便携包](https://github.com/MizukiKaede/Auto-Focus-Stacking/releases/download/main-win64-2026.11.18/AutoStack-main-win64.zip)
+- [本版发布说明与第三方源码](https://github.com/MizukiKaede/Auto-Focus-Stacking/releases/tag/main-win64-2026.11.18)
 - [所有历史版本](https://github.com/MizukiKaede/Auto-Focus-Stacking/releases)
 
-本版：**2026-11-14 第三次发布**，Windows 10/11 64 位。仓库当前只维护 `main`；旧 dev 预览版仅保留为历史发布。
+本版：**2026-11-18**，Windows 10/11 64 位。仓库当前只维护 `main`；旧 dev 预览版仅保留为历史发布。
 
 完整解压 `AutoStack-main-win64.zip`，双击 `AutoStack-main.exe`。保留旁边的 `_internal` 文件夹，不要在 ZIP 内直接运行。便携包已包含 Python 运行环境、原生 DLL 和 Hugin/Enfuse，无需另行安装这些依赖。
 
@@ -62,6 +62,11 @@
 没有一种引擎能保证所有场景都更快或完全消除伪影。建议先处理代表性照片组，检查外沿、反光、细小印字和不同材质交界，再运行大批量任务。
 
 ## 本版更新与验证范围
+
+- 高质量引擎在灰黑色直边附近保持清晰原片的来源连续，减少焦点切换形成的台阶；相邻边线采用同一清晰原片时，短斜角也沿用该原片。
+- 本次通过 41 项定向测试。两批默认设置的实拍流程共处理 505 张原片、75 组，生成 30 张 JPG，45 组无需合成，0 错误。
+
+### 此前版本的更新
 
 - EXE、窗口和任务栏统一使用蓝色叠层图标；透明 ICO 包含 16～256 像素共九档尺寸，适配不同显示比例。
 - 更新工作台界面：明暗主题、结果筛选、图片预览与放大、进度及资源状态展示。
