@@ -128,16 +128,22 @@ def _save_encoded_image(image: Any, destination: Path, cfg: OutputConfig) -> Non
                 "subsampling": getattr(cfg, "jpeg_subsampling", 0),
                 "optimize": bool(getattr(cfg, "optimize", True)),
             }
-            if exif:
-                kwargs["exif"] = exif
         else:
             kwargs = {"format": "TIFF"}
             compression = getattr(cfg, "tiff_compression", "tiff_deflate")
             if compression:
                 kwargs["compression"] = compression
+        if exif and fmt is OutputFormat.JPG:
+            kwargs["exif"] = exif
+        tiff_tags = image.info.get("tiff_capture_tags") if fmt is OutputFormat.TIFF else None
+        if tiff_tags:
+            kwargs["tiffinfo"] = {tag: value for tag, value in tiff_tags.items() if tag != 34665}
         if icc_profile:
             kwargs["icc_profile"] = icc_profile
         image.save(destination, **kwargs)
+        if tiff_tags and 34665 in tiff_tags:
+            from ..utils.exif import append_capture_ifd
+            append_capture_ifd(destination, tiff_tags[34665])
     finally:
         if converted is not None:
             converted.close()

@@ -52,7 +52,9 @@ def test_rgb_controller_input_matches_original_loader(tmp_path):
     controller = ApplicationController(ApplicationOptions(source_dir=tmp_path, output_dir=tmp_path / "out"))
     path = group.items[0].path
     np.testing.assert_array_equal(controller._analysis_loader(group.items[0], 1280), load_rgb(path, 1280))
-    assert isinstance(StackMergeService(tmp_path / "out").backend, QualityFusionBackend)
+    from focus_stack_app.fusion.ai_backend import AiFusionBackend
+    assert isinstance(StackMergeService(tmp_path / "out").backend, AiFusionBackend)
+    assert isinstance(StackMergeService(tmp_path / "out", fusion_backend="quality").backend, QualityFusionBackend)
 
 
 def test_failed_alignment_cannot_satisfy_four_frame_gate(tmp_path, monkeypatch):

@@ -32,7 +32,9 @@ def _call(name, *args):
 
 def _mask(mask, shape):
     array(mask, (np.uint8, np.bool_), shape)
-    return np.ascontiguousarray(mask, dtype=np.uint8)
+    if mask.dtype == np.uint8:
+        return mask
+    return mask.view(np.uint8)
 
 
 def probe_update(classes, rgb, low, high, count):
@@ -189,21 +191,24 @@ def update_offset(classes, material, delta, density, offset, confidence):
             conf[part][use] = 1
 
 
-def apply_colour(rgb, field, valid):
+def apply_colour(rgb, field, valid, *, out=None):
     rgb = np.ascontiguousarray(rgb)
     shape = image(rgb)
     array(field, np.float32, (*shape, 3))
     valid = _mask(valid, shape)
-    result = np.empty_like(rgb)
+    result = np.empty_like(rgb) if out is None else out
+    array(result, np.uint8, rgb.shape, write=True)
+    if np.shares_memory(rgb, result):
+        raise ValueError('apply_colour output must not alias input rgb')
     if _library.available:
         changed = _call('apply_colour', rgb, field, valid, result, valid.size)
     else:
-        source, f, out, v = rgb.reshape(-1, 3), field.reshape(-1, 3), result.reshape(-1, 3), valid.ravel()
+        source, f, out_view, v = rgb.reshape(-1, 3), field.reshape(-1, 3), result.reshape(-1, 3), valid.ravel()
         changed = 0
         for part in chunks(valid.size):
             corrected = np.rint(np.clip(source[part].astype(np.float32)+f[part], 0, 255)).astype(np.uint8)
-            out[part] = np.where(v[part, None] != 0, corrected, source[part])
-            changed += int(np.count_nonzero(np.any(out[part] != source[part], axis=1)))
+            out_view[part] = np.where(v[part, None] != 0, corrected, source[part])
+            changed += int(np.count_nonzero(np.any(out_view[part] != source[part], axis=1)))
     return result, int(changed)
 
 

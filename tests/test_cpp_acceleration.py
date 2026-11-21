@@ -112,7 +112,8 @@ def test_quality_blend_matches_frozen_baseline_and_missing_dll(monkeypatch, pref
     expected = baseline_masks.blend_focus_pyramid(4, frames.__getitem__, labels, prefetch=prefetch)
     before = rgb_native._calls['add']
     actual = focus_masks.blend_focus_pyramid(4, frames.__getitem__, labels, prefetch=prefetch)
-    assert rgb_native._calls['add'] - before == 4
+    # Unused label 3 is skipped by blend_focus_pyramid; only the 3 active labels run.
+    assert rgb_native._calls['add'] - before == int(len(np.unique(labels)))
     np.testing.assert_array_equal(actual, expected, strict=True)
     with monkeypatch.context() as patch:
         patch.setattr(rgb_native._library, 'dll', None)

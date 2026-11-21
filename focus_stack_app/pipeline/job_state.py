@@ -7,6 +7,7 @@ no-op for lightweight repositories used by headless callers.
 
 from __future__ import annotations
 
+from copy import copy
 import logging
 import threading
 from typing import Any, Iterable
@@ -36,7 +37,8 @@ class JobStateStore:
 
     UNFINISHED = frozenset({"PENDING", "RUNNING", "FAILED"})
 
-    def __init__(self, repository: Any | None, *, logger: logging.Logger | None = None) -> None:
+    def __init__(self, repository: Any | None, *, logger: logging.Logger | None = None, source_root: str | None = None) -> None:
+        self.source_root = source_root
         self.repository = repository
         self.logger = logger or logging.getLogger(__name__)
         self._lock = threading.RLock()
@@ -87,6 +89,11 @@ class JobStateStore:
             self._jobs = latest
             return list(latest.values())
 
+    def remember(self, job: JobRecord) -> None:
+        """Publish an already committed job to the in-memory worker map."""
+        with self._lock:
+            self._jobs[int(job.group_id)] = job
+
     def job_for(self, group: Any) -> JobRecord | None:
         gid = _group_id(group)
         if gid is None:
@@ -104,7 +111,7 @@ class JobStateStore:
             current = self._jobs.get(gid)
             if current is not None:
                 return current
-            row = JobRecord(group_id=gid, stage=str(_value(stage)), status="PENDING")
+            row = JobRecord(group_id=gid, source_root=self.source_root, stage=str(_value(stage)), status="PENDING")
             creator = next(
                 (getattr(self.repository, name, None) for name in ("create_job", "add_job", "save_job")
                  if callable(getattr(self.repository, name, None))),
@@ -137,8 +144,10 @@ class JobStateStore:
         status_value = str(_value(status)).upper()
         stage_value = str(_value(stage)).upper()
         with self._lock:
+            row = self._jobs.get(int(row.group_id), row)
             if self._status(row) == "DONE" and status_value != "DONE":
                 return row
+            row = copy(row)
             row.stage = stage_value
             row.status = status_value
             if progress is not None:
@@ -154,6 +163,8 @@ class JobStateStore:
                 updater(row)
             except Exception:
                 self.logger.warning("Unable to update pipeline job %s", getattr(row, "id", None), exc_info=True)
+                return self._jobs.get(int(row.group_id))
+            self._jobs[int(row.group_id)] = row
             return row
 
     def unfinished(self) -> list[JobRecord]:

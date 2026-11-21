@@ -7,7 +7,7 @@ import inspect
 import logging
 from pathlib import Path
 import threading
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 from .events import PipelineEvent, PipelineStage
 from .job_queue import BoundedJobQueue, QueueClosed
@@ -189,6 +189,8 @@ def _invoke(callback: AnalysisCallable, value: Any, *, cancel_event: threading.E
 
 
 def _set_group_state(repository: Any, group: Any, status: str, **values: Any) -> None:
+    if isinstance(group, Mapping) and group.get("_published_output") and status not in {"DONE", "FAILED_ARCHIVE"}:
+        return
     if repository is None:
         return
     gid = _group_id(group)

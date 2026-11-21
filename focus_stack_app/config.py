@@ -144,7 +144,7 @@ class RuntimeConfig:
     hugin_bin: str | None = None
     align_image_stack_path: str | None = None
     enfuse_path: str | None = None
-    fusion_backend: str = "quality"
+    fusion_backend: str = "ai"
     crop_ratio_warning: float = 0.65
     crop_ratio_fail: float = 0.35
     crop_ratio_max: float = 1.75
@@ -176,7 +176,7 @@ class RuntimeConfig:
     hugin_surface_tone: bool = True
     # One process-wide retained-RGB cap shared by both fusion paths.
     # Per-group limits and the existing available-memory reserve still apply.
-    fusion_cache_budget_bytes: int = 3 * 1024**3
+    fusion_cache_budget_bytes: int = 4 * 1024**3
     # Candidate-only switch: disable to restore synchronous Quality blending.
     quality_blend_prefetch: bool = True
     # Hugin's corrected intermediate TIFFs trade disk space for CPU time.
@@ -186,6 +186,19 @@ class RuntimeConfig:
     native_threads: int = 0
     # Shared across Hugin preparation tasks in this process, including ECC teams.
     hugin_parallel_cpu_budget: int = 12
+    # Dynamically scale merge concurrency down when available RAM is tight.
+    auto_merge_workers: bool = True
+    # Low-memory preset mode (1 GiB safety redline, reduced cache and concurrency).
+    low_memory_mode: bool = False
+    # AI fusion (StackMFF-V3 via ONNX Runtime: CUDA priority / DirectML default / CPU fallback).
+    ai_device: str = "auto"
+    ai_model_path: str | None = None
+    ai_scales: str = "1.0,0.5,0.25"
+    ai_sigma: float = 0.5
+    ai_hard_selection: bool = False
+    ai_tile_size: int = 0
+    ai_cpu_proxy_long_edge: int = 1600
+    ai_surface_tone: bool = False
 
     def __post_init__(self) -> None:
         if (type(self.hugin_parallel_cpu_budget) is not int
@@ -236,6 +249,60 @@ class RuntimeConfig:
             raise ValueError("fusion_cache_budget_bytes cannot be negative")
         if self.hugin_tone_tiff_compression not in {"raw", "tiff_deflate"}:
             raise ValueError("hugin_tone_tiff_compression must be raw or tiff_deflate")
+        self.auto_merge_workers = bool(self.auto_merge_workers)
+        self.low_memory_mode = bool(self.low_memory_mode)
+        self.ai_device = str(self.ai_device or "auto").strip().casefold()
+        if self.ai_device not in {"auto", "cuda", "dml", "cpu"}:
+            raise ValueError("ai_device must be auto, cuda, dml or cpu")
+        if self.ai_model_path is not None:
+            cleaned_model = str(self.ai_model_path).strip()
+            self.ai_model_path = cleaned_model or None
+        raw_scales = str(self.ai_scales or "1.0,0.5,0.25").strip()
+        try:
+            parsed_scales = [float(part.strip()) for part in raw_scales.split(",") if part.strip()]
+        except ValueError as exc:
+            raise ValueError("ai_scales must be a comma-separated list of positive numbers") from exc
+        if not parsed_scales or len(set(parsed_scales)) != len(parsed_scales) or any(s <= 0 or s > 2.0 for s in parsed_scales):
+            raise ValueError("ai_scales must contain distinct values in (0, 2.0]")
+        self.ai_scales = ",".join(f"{s:g}" for s in parsed_scales)
+        if float(self.ai_sigma) < 0:
+            raise ValueError("ai_sigma cannot be negative")
+        self.ai_sigma = float(self.ai_sigma)
+        self.ai_hard_selection = bool(self.ai_hard_selection)
+        if int(self.ai_tile_size) < 0 or (int(self.ai_tile_size) > 0 and (int(self.ai_tile_size) < 128 or int(self.ai_tile_size) % 64 != 0)):
+            raise ValueError("ai_tile_size must be 0 (auto) or a multiple of 64 >= 128")
+        self.ai_tile_size = int(self.ai_tile_size)
+        if int(self.ai_cpu_proxy_long_edge) < 0 or (0 < int(self.ai_cpu_proxy_long_edge) < 128):
+            raise ValueError("ai_cpu_proxy_long_edge must be 0 or >= 128")
+        self.ai_cpu_proxy_long_edge = int(self.ai_cpu_proxy_long_edge)
+        self.ai_surface_tone = bool(self.ai_surface_tone)
+
+
+NORMAL_MEMORY_PRESET: dict[str, Any] = {
+    "merge_workers": 3,
+    "auto_merge_workers": True,
+    "parallel": True,
+    "focus_analysis_workers": 0,
+    "fusion_cache_budget_bytes": 4 * 1024**3,
+    "opencv_aligned_cache_bytes": 2 * 1024**3,
+    "min_available_memory_bytes": 2 * 1024**3,
+    "min_available_memory_fraction": 0.10,
+    "selection_frame_cache_bytes": 400 * 1024**2,
+    "aligned_tiff_cache_bytes": 1024**3,
+}
+
+LOW_MEMORY_PRESET: dict[str, Any] = {
+    "merge_workers": 1,
+    "auto_merge_workers": True,
+    "parallel": False,
+    "focus_analysis_workers": 1,
+    "fusion_cache_budget_bytes": 1 * 1024**3,
+    "opencv_aligned_cache_bytes": 512 * 1024**2,
+    "min_available_memory_bytes": 1 * 1024**3,
+    "min_available_memory_fraction": 0.0,
+    "selection_frame_cache_bytes": 128 * 1024**2,
+    "aligned_tiff_cache_bytes": 256 * 1024**2,
+}
 
 
 @dataclass(slots=True)
@@ -379,6 +446,8 @@ __all__ = [
     "ScannerConfig",
     "AppConfig",
     "DEFAULT_CONFIG",
+    "NORMAL_MEMORY_PRESET",
+    "LOW_MEMORY_PRESET",
     "MAX_HUGIN_WORKERS",
     "load_config",
     "save_config",

@@ -14,7 +14,7 @@ from typing import Any, Mapping, Sequence
 from ..utils.image_io import image_fingerprint
 
 
-GROUPING_PLAN_VERSION = "scene-grouping-v1"
+GROUPING_PLAN_VERSION = "scene-grouping-v2"
 SELECTION_PLAN_VERSION = "whole-frame-selection-v1"
 
 

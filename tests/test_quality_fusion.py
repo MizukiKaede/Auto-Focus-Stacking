@@ -26,12 +26,18 @@ def test_neutral_label_islands_are_removed_without_changing_coloured_detail():
 
 
 def test_only_two_modes_route_to_their_backends(tmp_path):
-    assert isinstance(StackMergeService(tmp_path / 'quality', archive_enabled=False).backend,
-                      QualityFusionBackend)
+    from focus_stack_app.fusion.ai_backend import AiFusionBackend
+
+    assert isinstance(StackMergeService(tmp_path / 'default', archive_enabled=False).backend,
+                      AiFusionBackend)
+    assert isinstance(StackMergeService(tmp_path / 'quality', archive_enabled=False,
+                                        fusion_backend='quality').backend, QualityFusionBackend)
     assert isinstance(StackMergeService(tmp_path / 'experimental', archive_enabled=False,
                                         fusion_backend='experimental').backend, HuginEnfuseBackend)
-    assert isinstance(StackMergeService(tmp_path / 'old-fast', archive_enabled=False,
+    assert isinstance(StackMergeService(tmp_path / 'old-opencv', archive_enabled=False,
                                         fusion_backend='opencv').backend, QualityFusionBackend)
+    assert isinstance(StackMergeService(tmp_path / 'old-fast', archive_enabled=False,
+                                        fusion_backend='fast').backend, AiFusionBackend)
 
 
 def test_quality_mode_fuses_full_resolution_edges_without_hugin_tiffs(tmp_path):

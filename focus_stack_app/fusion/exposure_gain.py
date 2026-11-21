@@ -70,8 +70,18 @@ class ExposureGain:
             if gain > 1:
                 for y in range(0, source.shape[0], 128):
                     strip = source[y:y + 128]
-                    values = strip[strip < 255]
-                    maximum_unsaturated = max(maximum_unsaturated, int(values.max()) if values.size else 0)
+                    strip_max = int(strip.max())
+                    if strip_max < 255:
+                        if strip_max > maximum_unsaturated:
+                            maximum_unsaturated = strip_max
+                    else:
+                        values = strip[strip < 255]
+                        if values.size:
+                            candidate = int(values.max())
+                            if candidate > maximum_unsaturated:
+                                maximum_unsaturated = candidate
+                    if maximum_unsaturated == 254:
+                        break
                 if maximum_unsaturated:
                     gain = min(gain, 254.49 / maximum_unsaturated)
             self.gains[index] = gain
@@ -88,6 +98,12 @@ class ExposureGain:
         if gain == 1.0:
             return source
         with stage("brightness_gain_application", frame=index):
+            if source.dtype == np.uint8:
+                table = np.arange(256, dtype=np.float32)
+                table *= gain
+                np.rint(table, out=table)
+                np.clip(table, 0, 255, out=table)
+                return cv2.LUT(source, table.astype(np.uint8))
             corrected = np.empty_like(source)
             for y in range(0, source.shape[0], 128):
                 strip = source[y:y + 128].astype(np.float32)

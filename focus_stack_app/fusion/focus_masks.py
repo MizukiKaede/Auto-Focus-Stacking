@@ -111,7 +111,7 @@ class SurfaceToneMonitor:
 
 
 @timed("focus_response")
-def focus_response(rgb, gray=None, *, support_radius=7):
+def focus_response(rgb, gray=None, *, support_radius=7, gray_f32=None):
     """Compare fine detail on a common scale, including its defocus fringe.
 
     A defocused edge can win just outside the sharp silhouette, where the
@@ -122,11 +122,19 @@ def focus_response(rgb, gray=None, *, support_radius=7):
     Do not normalise each
     frame independently: that would promote a uniformly blurry frame.
     """
-    if gray is None:
-        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    gray = gray.astype(np.float32) / 255.0
-    lap = cv2.Laplacian(cv2.GaussianBlur(gray, (0, 0), 0.6), cv2.CV_32F, ksize=3)
-    response = cv2.GaussianBlur(lap * lap, (0, 0), 4.0)
+    if gray_f32 is None:
+        if gray is None:
+            gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        gray_f32 = np.empty(gray.shape, np.float32)
+        np.divide(gray, np.float32(255.0), out=gray_f32)
+    smooth = cv2.GaussianBlur(gray_f32, (0, 0), 0.6)
+    lap = cv2.Laplacian(smooth, cv2.CV_32F, ksize=3)
+    del smooth
+    np.multiply(lap, lap, out=lap)
+    response = cv2.GaussianBlur(lap, (0, 0), 4.0)
+    del lap
+    if int(support_radius) == 0:
+        return response
     diameter = 2 * int(support_radius) + 1
     return cv2.dilate(response, np.ones((diameter, diameter), np.uint8))
 
@@ -145,21 +153,28 @@ class _StableBackground:
         self.indices = []
 
     @timed("background_statistics")
-    def observe(self, rgb, gray, score, index=None):
+    def observe(self, rgb, gray, score, index=None, *, gray_f32=None):
+        from .statistics_native import chroma_map
         # Bound the adaptive noise estimate: a fully textured photograph must
         # never classify its lowest-scoring fifth as a textureless background.
         noise = float(np.percentile(score[::8, ::8], 20))
         fine_floor = max(1e-5, min(3 * noise, 6e-4))
-        smooth = cv2.GaussianBlur(gray.astype(np.float32) / 255.0, (0, 0), 2.0)
+        if gray_f32 is None:
+            gray_f32 = np.empty(gray.shape, np.float32)
+            np.divide(gray, np.float32(255.0), out=gray_f32)
+        smooth = cv2.GaussianBlur(gray_f32, (0, 0), 2.0)
         lap = cv2.Laplacian(smooth, cv2.CV_32F, ksize=3)
-        coherent = cv2.GaussianBlur(lap * lap, (0, 0), 4.0)
+        del smooth
+        np.multiply(lap, lap, out=lap)
+        coherent = cv2.GaussianBlur(lap, (0, 0), 4.0)
+        del lap
         coarse_noise = float(np.percentile(coherent[::8, ::8], 20))
         coarse_floor = max(2e-6, min(8 * coarse_noise, 1e-5))
         detail = (score > fine_floor) | (coherent > coarse_floor)
-        del smooth, lap, coherent
-        r, g, b = cv2.split(rgb)
-        chroma = cv2.subtract(cv2.max(r, cv2.max(g, b)), cv2.min(r, cv2.min(g, b)))
+        del coherent
+        chroma = chroma_map(rgb)
         detail |= chroma > 40
+        del chroma
         if self.detail is None:
             self.detail = detail.astype(np.uint8)
         else:
@@ -517,16 +532,22 @@ def build_focus_labels(
         if tone_monitor is not None:
             tone_monitor.observe(rgb)
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-        score = focus_response(rgb, gray=gray, support_radius=focus_support_radius)
+        gray_f32 = None
+        if background is not None:
+            gray_f32 = np.empty(gray.shape, np.float32)
+            np.divide(gray, np.float32(255.0), out=gray_f32)
+        score = focus_response(rgb, gray=gray, support_radius=focus_support_radius, gray_f32=gray_f32)
         if print_guard is not None:
+            from .statistics_native import chroma_map
             print_guard.observe(index, rgb, gray, score)
-            frame_coloured = (rgb.max(axis=2) - rgb.min(axis=2) >= 65) & (gray >= 30)
+            frame_coloured = (chroma_map(rgb) >= 65) & (gray >= 30)
         if frame_observer is not None:
             # Observers retain compact statistics, never the input/score maps.
             with stage("texture_statistics", frame=index):
                 frame_observer(index, rgb, gray, score)
         if background is not None:
-            background.observe(rgb, gray, score, index=index)
+            background.observe(rgb, gray, score, index=index, gray_f32=gray_f32)
+            del gray_f32
         if gray_bytes + gray.nbytes <= gray_cache_budget:
             gray_frames[index] = gray
             gray_bytes += gray.nbytes
@@ -707,6 +728,25 @@ def focus_weight(labels, index):
     return cv2.GaussianBlur((labels == index).astype(np.float32), (0, 0), 1.0)
 
 
+def _active_row_span(labels, index, pad=4):
+    """Return (top, bottom, blur_top, blur_bottom) for exact sigma=1.0 GaussianBlur.
+
+    Using blur_pad = 2 * pad guarantees zero BORDER_REFLECT_101 leakage of
+    in-range ones into [top, bottom) when blur_top > 0 / blur_bottom < height.
+    """
+    row_has = np.any(labels == index, axis=1)
+    ys = np.flatnonzero(row_has)
+    if ys.size == 0:
+        return None
+    height = labels.shape[0]
+    y0, y1 = int(ys[0]), int(ys[-1])
+    top = max(0, y0 - pad)
+    bottom = min(height, y1 + pad + 1)
+    blur_top = max(0, y0 - 2 * pad)
+    blur_bottom = min(height, y1 + 2 * pad + 1)
+    return top, bottom, blur_top, blur_bottom
+
+
 @timed("fusion")
 def blend_focus_pyramid(count, load_aligned, labels, *, cancel_event=None, levels=1,
                         prefetch=True):
@@ -724,19 +764,34 @@ def blend_focus_pyramid(count, load_aligned, labels, *, cancel_event=None, level
         raise ValueError("focus blend levels must be at least 1")
     from . import quality_rgb_native
     use_native = levels == 1 and quality_rgb_native.available()
+    if levels == 1:
+        present = np.bincount(labels.ravel(), minlength=count)
+        active_indices = [i for i in range(count) if present[i] > 0]
+        if not active_indices:
+            active_indices = [0]
+    else:
+        active_indices = list(range(count))
     accumulators = []
     if prefetch:
-        frame_iterator = _ordered_prefetched_frames(count, load_aligned, cancel_event)
+        def _prefetched_active():
+            for slot, rgb in _ordered_prefetched_frames(
+                len(active_indices),
+                lambda slot: load_aligned(active_indices[slot]),
+                cancel_event,
+            ):
+                yield active_indices[slot], rgb
+        frame_iterator = _prefetched_active()
     else:
         def synchronous_frames():
-            for index in range(count):
+            for index in active_indices:
                 if cancel_event is not None and cancel_event.is_set():
                     raise RuntimeError("focus fusion cancelled")
                 yield index, load_aligned(index)
 
         frame_iterator = synchronous_frames()
+    single_owner_output = None
     try:
-        for index, rgb in frame_iterator:
+        for order_pos, (index, rgb) in enumerate(frame_iterator):
             # The historical synchronous path checked cancellation before
             # loading each frame. Keep that boundary; prefetched frames also
             # need a check after their background load has completed.
@@ -744,12 +799,36 @@ def blend_focus_pyramid(count, load_aligned, labels, *, cancel_event=None, level
                 raise RuntimeError("focus fusion cancelled")
             if use_native and rgb.dtype != np.uint8:
                 use_native = False
+            if levels == 1 and len(active_indices) == 1 and rgb.dtype == np.uint8:
+                # Every pixel has weight 1.0 from this single owner; uint8 is exact.
+                single_owner_output = rgb.copy()
+                del rgb
+                break
             if use_native:
-                weight = focus_weight(labels, index)
-                if index == 0:
-                    accumulators.append(np.empty(rgb.shape, np.float32))
-                quality_rgb_native.add(rgb, weight, accumulators[0], first=index == 0)
-                del rgb, weight
+                span = _active_row_span(labels, index, pad=4)
+                if span is None:
+                    del rgb
+                    continue
+                top, bottom, blur_top, blur_bottom = span
+                full_span = (top == 0 and bottom == labels.shape[0])
+                weight_blur = cv2.GaussianBlur(
+                    (labels[blur_top:blur_bottom] == index).astype(np.float32), (0, 0), 1.0
+                )
+                weight_slice = np.ascontiguousarray(
+                    weight_blur[top - blur_top : bottom - blur_top]
+                )
+                del weight_blur
+                if not accumulators:
+                    acc = (np.empty(rgb.shape, np.float32) if full_span
+                           else np.zeros(rgb.shape, np.float32))
+                    accumulators.append(acc)
+                    first_write = True
+                else:
+                    first_write = False
+                quality_rgb_native.add(
+                    rgb[top:bottom], weight_slice, accumulators[0][top:bottom], first=first_write
+                )
+                del rgb, weight_slice
                 continue
             pixels = rgb.astype(np.float32)
             del rgb
@@ -762,7 +841,7 @@ def blend_focus_pyramid(count, load_aligned, labels, *, cancel_event=None, level
                 else:
                     detail = pixels
                 contribution = detail * weight[..., None]
-                if index == 0:
+                if order_pos == 0:
                     accumulators.append(contribution)
                 else:
                     accumulators[level] += contribution
@@ -774,6 +853,8 @@ def blend_focus_pyramid(count, load_aligned, labels, *, cancel_event=None, level
         close = getattr(frame_iterator, "close", None)
         if callable(close):
             close()
+    if single_owner_output is not None:
+        return single_owner_output
     result = accumulators.pop()
     if use_native:
         from ..utils.performance import diagnostic

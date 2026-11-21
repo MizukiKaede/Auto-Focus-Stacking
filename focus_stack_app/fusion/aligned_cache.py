@@ -18,7 +18,9 @@ class AlignedTIFFImageCache:
     """Reuse validation decodes in the Enfuse mask pass within a RAM budget."""
 
     def __init__(self, *, max_bytes=DEFAULT_ALIGNED_TIFF_CACHE_BYTES, snapshot_fn=None,
-                 shared_budget: SharedCacheBudget | None = None):
+                 shared_budget: SharedCacheBudget | None = None,
+                 minimum_available_bytes: int = 2 * 1024**3,
+                 minimum_available_fraction: float = 0.10):
         if max_bytes < 0:
             raise ValueError("aligned TIFF cache limit cannot be negative")
         self.snapshot_fn = snapshot_fn or memory_snapshot
@@ -38,7 +40,10 @@ class AlignedTIFFImageCache:
             return
         try:
             snapshot = self.snapshot_fn()
-            self.reserve_bytes = max(2 * 1024**3, int(snapshot.total_bytes * 0.10))
+            self.reserve_bytes = max(
+                max(0, int(minimum_available_bytes)),
+                int(snapshot.total_bytes * max(0.0, float(minimum_available_fraction))),
+            )
             spare = max(0, snapshot.available_bytes - self.reserve_bytes)
             self.max_bytes = min(int(max_bytes), spare // 2)
         except Exception:
@@ -224,7 +229,9 @@ class AlignedFrameCache:
 
     def __init__(self, loader, *, max_bytes=DEFAULT_ALIGNED_CACHE_BYTES,
                  working_bytes=0, snapshot_fn=None,
-                 shared_budget: SharedCacheBudget | None = None):
+                 shared_budget: SharedCacheBudget | None = None,
+                 minimum_available_bytes: int = 2 * 1024**3,
+                 minimum_available_fraction: float = 0.10):
         self.loader = loader
         self.snapshot_fn = snapshot_fn or memory_snapshot
         self.shared_budget = shared_budget
@@ -243,7 +250,10 @@ class AlignedFrameCache:
             return
         try:
             snapshot = self.snapshot_fn()
-            self.reserve_bytes += max(2 * 1024**3, int(snapshot.total_bytes * 0.10))
+            self.reserve_bytes += max(
+                max(0, int(minimum_available_bytes)),
+                int(snapshot.total_bytes * max(0.0, float(minimum_available_fraction))),
+            )
             # Leave half the spare RAM for concurrent work, in addition to
             # reserving the temporary arrays needed by the image operations.
             spare = max(0, snapshot.available_bytes - self.reserve_bytes)
@@ -339,6 +349,13 @@ class AlignedFrameCache:
         self._release_shared(image.nbytes)
         self.hits += 1
         return image
+
+    def discard(self, index):
+        """Drop an unused cached frame and return its reservation to the budget."""
+        image = self.frames.pop(index, None)
+        if image is not None:
+            self.bytes_used -= image.nbytes
+            self._release_shared(image.nbytes)
 
     def _load(self, index, phase):
         self.loader_calls += 1

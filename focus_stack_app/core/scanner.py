@@ -65,10 +65,12 @@ class ImageScanner:
         self.last_report: ScanReport | None = None
 
     def _is_excluded(self, path: Path) -> bool:
+        if not self.excluded_roots:
+            return False
         resolved = path.resolve(strict=False)
         return any(resolved == root or root in resolved.parents for root in self.excluded_roots)
 
-    def _iter_paths(self) -> Iterator[Path]:
+    def _iter_entries(self) -> Iterator[tuple[Path, os.stat_result | None]]:
         if not self.root.exists() or not self.root.is_dir():
             raise ScanError(f"scan root is not a directory: {self.root}")
         if self.config.recursive:
@@ -85,28 +87,47 @@ class ImageScanner:
                 for name in names:
                     path = Path(base) / name
                     if self._accept(path):
-                        yield path
+                        yield path, None
         else:
             try:
-                entries = self.root.iterdir()
+                with os.scandir(self.root) as entries:
+                    for entry in entries:
+                        name = entry.name
+                        if not self.config.include_hidden and name.startswith("."):
+                            continue
+                        _, ext = os.path.splitext(name)
+                        if ext.lower() not in self.config.extensions:
+                            continue
+                        try:
+                            if entry.is_file():
+                                yield Path(entry.path), entry.stat()
+                        except OSError:
+                            yield Path(entry.path), None
             except OSError as exc:
                 raise ScanError(f"unable to enumerate {self.root}: {exc}") from exc
-            for path in entries:
-                if path.is_file() and self._accept(path):
-                    yield path
+
+    def _iter_paths(self) -> Iterator[Path]:
+        for path, _ in self._iter_entries():
+            yield path
 
     def _accept(self, path: Path) -> bool:
         if not self.config.include_hidden and path.name.startswith("."):
             return False
         return path.suffix.lower() in self.config.extensions
 
-    def _read_record(self, path: Path, issues: list[ScanIssue]) -> ImageRecord | None:
-        try:
-            stat = path.stat()
-        except OSError as exc:
-            issues.append(ScanIssue(str(path), f"stat failed: {exc}"))
-            self.logger.warning("Unable to stat image %s: %s", path, exc)
-            return None
+    def _read_record(
+        self,
+        path: Path,
+        issues: list[ScanIssue],
+        stat: os.stat_result | None = None,
+    ) -> ImageRecord | None:
+        if stat is None:
+            try:
+                stat = path.stat()
+            except OSError as exc:
+                issues.append(ScanIssue(str(path), f"stat failed: {exc}"))
+                self.logger.warning("Unable to stat image %s: %s", path, exc)
+                return None
 
         # Each helper reads headers only.  Failure to parse one corrupt image
         # should not discard the rest of a batch.
@@ -151,11 +172,28 @@ class ImageScanner:
     def scan_report(self) -> ScanReport:
         issues: list[ScanIssue] = []
         records: list[ImageRecord] = []
-        for path in self._iter_paths():
-            record = self._read_record(path, issues)
+        for path, stat in self._iter_entries():
+            record = self._read_record(path, issues, stat=stat)
             if record is not None:
                 records.append(record)
-        records.sort(key=self._sort_key)
+        # A destroyed header loses its capture time too. Anchor the unreadable
+        # frame beside its next numbered exposure in the same folder.
+        anchors = {}
+        if any(not r.capture_time and not r.width for r in records):
+            next_record = None
+            for item in sorted(records, key=lambda r: (
+                    Path(r.original_path).parent, natural_sort_key(r.filename or "")), reverse=True):
+                folder = Path(item.original_path).parent
+                if item.width:
+                    next_record = item
+                elif (not item.capture_time and next_record is not None
+                      and folder == Path(next_record.original_path).parent and next_record.capture_time):
+                    anchors[item.original_path] = self._sort_key(next_record)
+        if anchors:
+            records.sort(key=lambda r: (anchors.get(r.original_path) or self._sort_key(r),
+                                        r.original_path not in anchors, natural_sort_key(r.filename or "")))
+        else:
+            records.sort(key=self._sort_key)
         for index, record in enumerate(records):
             record.sequence_index = index
         report = ScanReport(root=os.path.normpath(os.path.abspath(os.fspath(self.root))), images=records, issues=issues)

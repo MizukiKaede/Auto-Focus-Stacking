@@ -8,6 +8,7 @@ import numpy as np
 from .quality_fusion import SurfaceBoundaryOwnership
 
 OPENCV_REPAIR_VERSION = "opencv-boundary-target-detail-v21-candidate2"
+_EYE3 = np.eye(3, dtype=np.float32)
 
 
 class ValidSourceOwnership:
@@ -23,6 +24,7 @@ class ValidSourceOwnership:
         self.geometry = {}
         self.best = self.owner = None
         self.rejected_pixels = 0
+        self._has_uncovered = None
 
     def register(self, index, matrix, source_shape):
         self.geometry[int(index)] = (np.asarray(matrix, np.float32).copy(),
@@ -30,11 +32,38 @@ class ValidSourceOwnership:
 
     def valid_mask(self, index, shape):
         matrix, source_shape = self.geometry[int(index)]
+        h, w = int(shape[0]), int(shape[1])
+        sh, sw = int(source_shape[0]), int(source_shape[1])
+        is_affine = (matrix[2, 0] == 0.0 and matrix[2, 1] == 0.0 and matrix[2, 2] == 1.0)
+        if sh == h and sw == w and np.array_equal(matrix, _EYE3):
+            return np.ones((h, w), bool)
+        if is_affine and sh >= 4 and sw >= 4:
+            # An affine transform preserves convexity: if all four destination
+            # corners map strictly inside [1.5, sw-2.5] x [1.5, sh-2.5], every
+            # pixel has complete 2x2 bilinear support inside the source.
+            try:
+                inv = np.linalg.inv(matrix.astype(np.float64))
+                corners = np.array(
+                    [[0.0, 0.0, 1.0], [w - 1.0, 0.0, 1.0],
+                     [0.0, h - 1.0, 1.0], [w - 1.0, h - 1.0, 1.0]],
+                    dtype=np.float64,
+                )
+                mapped = corners @ inv.T
+                if (np.all(mapped[:, 0] >= 1.5) and np.all(mapped[:, 0] <= sw - 2.5)
+                        and np.all(mapped[:, 1] >= 1.5) and np.all(mapped[:, 1] <= sh - 2.5)):
+                    return np.ones((h, w), bool)
+            except np.linalg.LinAlgError:
+                pass
         # Linear sampling of a constant coverage image rejects partial border
         # support too. An identity reference covers its own complete canvas.
-        coverage = cv2.warpPerspective(
-            np.ones(source_shape, np.float32), matrix, (shape[1], shape[0]),
-            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        if is_affine:
+            coverage = cv2.warpAffine(
+                np.ones(source_shape, np.float32), matrix[:2], (w, h),
+                flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        else:
+            coverage = cv2.warpPerspective(
+                np.ones(source_shape, np.float32), matrix, (w, h),
+                flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
         return coverage >= 1.0
 
     def observe(self, index, score):
@@ -43,6 +72,7 @@ class ValidSourceOwnership:
         if self.best is None:
             self.best = np.full(score.shape, -1.0, np.float32)
             self.owner = np.zeros(score.shape, np.uint16)
+        self._has_uncovered = None
         better = valid & ((score > self.best)
                           | ((score == self.best) & (index < self.owner)))
         self.best[better] = score[better]
@@ -53,12 +83,19 @@ class ValidSourceOwnership:
         score[~valid] = 0
         return valid
 
+    def release_best(self):
+        """Release the full-resolution float32 score map once Pass 1 ends."""
+        if self.best is not None:
+            self._has_uncovered = bool(np.any(self.best < 0))
+            self.best = None
+
     def apply(self, labels):
         from ..utils.performance import diagnostic
 
-        if self.best is None:
+        if self.owner is None:
             return labels
-        if np.any(self.best < 0):
+        has_uncovered = self._has_uncovered if self.best is None else bool(np.any(self.best < 0))
+        if has_uncovered:
             raise ValueError("Quality output has pixels outside every source footprint")
         invalid = np.zeros(labels.shape, bool)
         for index in np.unique(labels):
@@ -83,13 +120,20 @@ def _local_detail_statistics(small, valid=None, *, gray=None):
     """
     if gray is None:
         gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
-    luma = gray.astype(np.float32) / 255.0
+    luma = np.empty(gray.shape, np.float32)
+    np.divide(gray, np.float32(255.0), out=luma)
     smooth = cv2.GaussianBlur(luma, (0, 0), 0.6)
     lap = cv2.Laplacian(smooth, cv2.CV_32F, ksize=3)
-    response = cv2.GaussianBlur(lap * lap, (0, 0), 2.0)
+    np.multiply(lap, lap, out=lap)
+    response = cv2.GaussianBlur(lap, (0, 0), 2.0, dst=smooth)
+    del lap
     low = cv2.GaussianBlur(luma, (0, 0), 2.0)
-    detail = low - cv2.GaussianBlur(low, (0, 0), 2.0)
-    variance = cv2.GaussianBlur(detail * detail, (0, 0), 2.0)
+    detail = cv2.GaussianBlur(low, (0, 0), 2.0)
+    np.subtract(low, detail, out=detail)
+    del low
+    np.multiply(detail, detail, out=detail)
+    variance = cv2.GaussianBlur(detail, (0, 0), 2.0, dst=luma)
+    del detail
     bins = gray[::4, ::4] // 16
     sampled_variance = variance[::4, ::4]
     sampled_response = response[::4, ::4]
@@ -147,15 +191,17 @@ class OpenCVBoundaryOwnership(SurfaceBoundaryOwnership):
         # INTER_AREA can resize a constant float32 one to 0.99999994.
         # Resample invalid support instead: exact zero retains real interior
         # pixels while any photographed-footprint gap still rejects the bin.
-        valid_small = (None if valid is None else
-                       cv2.resize((~valid).astype(np.float32), size,
+        valid_small = (None if valid is None or valid.all() else
+                       cv2.resize(np.subtract(1, valid, dtype=np.float32), size,
                                   interpolation=cv2.INTER_AREA) == 0)
         response, evidence = _local_detail_statistics(
             small, valid_small, gray=None if features is None else features.gray(size))
         if valid is None and score is not None:
             # The private source-footprint observer already zeros invalid
             # focus samples; reflected RGB padding must not supply evidence.
-            evidence &= cv2.resize(score, size, interpolation=cv2.INTER_AREA) > 0
+            small_score = (cv2.resize(score, size, interpolation=cv2.INTER_AREA)
+                           if features is None else features.score(size, score))
+            evidence &= small_score > 0
         detail = np.where(evidence, response, 0)
         if self.local_detail_best is None:
             self.local_detail_best = detail
@@ -171,9 +217,7 @@ class OpenCVBoundaryOwnership(SurfaceBoundaryOwnership):
         result = super().apply(labels)
         if self.best is None:
             return result
-        clearance = max(1, int(np.ceil(8 * self.scale)))
-        interior = cv2.dilate(
-            self.interior, np.ones((2 * clearance + 1,) * 2, np.uint8)) != 0
+        interior = self._dilated_interior()
         independent_detail = ((self.local_detail_best > 0)
                               & (self.local_detail_owner < 0.7 * self.local_detail_best))
         # The inherited guard propagates inward too. Protect a coloured
@@ -186,7 +230,7 @@ class OpenCVBoundaryOwnership(SurfaceBoundaryOwnership):
                     & (self.best > 0) & ~independent_detail)
         active = cv2.resize(np.uint8(exterior), size, interpolation=cv2.INTER_NEAREST) != 0
         active &= ~self.texture_protection(labels.shape)
-        owner = cv2.resize(self.owner, size, interpolation=cv2.INTER_NEAREST)
+        owner = self._upsampled_owner(labels.shape)
         changed = active & (result != owner)
         result[active] = owner[active]
         diagnostic("opencv_exterior_local_detail_ownership", version=OPENCV_REPAIR_VERSION,
@@ -199,4 +243,3 @@ class OpenCVBoundaryOwnership(SurfaceBoundaryOwnership):
                    missing_bin_policy="adjacent-observed-flat-support-only",
                    independent_detail_noise_multiple=2.0)
         return result
-

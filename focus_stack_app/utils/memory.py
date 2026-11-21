@@ -25,6 +25,23 @@ class MemorySnapshot:
         return self.used_bytes / self.total_bytes if self.total_bytes else 0.0
 
 
+if os.name == "nt":
+    class _MemoryStatus(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.c_ulong),
+            ("dwMemoryLoad", ctypes.c_ulong),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+else:
+    _MemoryStatus = None
+
+
 def memory_snapshot() -> MemorySnapshot:
     """Return system memory, using psutil or a Windows API fallback."""
 
@@ -36,20 +53,7 @@ def memory_snapshot() -> MemorySnapshot:
     except ImportError:
         pass
 
-    if os.name == "nt":
-        class _MemoryStatus(ctypes.Structure):
-            _fields_ = [
-                ("dwLength", ctypes.c_ulong),
-                ("dwMemoryLoad", ctypes.c_ulong),
-                ("ullTotalPhys", ctypes.c_ulonglong),
-                ("ullAvailPhys", ctypes.c_ulonglong),
-                ("ullTotalPageFile", ctypes.c_ulonglong),
-                ("ullAvailPageFile", ctypes.c_ulonglong),
-                ("ullTotalVirtual", ctypes.c_ulonglong),
-                ("ullAvailVirtual", ctypes.c_ulonglong),
-                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-            ]
-
+    if os.name == "nt" and _MemoryStatus is not None:
         status = _MemoryStatus()
         status.dwLength = ctypes.sizeof(status)
         if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):

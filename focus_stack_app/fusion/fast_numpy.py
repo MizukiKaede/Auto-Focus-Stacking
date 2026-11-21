@@ -98,6 +98,35 @@ def nearest_support(strength, edge, radius):
     return result
 
 
+def nearest_support_pair(first, second, edge, radius):
+    edge = np.ascontiguousarray(edge != 0)
+    if not np.any(edge):
+        return np.zeros_like(first), np.zeros_like(second)
+    present = edge.astype(np.float32)
+    density = cv2.GaussianBlur(present, (0, 0), 2.0)
+    avg1 = cv2.GaussianBlur(first * present, (0, 0), 2.0)
+    avg2 = cv2.GaussianBlur(second * present, (0, 0), 2.0)
+    distance, nearest = cv2.distanceTransformWithLabels(
+        np.uint8(~edge), cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL)
+    max_label = int(nearest.max()) + 1
+    denom_edge = np.maximum(density[edge], F(1e-6))
+    edge_labels = nearest[edge]
+    v1 = np.zeros(max_label, np.float32)
+    v2 = np.zeros(max_label, np.float32)
+    v1[edge_labels] = avg1[edge] / denom_edge
+    v2[edge_labels] = avg2[edge] / denom_edge
+    r1 = np.empty_like(first)
+    r2 = np.empty_like(second)
+    o1, o2, d, near = r1.ravel(), r2.ravel(), distance.ravel(), nearest.ravel()
+    denominator = max(F(2), F(radius) / F(4))
+    for p in chunks(first.size):
+        weight = np.clip((F(radius) + F(1) - d[p]) / denominator, F(0), F(1))
+        idx = near[p]
+        o1[p] = v1[idx] * weight
+        o2[p] = v2[idx] * weight
+    return r1, r2
+
+
 def neutral_filter(positions, details, local_best, chroma, foreground, material):
     result = np.empty(positions.shape, bool)
     pos, d, out = positions.ravel(), details.ravel(), result.ravel()

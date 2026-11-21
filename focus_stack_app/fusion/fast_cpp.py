@@ -157,6 +157,41 @@ def nearest_support(strength,edge,radius):
     _calls['nearest_support'] += 1
     return out
 
+
+def nearest_support_pair(first, second, edge, radius):
+    """Compute nearest_support for two fields sharing one edge mask & distanceTransform."""
+    first = np.ascontiguousarray(first, dtype=np.float32)
+    second = np.ascontiguousarray(second, dtype=np.float32)
+    edge = np.ascontiguousarray(edge != 0)
+    if not np.isfinite(radius) or radius <= 0:
+        raise ValueError('invalid radius')
+    array(first, np.float32)
+    array(second, np.float32, first.shape)
+    array(edge, np.bool_, first.shape)
+    if not _library.available:
+        _calls['nearest_support'] += 2
+        return fast_numpy.nearest_support_pair(first, second, edge, radius)
+    if not np.any(edge):
+        return np.zeros_like(first), np.zeros_like(second)
+    present = np.empty(first.shape, np.float32)
+    masked1 = np.empty(first.shape, np.float32)
+    masked2 = np.empty(first.shape, np.float32)
+    _inputs(*inputs(first, edge, present, masked1), first.size)
+    np.multiply(second, present, out=masked2)
+    density = cv2.GaussianBlur(present, (0, 0), 2.0)
+    averaged1 = cv2.GaussianBlur(masked1, (0, 0), 2.0)
+    averaged2 = cv2.GaussianBlur(masked2, (0, 0), 2.0)
+    distance, nearest = cv2.distanceTransformWithLabels(
+        np.uint8(~edge), cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL)
+    out1 = np.empty_like(first)
+    out2 = np.empty_like(second)
+    if _support(*inputs(edge, density, averaged1, distance, nearest), float(radius), ptr(out1), out1.size):
+        raise MemoryError('C++ nearest edge support allocation failed')
+    if _support(*inputs(edge, density, averaged2, distance, nearest), float(radius), ptr(out2), out2.size):
+        raise MemoryError('C++ nearest edge support allocation failed')
+    _calls['nearest_support'] += 2
+    return out1, out2
+
 def neutral_filter(positions,details,local_best,chroma,foreground,material):
     use = np.empty(positions.shape,bool)
     _neutral_filter(*inputs(positions,details,local_best,chroma,foreground,material,use),positions.size)
@@ -307,8 +342,10 @@ def _validate(name, values):
         rgb = values['rgb']
         if not isinstance(rgb,np.ndarray) or rgb.dtype != np.uint8:
             raise ValueError('RGB uint8 image required')
-        values['rgb'] = np.ascontiguousarray(rgb)
-        image(values['rgb'])
+        if rgb.ndim != 3 or rgb.shape[2] != 3 or min(rgb.shape[:2]) < 1:
+            raise ValueError('RGB: nonempty HxWx3 image required')
+        if not _library.available or rgb.strides[1:] != (3, 1) or rgb.strides[0] <= 0:
+            values['rgb'] = np.ascontiguousarray(rgb)
         return
     if 'index' in values:
         values['index'] = source_index(values['index'])

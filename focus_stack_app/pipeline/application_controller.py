@@ -31,7 +31,7 @@ from ..utils.concurrency import opencv_thread_budget, resolve_focus_analysis_bud
 from ..files.archiver import ArchiveMode, FileArchiver
 from ..storage.cache import CachePaths, DiskCache
 from ..storage.database import Database
-from ..storage.models import GroupRecord, ImageRecord
+from ..storage.models import GroupRecord, ImageRecord, JobRecord
 from .coordinator import PipelineConfig, PipelineCoordinator, PipelineSummary
 from .events import PipelineEvent, PipelineStage
 from .job_state import JobStateStore
@@ -71,7 +71,7 @@ class ApplicationOptions:
     archive_enabled: bool = False
     minimum_stack_group_size: int = 4
     grouping_pause_seconds: int = 20
-    fusion_backend: str = "quality"
+    fusion_backend: str = "ai"
     output_format: str = "jpg"
     parallel: bool = True
     preserve_cache: bool = False
@@ -86,6 +86,13 @@ class ApplicationOptions:
     # Kept last for positional compatibility. 0 = automatic; 1..10 is a
     # memory-safe upper bound for images analysed concurrently in one group.
     focus_analysis_workers: int = 0
+    # Automatically scale merge_workers down when available RAM is tight.
+    auto_merge_workers: bool = True
+    # Optional explicit byte caps; None uses AppConfig / memory-mode preset.
+    fusion_cache_budget_bytes: int | None = None
+    opencv_aligned_cache_bytes: int | None = None
+    # Low-memory mode lowers the safety redline to 1 GiB and applies conservative defaults.
+    low_memory_mode: bool = False
 
     def __post_init__(self) -> None:
         if self.output_dir is None or (isinstance(self.output_dir, str) and not self.output_dir.strip()):
@@ -111,6 +118,16 @@ class ApplicationOptions:
         self.focus_analysis_workers = int(self.focus_analysis_workers)
         if not 0 <= self.focus_analysis_workers <= 10:
             raise ValueError("focus_analysis_workers must be between 0 and 10")
+        self.auto_merge_workers = bool(self.auto_merge_workers)
+        self.low_memory_mode = bool(self.low_memory_mode)
+        if self.fusion_cache_budget_bytes is not None:
+            self.fusion_cache_budget_bytes = int(self.fusion_cache_budget_bytes)
+            if self.fusion_cache_budget_bytes < 0:
+                raise ValueError("fusion_cache_budget_bytes cannot be negative")
+        if self.opencv_aligned_cache_bytes is not None:
+            self.opencv_aligned_cache_bytes = int(self.opencv_aligned_cache_bytes)
+            if self.opencv_aligned_cache_bytes < 0:
+                raise ValueError("opencv_aligned_cache_bytes cannot be negative")
 
 
 # Names used by early UI prototypes and external scripts.
@@ -561,13 +578,40 @@ class ApplicationController:
             base = config
         # AppConfig.with_overrides is the canonical adapter.  A custom
         # duck-typed config can still be used by tests and advanced callers.
+        from ..config import LOW_MEMORY_PRESET
+
         runtime_values: dict[str, Any] = {
             "parallel_pipeline": bool(options.parallel),
             "preserve_cache": bool(options.preserve_cache),
             "max_hugin_workers": int(options.merge_workers),
             "focus_analysis_workers": int(options.focus_analysis_workers),
             "fusion_backend": options.fusion_backend,
+            "auto_merge_workers": bool(options.auto_merge_workers),
+            "low_memory_mode": bool(options.low_memory_mode),
         }
+        analysis_values: dict[str, Any] = {
+            "minimum_stack_group_size": options.minimum_stack_group_size,
+        }
+        if options.low_memory_mode:
+            runtime_values["min_available_memory_bytes"] = int(LOW_MEMORY_PRESET["min_available_memory_bytes"])
+            runtime_values["min_available_memory_fraction"] = float(LOW_MEMORY_PRESET["min_available_memory_fraction"])
+            runtime_values["aligned_tiff_cache_bytes"] = int(LOW_MEMORY_PRESET["aligned_tiff_cache_bytes"])
+            runtime_values["fusion_cache_budget_bytes"] = (
+                int(options.fusion_cache_budget_bytes)
+                if options.fusion_cache_budget_bytes is not None
+                else int(LOW_MEMORY_PRESET["fusion_cache_budget_bytes"])
+            )
+            runtime_values["opencv_aligned_cache_bytes"] = (
+                int(options.opencv_aligned_cache_bytes)
+                if options.opencv_aligned_cache_bytes is not None
+                else int(LOW_MEMORY_PRESET["opencv_aligned_cache_bytes"])
+            )
+            analysis_values["selection_frame_cache_bytes"] = int(LOW_MEMORY_PRESET["selection_frame_cache_bytes"])
+        else:
+            if options.fusion_cache_budget_bytes is not None:
+                runtime_values["fusion_cache_budget_bytes"] = int(options.fusion_cache_budget_bytes)
+            if options.opencv_aligned_cache_bytes is not None:
+                runtime_values["opencv_aligned_cache_bytes"] = int(options.opencv_aligned_cache_bytes)
         for key, value in (
             ("hugin_bin", options.hugin_bin),
             ("align_image_stack_path", options.align_image_stack_path),
@@ -581,7 +625,7 @@ class ApplicationController:
         if callable(override):
             try:
                 return override(output=output_values, runtime=runtime_values, scanner=scanner_values,
-                                analysis={"minimum_stack_group_size": options.minimum_stack_group_size})
+                                analysis=analysis_values)
             except (TypeError, ValueError, KeyError):
                 pass
         # Preserve custom config objects while making the three explicit UI
@@ -830,22 +874,28 @@ class ApplicationController:
             try:
                 # Supplying the archive root lets legacy image rows resolve a
                 # destination even when their original source was moved away.
-                try:
-                    archive_recovery(destination_root=self.archive_dir)
-                except TypeError:
+                if isinstance(self._database, Database):
+                    archive_recovery(destination_root=self.archive_dir, source_root=source)
+                else:
                     try:
-                        archive_recovery(self.archive_dir)
+                        archive_recovery(destination_root=self.archive_dir)
                     except TypeError:
-                        archive_recovery()
+                        try:
+                            archive_recovery(self.archive_dir)
+                        except TypeError:
+                            archive_recovery()
             except Exception:
                 self.logger.warning("Recovery check recover_archived_images failed", exc_info=True)
         job_recovery = getattr(self._database, "recover_incomplete_jobs", None)
         if callable(job_recovery):
             try:
-                job_recovery()
+                if isinstance(self._database, Database):
+                    job_recovery(source_root=source)
+                else:
+                    job_recovery()
             except Exception:
                 self.logger.warning("Recovery check recover_incomplete_jobs failed", exc_info=True)
-        self._job_state = JobStateStore(self._database, logger=self.logger)
+        self._job_state = JobStateStore(self._database, logger=self.logger, source_root=str(source))
         if self._cache is None:
             analysis_config = getattr(self.config, "analysis", None)
             self._cache = DiskCache(
@@ -944,6 +994,15 @@ class ApplicationController:
         if not images:
             self._diagnostics.append(f"恢复组 {gid} 没有可用 image rows，保留为未完成任务。")
             return None
+        source_root = self.source_dir.resolve()
+        stored_root = _mapping_value(job, "source_root")
+        if stored_root:
+            if Path(stored_root) != source_root:
+                return None
+        elif any(Path(_mapping_value(image, "original_path", default="")).parent != source_root
+                 for image in images):
+            self._diagnostics.append(f"旧任务组 {gid} 的原始目录与本次来源不一致，已保留。")
+            return None
         paths: list[Path | None] = [self._recovery_image_path(self._database, image) for image in images]
         if not any(path is not None for path in paths):
             self._diagnostics.append(f"恢复组 {gid} 的 current/pending/destination 均不存在，保留为未完成任务。")
@@ -997,8 +1056,11 @@ class ApplicationController:
             # skipping a required stack.
             selected_indices = [index for index, path in enumerate(paths) if path is not None]
             selected_paths = [str(paths[index]) for index in selected_indices if paths[index] is not None]
-        needs_merge = len(images) >= self.options.minimum_stack_group_size and len(selected_paths) > 1 and (
-            merge_status or merge_stage or int(_mapping_value(group_record, "selected_count", default=0) or 0) > 1
+        needs_merge = (
+            group_status != "CLASSIFIED" and len(images) >= self.options.minimum_stack_group_size
+            and len(selected_paths) > 1 and (
+                merge_status or merge_stage or int(_mapping_value(group_record, "selected_count", default=0) or 0) > 1
+            )
         )
         first = images[0]
         first_path = paths[0] or Path(_mapping_value(first, "current_path", "original_path", default=""))
@@ -1084,6 +1146,14 @@ class ApplicationController:
             "status": group_status,
             "_recovery": True,
         }
+        saved_output = _mapping_value(group_record, "output_path")
+        if saved_output and Path(saved_output).parent == self.output_dir and Path(saved_output).is_file():
+            group["_published_output"] = str(saved_output)
+            for name in ("actual_backend", "requested_backend", "alignment_level",
+                         "alignment_status", "crop_ratio", "diagnostics"):
+                group[name] = _mapping_value(group_record, name)
+        for metric in ("selection_reason", "quality_score", "coverage_gain"):
+            analysis[metric] = [row[metric] for row in analysis["analysis_records"]]
         return group, analysis
 
     def _load_recovery_groups(self) -> tuple[list[Any], dict[int, Any]]:
@@ -1101,6 +1171,9 @@ class ApplicationController:
         if not callable(get_group):
             return [], {}
         for job in jobs:
+            owner = _mapping_value(job, "source_root")
+            if owner and Path(owner) != self.source_dir:
+                continue
             gid = _mapping_value(job, "group_id")
             if gid is None:
                 continue
@@ -1116,24 +1189,74 @@ class ApplicationController:
                 continue
             group, analysis = built
             groups.append(group)
-            payloads[int(gid)] = analysis
+            # A group transaction may have rolled back before selection finished.
+            # Such a job must run analysis again rather than replay empty rows.
+            if _mapping_value(group_record, "status") not in {
+                "DISCOVERED", "CLASSIFYING", "ANALYZING_FOCUS", "FAILED_CLASSIFICATION",
+            }:
+                payloads[int(gid)] = analysis
         return groups, payloads
 
-    def _disk_check(self, required_bytes: int) -> None:
+    def _disk_check(self, required_bytes: int, destination=None) -> None:
+        destination = destination or self.output_dir
         runtime = getattr(self.config, "runtime", None)
         margin = int(getattr(runtime, "disk_safety_margin_bytes", 0) or 0)
         required = max(0, int(required_bytes)) + max(0, margin)
         try:
-            usage = shutil.disk_usage(self.output_dir)
+            usage = shutil.disk_usage(destination)
         except OSError as exc:
             raise DiskSpaceError(f"unable to inspect destination disk: {exc}") from exc
         if usage.free < required:
-            available_gib = usage.free / 1024**3
-            required_gib = required / 1024**3
+            available_gib = f"{usage.free / 1024**3:.2f}"
+            required_gib = f"{required / 1024**3:.2f}"
+            shortfall = f"，还差 {required - usage.free:,} 字节" if available_gib == required_gib else ""
             raise DiskSpaceError(
-                f"insufficient free space at {self.output_dir}: "
-                f"{available_gib:.2f} GiB available, {required_gib:.2f} GiB required"
+                f"目标卷空间不足（{destination}），预计需要 {required_gib} GiB，"
+                f"当前可用 {available_gib} GiB{shortfall}。"
             )
+
+    def _quality_disk_check(self, groups):
+        """Estimate output and post-success archival writes on their actual volumes."""
+        output_device = self.output_dir.stat().st_dev
+        archive_device = self.archive_dir.stat().st_dev if self.options.archive_enabled else None
+        output_bytes = archive_bytes = 0
+        temporary_sizes = []
+        for group in groups:
+            items = _items_for_group(group)
+            if len(items) < self.options.minimum_stack_group_size or _mapping_value(group, "excluded_reason"):
+                continue
+            sizes = [int(_mapping_value(item, "file_size", default=0) or 0) for item in items]
+            pixels = max(int(_mapping_value(item, "width", default=0) or 0) *
+                         int(_mapping_value(item, "height", default=0) or 0) for item in items)
+            # TIFF may be uncompressed. Quality JPEG can exceed the original
+            # camera JPEG, especially with full-chroma output.
+            if self.options.output_format in {"tif", "tiff"}:
+                encoded = max(3 * pixels, max(sizes)) + 65536
+            else:
+                encoded = max(pixels, 2 * max(sizes)) + 65536
+            if not _mapping_value(group, "_published_output"):
+                output_bytes += encoded
+            if archive_device is None:
+                continue
+            largest_copy = 0
+            for item, size in zip(items, sizes):
+                if self.options.archive_mode == ArchiveMode.HARDLINK:
+                    continue
+                if self.options.archive_mode == ArchiveMode.MOVE:
+                    path = _path_for_item(item)
+                    if path is not None and path.is_file() and path.stat().st_dev == archive_device:
+                        continue
+                archive_bytes += size
+                largest_copy = max(largest_copy, size)
+            temporary_sizes.append(largest_copy)
+        # Encoded .partial is renamed in place and already included above.
+        # Archive copy fallback can briefly hold a second complete copy.
+        archive_bytes += sum(sorted(temporary_sizes, reverse=True)[:self.options.merge_workers])
+        if archive_device == output_device:
+            output_bytes += archive_bytes
+        elif archive_bytes:
+            self._disk_check(archive_bytes, self.archive_dir)
+        self._disk_check(output_bytes, self.output_dir)
 
     @timed("scan")
     def _scan(self) -> tuple[Any, list[ImageRecord]]:
@@ -1229,15 +1352,18 @@ class ApplicationController:
 
         from ..core.types import SceneGroup
 
+        if self._cancel_event.is_set():
+            raise ControllerCancelled()
         message = (
             f"场景预览失败：{type(error).__name__}: {error}；"
-            "已降级为逐张归档组，不会执行合成。"
+            "本段已逐张记录失败原因。"
         )
         self._event_errors += 1
         self._diagnostics.append(message)
         self._emit(PipelineStage.ERROR, errors=self._event_errors, message=message)
         groups = [
-            SceneGroup(index + 1, [record], start_index=index, end_index=index, confidence=0.0)
+            SceneGroup(index + 1, [record], start_index=index, end_index=index, confidence=0.0,
+                       excluded_reason=message)
             for index, record in enumerate(records)
         ]
         self._groups_found = len(groups)
@@ -1306,7 +1432,8 @@ class ApplicationController:
         self.logger.info(
             "grouping plan cache status=miss key=%s groups=%s", plan_key, len(groups),
         )
-        if plan_cache_enabled and plan_key is not None and not self._cancel_event.is_set():
+        if (plan_cache_enabled and plan_key is not None and not self._cancel_event.is_set()
+                and not any(_mapping_value(g, "excluded_reason") for g in groups)):
             try:
                 positions = {id(record): index for index, record in enumerate(records)}
                 payload = {
@@ -1373,9 +1500,20 @@ class ApplicationController:
         if detector is None:
             from ..core.group_detector import StackGroupDetector, StackGroupDetectorConfig
             # Calibrated grouping uses original RGB thumbnails, not recompressed cache previews.
-            detector = StackGroupDetector(StackGroupDetectorConfig(
-                pause_seconds=self.options.grouping_pause_seconds,
-            ))
+            workers = 1
+            if self.options.fusion_backend in {"quality", "ai"}:
+                runtime = getattr(self.config, "runtime", None)
+                budget = resolve_focus_analysis_budget(
+                    self.options.focus_analysis_workers, image_count=len(records),
+                    merge_workers=self.options.merge_workers, parallel_pipeline=self.options.parallel,
+                    minimum_available_bytes=getattr(runtime, "min_available_memory_bytes", 2 * 1024**3),
+                    minimum_available_fraction=getattr(runtime, "min_available_memory_fraction", 0.10),
+                )
+                workers = min(4, os.cpu_count() or 1) if budget.workers >= 2 else budget.workers
+            detector = StackGroupDetector(
+                StackGroupDetectorConfig(pause_seconds=self.options.grouping_pause_seconds),
+                workers=workers, cancel_event=self._cancel_event,
+            )
             self._scene_detector = detector
         iterator = getattr(detector, "iter_groups", None)
         groups: list[Any] = []
@@ -1450,13 +1588,14 @@ class ApplicationController:
             return
         by_path: dict[str, ImageRecord] = {}
         for record in records:
-            for value in (record.original_path, record.current_path, str(record.path)):
+            for value in {record.original_path, record.current_path, str(record.path)}:
                 if value:
                     by_path[str(Path(value).resolve(strict=False)).casefold()] = record
         insert = getattr(self._database, "insert_group", None)
         set_image_group = getattr(self._database, "set_image_group", None)
         if not callable(insert):
             raise ControllerError("database must expose insert_group")
+        source_root = str(self.source_dir.resolve())
         for index, group in enumerate(groups):
             values = _items_for_group(group)
             canonical: list[Any] = []
@@ -1477,20 +1616,26 @@ class ApplicationController:
                 confidence=_mapping_value(group, "confidence", default=None),
                 status="DISCOVERED",
             )
-            group_id = int(insert(group_record))
+            if isinstance(self._database, Database):
+                with self._database.transaction():
+                    group_id = int(insert(group_record))
+                    for image_id in image_ids:
+                        set_image_group(image_id, group_id)
+                    job = JobRecord(group_id=group_id, source_root=source_root)
+                    self._database.create_job(job)
+                if self._job_state is not None:
+                    self._job_state.remember(job)
+            else:
+                group_id = int(insert(group_record))
+                if callable(set_image_group):
+                    for image_id in image_ids:
+                        set_image_group(image_id, group_id)
             _set_group_id(group, group_id)
-            if self._job_state is not None:
+            if self._job_state is not None and not isinstance(self._database, Database):
                 self._job_state.ensure(group, stage="CLASSIFICATION")
             for item in canonical:
-                image_id = getattr(item, "id", None)
-                if image_id is None:
-                    continue
-                try:
+                if isinstance(item, ImageRecord):
                     item.group_id = group_id
-                except Exception:
-                    pass
-                if callable(set_image_group):
-                    set_image_group(int(image_id), group_id)
 
     def _encode_preview(self, image: Any) -> bytes:
         try:
@@ -1613,7 +1758,7 @@ class ApplicationController:
         )
         return self._merge_service
 
-    def _build_coordinator(self, analyzer: Any, merger: Any) -> Any:
+    def _build_coordinator(self, analyzer: Any, merger: Any, *, resume=False) -> Any:
         if self._coordinator is not None:
             coordinator = self._coordinator
             try:
@@ -1634,10 +1779,25 @@ class ApplicationController:
                 pass
             return coordinator
         manifest_path = self.output_dir / "stack_manifest.csv"
+        writer = None
+        if isinstance(self._database, Database):
+            from ..storage.manifest import ManifestWriter
+            writer = ManifestWriter(manifest_path, journal=self._database, source_root=self.source_dir,
+                                    flush_interval_seconds=2.0)
+            writer.recover(resume=resume)
+        from ..utils.fusion_budget import (
+            DEFAULT_AUTO_MERGE_WORKER_BYTES,
+            LOW_MEMORY_AUTO_MERGE_WORKER_BYTES,
+        )
         runtime = getattr(self.config, "runtime", None)
         measured_peak = (int(getattr(runtime, "quality_worker_peak_60mp_bytes", 0))
                          if self.options.fusion_backend == "quality"
                          and getattr(runtime, "quality_execution", "cached") == "streaming" else 0)
+        auto_worker_bytes = (
+            LOW_MEMORY_AUTO_MERGE_WORKER_BYTES
+            if self.options.low_memory_mode
+            else DEFAULT_AUTO_MERGE_WORKER_BYTES
+        )
         return PipelineCoordinator(
             analyzer=analyzer,
             merger=merger,
@@ -1645,10 +1805,13 @@ class ApplicationController:
                 queue_size=self.options.queue_size,
                 merge_workers=self.options.merge_workers,
                 parallel=self.options.parallel,
+                auto_merge_workers=bool(self.options.auto_merge_workers),
+                auto_merge_worker_bytes=auto_worker_bytes,
             ),
             repository=self._database,
             event_callback=self._on_pipeline_event,
             manifest_path=manifest_path,
+            manifest_writer=writer,
             memory_guard=self._memory_guard,
             job_state=self._job_state,
             logger=self.logger,
@@ -1714,14 +1877,18 @@ class ApplicationController:
                     for issue in scan_issues
                 )
             total_bytes = int(getattr(report, "total_bytes", 0) or sum(int(item.file_size) for item in records))
-            self._disk_check(total_bytes)
+            if self.options.fusion_backend not in {"quality", "ai"}:
+                self._disk_check(total_bytes)
             if not recovery_groups:
                 self._persist_images(records)
                 if self._cancel_event.is_set():
                     raise ControllerCancelled()
                 groups = self._scene_groups(records)
-                self._persist_groups(groups, records)
                 self._groups_found = len(groups)
+            if self.options.fusion_backend in {"quality", "ai"}:
+                self._quality_disk_check(groups)
+            if not recovery_groups:
+                self._persist_groups(groups, records)
             if self._cancel_event.is_set():
                 raise ControllerCancelled()
             runtime = getattr(self.config, "runtime", None)
@@ -1765,9 +1932,10 @@ class ApplicationController:
                 if recovery_payloads:
                     analyzer = _RecoveryAnalyzerAdapter(analyzer, recovery_payloads)
                 merger = self._build_merger()
-                coordinator = self._build_coordinator(analyzer, merger)
+                coordinator = self._build_coordinator(analyzer, merger, resume=bool(recovery_groups))
                 self._coordinator = coordinator
                 pipeline_summary = coordinator.run(groups)
+            self._diagnostics.extend(getattr(pipeline_summary, "diagnostics", ()))
             for failed_group, error in list(getattr(pipeline_summary, "failed_merge", ()) or ()):
                 group_label = _group_id(getattr(failed_group, "group", failed_group))
                 detail = f"融合失败（组 {group_label!r}）：{type(error).__name__}: {error}"

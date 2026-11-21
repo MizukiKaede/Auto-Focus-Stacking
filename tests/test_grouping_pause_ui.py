@@ -81,7 +81,8 @@ def test_experimental_picker_uses_hugin_backend(tmp_path):
     try:
         window.source_edit.setText(str(tmp_path))
         window.output_edit.setText(str(tmp_path / 'out'))
-        assert window.backend_combo.currentData() == 'quality'
+        assert window.backend_combo.currentData() == 'ai'
+        assert window.backend_combo.findData('fast') == -1
         index = window.backend_combo.findData('hugin_enfuse')
         assert index >= 0
         assert '实验模式' in window.backend_combo.itemText(index)

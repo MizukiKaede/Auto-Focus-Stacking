@@ -11,6 +11,7 @@ from __future__ import annotations
 from ..utils.performance import timed
 from ..utils.concurrency import resolve_focus_analysis_budget
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 import hashlib
 import io
@@ -23,6 +24,7 @@ from pathlib import Path
 import threading
 from typing import Any, Callable, Mapping, Sequence
 
+from ..storage.database import Database
 from .coverage_selector import CoverageConfig, select_focus_images
 from .focus_cluster import FocusClusterConfig, deduplicate_focus_maps
 from .focus_map import FocusMapConfig, compute_focus_map
@@ -723,6 +725,9 @@ class GroupAnalyzer:
         if repository is None or gid is None:
             return
         setter = getattr(repository, "set_group_status", None)
+        if isinstance(repository, Database):
+            setter(int(gid), status, **values)
+            return
         if callable(setter):
             try:
                 setter(int(gid), status, **values)
@@ -758,7 +763,9 @@ class GroupAnalyzer:
         selected = bool(result.get("selected", False))
         status = "SELECTED" if selected else "REJECTED"
         set_group = getattr(repository, "set_image_group", None)
-        if callable(set_group) and gid is not None:
+        if isinstance(repository, Database) and gid is not None:
+            set_group(int(image_id), int(gid), status=status)
+        elif callable(set_group) and gid is not None:
             try:
                 set_group(int(image_id), int(gid), status=status)
             except Exception:
@@ -784,7 +791,9 @@ class GroupAnalyzer:
             record = dict(result)
             record["image_id"] = image_id
         saver = getattr(repository, "upsert_analysis", getattr(repository, "save_analysis", None))
-        if callable(saver):
+        if isinstance(repository, Database):
+            saver(record)
+        elif callable(saver):
             try:
                 saver(record)
             except Exception:
@@ -1043,7 +1052,6 @@ class GroupAnalyzer:
                 "error": plan["errors"].get(index),
             }
             per_image.append(row)
-            self._persist_image(group, item, row)
 
         first_item = items[0]
         first_original = _item_value(first_item, "original_path", default=paths[0])
@@ -1101,17 +1109,20 @@ class GroupAnalyzer:
             "quality_scan_seconds": float(plan.get("quality_scan_seconds", 0.0)),
             "registration_seconds": float(plan.get("registration_seconds", 0.0)),
         }
-        self._persist_status(
-            group, "CANCELLED" if cancelled else ("SELECTED" if result["needs_merge"] else "CLASSIFIED"),
-            confidence=result["confidence"], coverage=result["coverage"],
-            selected_count=len(selected_indices), image_count=len(items),
-            preview_reference=preview_reference, alignment_order=alignment_order,
-            alignment_order_confidence=result["alignment_order_confidence"],
-            alignment_order_fallback_used=result["alignment_order_fallback_used"],
-            pairwise_analysis_summary=result["pairwise_analysis_summary"],
-            start_index=_group_value(group, "start_index", default=0),
-            end_index=_group_value(group, "end_index", default=max(0, len(items) - 1)),
-        )
+        with self.database.transaction() if isinstance(self.database, Database) else nullcontext():
+            for item, row in zip(items, per_image):
+                self._persist_image(group, item, row)
+            self._persist_status(
+                group, "CANCELLED" if cancelled else ("SELECTED" if result["needs_merge"] else "CLASSIFIED"),
+                confidence=result["confidence"], coverage=result["coverage"],
+                selected_count=len(selected_indices), image_count=len(items),
+                preview_reference=preview_reference, alignment_order=alignment_order,
+                alignment_order_confidence=result["alignment_order_confidence"],
+                alignment_order_fallback_used=result["alignment_order_fallback_used"],
+                pairwise_analysis_summary=result["pairwise_analysis_summary"],
+                start_index=_group_value(group, "start_index", default=0),
+                end_index=_group_value(group, "end_index", default=max(0, len(items) - 1)),
+            )
         return result
 
     @staticmethod
@@ -1293,8 +1304,6 @@ class GroupAnalyzer:
             }
             for index, item in enumerate(items)
         ]
-        for item, row in zip(items, per_image):
-            self._persist_image(group, item, row)
 
         first_item = items[0]
         first_path = paths[0]
@@ -1357,16 +1366,19 @@ class GroupAnalyzer:
             "focus analysis skipped group_id=%s image_count=%s status=%s reason=%s",
             gid, total, merge_status, reason,
         )
-        self._persist_status(
-            group,
-            "CLASSIFIED",
-            confidence=confidence,
-            coverage=0.0,
-            selected_count=0,
-            image_count=total,
-            start_index=_group_value(group, "start_index", default=0),
-            end_index=_group_value(group, "end_index", default=max(0, total - 1)),
-        )
+        with self.database.transaction() if isinstance(self.database, Database) else nullcontext():
+            for item, row in zip(items, per_image):
+                self._persist_image(group, item, row)
+            self._persist_status(
+                group,
+                "CLASSIFIED",
+                confidence=confidence,
+                coverage=0.0,
+                selected_count=0,
+                image_count=total,
+                start_index=_group_value(group, "start_index", default=0),
+                end_index=_group_value(group, "end_index", default=max(0, total - 1)),
+            )
         return result
 
     @timed("selection_inclusive")
@@ -1382,6 +1394,9 @@ class GroupAnalyzer:
         gid = _group_id(group)
         if not items:
             raise ValueError(f"group {gid!r} contains no images")
+        reason = _group_value(group, "excluded_reason", default=None)
+        if reason and str(reason).startswith("预览读取失败"):
+            raise ValueError(reason)
         total = len(items)
         minimum_group_size = self._minimum_stack_group_size()
         if total < minimum_group_size:

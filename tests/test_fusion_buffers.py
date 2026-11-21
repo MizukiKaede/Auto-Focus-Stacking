@@ -58,6 +58,34 @@ def test_normalised_colour_workspace_retains_exact_fields_across_materials():
         np.testing.assert_array_equal(reused_density, density, strict=True)
 
 
+@pytest.mark.parametrize('top', [0, 254, 674])
+def test_striped_tone_preserves_gaussian_support_at_real_and_cropped_edges(monkeypatch, top):
+    import focus_stack_app.fusion.surface_tone as tone
+
+    rng = np.random.default_rng(48)
+    reference = np.full((733, 443, 3), (172, 173, 174), np.uint8)
+    reference[top:top + 59] = (164, 54, 48)
+    reference += rng.integers(0, 8, reference.shape, np.uint8)
+    shifted = reference - rng.integers(4, 16, reference.shape, np.uint8)
+    model = SurfaceToneHarmonizer(0, maximum_pixels=65_000)
+    model.observe(0, reference)
+    model.observe(1, shifted)
+    expected = model.correct(shifted, index=1)
+    assert np.count_nonzero(expected[top:top + 59] != shifted[top:top + 59])
+
+    processed_rows = []
+    normalise = tone._normalised_colour
+
+    def record_rows(rgb, mask, sigma, *, workspace):
+        processed_rows.append(rgb.shape[0])
+        return normalise(rgb, mask, sigma, workspace=workspace)
+
+    monkeypatch.setattr(tone, '_normalised_colour', record_rows)
+    result = model.correct(shifted, index=1, strip_rows=256)
+    np.testing.assert_array_equal(result, expected, strict=True)
+    assert 0 < min(processed_rows) < model.size[1]
+
+
 def test_reference_shortcut_checks_pixels_and_finishes_drift_probe(monkeypatch):
     reference = np.full((128, 192, 3), (180, 60, 60), np.uint8)
     shifted = np.full_like(reference, (169, 49, 49))

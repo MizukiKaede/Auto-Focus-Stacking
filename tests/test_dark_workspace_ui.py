@@ -29,7 +29,7 @@ class FakeController:
 
 
 @pytest.fixture
-def workspace(monkeypatch):
+def workspace(monkeypatch, tmp_path):
     app = QApplication.instance() or QApplication([])
     monkeypatch.setattr(QMessageBox, "warning", lambda *args: None)
     monkeypatch.setattr(QMessageBox, "critical", lambda *args: None)
@@ -40,10 +40,15 @@ def workspace(monkeypatch):
         return FakeController()
 
     window = MainWindow(controller_factory=factory)
-    window.source_edit.setText("C:/photos")
-    window.output_edit.setText("C:/photos/合成")
+    window.source_edit.setText(str(tmp_path))
+    window.output_edit.setText(str(tmp_path / "合成"))
     window.show()
-    app.processEvents()
+    from PySide6.QtTest import QTest
+    for _ in range(200):
+        if window.start_button.isEnabled():
+            break
+        QTest.qWait(10)
+    assert window.start_button.isEnabled()
     yield app, window, received
     window.close()
     app.processEvents()
@@ -134,3 +139,114 @@ def test_start_failure_keeps_settings_available(workspace):
     assert window.settings_content.isEnabled()
     assert window.start_button.isEnabled()
     assert not window.stop_button.isEnabled()
+
+
+def test_bulk_results_filter_once_and_preserve_selection(workspace, monkeypatch):
+    _, window, _ = workspace
+    view = window.group_list
+    calls = []
+    original = view.table.setRowHidden
+
+    def track(row, hidden):
+        calls.append(row)
+        original(row, hidden)
+
+    monkeypatch.setattr(view.table, "setRowHidden", track)
+    view.update_results({"group_id": i, "status": "DONE"} for i in range(500))
+    assert calls == list(range(500))
+    view.search_box.setText("#499")
+    assert view.table.currentRow() == 499
+    assert not view.table.isRowHidden(499)
+
+
+def test_run_and_stopping_reject_directory_drop(workspace, tmp_path):
+    from PySide6.QtCore import QMimeData, QUrl
+    from types import SimpleNamespace
+
+    _, window, _ = workspace
+    other = tmp_path / "B"
+    other.mkdir()
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(str(other))])
+    decisions = []
+    event = SimpleNamespace(mimeData=lambda: mime, ignore=lambda: decisions.append(False),
+                            acceptProposedAction=lambda: decisions.append(True))
+    destination = window.output_directory
+    window.start_processing()
+    window.dropEvent(event)
+    window.stop_processing()
+    window.dropEvent(event)
+    assert decisions == [False, False]
+    assert window.source_directory == tmp_path
+    window._on_complete(PipelineSummary(cancelled=True))
+    window.dropEvent(event)
+    assert decisions[-1] and window.source_directory == other
+    assert window.group_list._output_dir == destination
+
+
+def test_async_preview_and_compact_actions(workspace, tmp_path):
+    from PIL import Image
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    app, window, _ = workspace
+    view = window.group_list
+    paths = [tmp_path / "red.jpg", tmp_path / "blue.jpg"]
+    for path, color in zip(paths, ("red", "blue")):
+        Image.new("RGB", (1600, 1200), color).save(path)
+    view.update_results([dict(group_id=i, output_path=str(p), status="DONE")
+                         for i, p in enumerate(paths)])
+    view.table.selectRow(1)
+    for _ in range(250):
+        if view._current_pixmap is not None:
+            break
+        QTest.qWait(10)
+    assert view._current_pixmap.toImage().pixelColor(0, 0).blue() > 240
+    assert view._current_pixmap.height() < 1200
+    assert "1600 × 1200" in view.preview_meta.text()
+    for _ in range(2):
+        for width, height in [(1180, 780), (960, 640)]:
+            window.resize(width, height)
+            app.processEvents()
+            assert view.more_btn.isVisible() == (width == 960)
+            if width == 960:
+                assert not view.zoom_btn.visibleRegion().isEmpty()
+                assert not view.more_btn.visibleRegion().isEmpty()
+                assert [a.text() for a in view.more_btn.menu().actions()] == ["系统打开", "定位文件"]
+                assert view.more_btn.focusPolicy() & Qt.TabFocus
+            assert view.zoom_btn.isVisible()
+        window.theme_toggle_btn.click()
+
+
+def test_obsolete_folder_statistics_cannot_enable_or_replace_current_folder(workspace, tmp_path, monkeypatch):
+    import threading
+    from PySide6.QtTest import QTest
+    from focus_stack_app.ui import main_window
+
+    _, window, _ = workspace
+    older, newest = tmp_path/"older", tmp_path/"newest"
+    older.mkdir()
+    newest.mkdir()
+    entered, release = threading.Event(), threading.Event()
+    def scan(path, *args, cancelled):
+        if path == older:
+            entered.set()
+            release.wait(timeout=5)
+        return path.name, False, 1
+    monkeypatch.setattr(main_window, "_folder_summary", scan)
+    window.source_edit.setText(str(older))
+    for _ in range(100):
+        if entered.is_set():
+            break
+        QTest.qWait(10)
+    assert entered.is_set()
+    window.source_edit.setText(str(newest))
+    assert not window.start_button.isEnabled()
+    release.set()
+    for _ in range(100):
+        if window.start_button.isEnabled():
+            break
+        QTest.qWait(10)
+    assert window.folder_stats_label.text() == "newest"
+    window.source_edit.clear()
+    assert window.group_list.empty_browse_btn.isDefault() and not window.start_button.isEnabled()

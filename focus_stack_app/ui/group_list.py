@@ -114,8 +114,8 @@ def _extract_selected_names(result: Any, analysis: Any) -> list[str]:
 
 def _backend_label(backend: str | None) -> str:
     mapping = {
+        "ai": "AI (StackMFF-V3)",
         "quality": "高质量引擎",
-        "fast": "Fast C++",
         "hugin_enfuse": "Hugin / Enfuse",
         "hugin": "Hugin / Enfuse",
     }
@@ -124,8 +124,8 @@ def _backend_label(backend: str | None) -> str:
 
 
 try:
-    from PySide6.QtCore import Qt, QUrl, Signal
-    from PySide6.QtGui import QAction, QColor, QDesktopServices, QPixmap
+    from PySide6.QtCore import QEvent, QSignalBlocker, QSize, Qt, QUrl, Signal
+    from PySide6.QtGui import QAction, QColor, QDesktopServices, QImageReader, QPixmap
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QFrame,
@@ -133,6 +133,7 @@ try:
         QHeaderView,
         QLabel,
         QLineEdit,
+        QMenu,
         QProgressBar,
         QPushButton,
         QScrollArea,
@@ -144,6 +145,21 @@ try:
         QVBoxLayout,
         QWidget,
     )
+    from .background import LatestRead
+
+    def _read_thumbnail(path, target, *, cancelled):
+        if cancelled.is_set():
+            return None
+        reader = QImageReader(path)
+        reader.setAutoTransform(True)
+        original = reader.size()
+        if original.isValid():
+            reader.setScaledSize(original.scaled(target, Qt.KeepAspectRatio).boundedTo(original))
+        image = reader.read()
+        if image.isNull():
+            raise ValueError(reader.errorString())
+        return image, original, Path(path).stat().st_size
+
     from .image_viewer import ImageLightboxDialog
     from .theme import ThemeTokens, get_theme_tokens, themed_icon, themed_pixmap
 
@@ -159,6 +175,8 @@ try:
             self._all_results: list[Any] = []
             self._result_images: list[list[str]] = []
             self._result_ranges: list[str] = []
+            self._thumbnail = LatestRead(self)
+            self._thumbnail.ready.connect(self._show_thumbnail)
             self._filter_status = "all"
             self._current_output_path = ""
             self._current_pixmap: QPixmap | None = None
@@ -282,7 +300,7 @@ try:
             insp_body = QWidget()
             insp_body.setObjectName("inspectorScrollContent")
             inspector_layout = QVBoxLayout(insp_body)
-            inspector_layout.setContentsMargins(14, 12, 14, 14)
+            inspector_layout.setContentsMargins(12, 12, 12, 14)
             inspector_layout.setSpacing(8)
             insp_scroll.setWidget(insp_body)
             inspector_outer.addWidget(insp_scroll)
@@ -325,6 +343,9 @@ try:
 
             self.preview_meta = QLabel("")
             self.preview_meta.setAlignment(Qt.AlignCenter)
+            self.preview_meta.setWordWrap(True)
+            self.preview_meta.setMinimumWidth(0)
+            self.preview_meta.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             self.preview_meta.setProperty("role", "hint")
             self.preview_meta.hide()
             stage_layout.addWidget(self.preview_meta)
@@ -334,7 +355,7 @@ try:
             self._action_row_widget = QWidget()
             action_row = QHBoxLayout(self._action_row_widget)
             action_row.setContentsMargins(0, 0, 0, 0)
-            action_row.setSpacing(6)
+            action_row.setSpacing(4)
             self.zoom_btn = QPushButton("放大校对")
             self.zoom_btn.setEnabled(False)
             self.zoom_btn.setToolTip("在内置大图看图器中 1:1 检查细节清晰度")
@@ -353,6 +374,16 @@ try:
             action_row.addWidget(self.zoom_btn, 1)
             action_row.addWidget(self.open_file_btn)
             action_row.addWidget(self.reveal_file_btn)
+            self.more_btn = QPushButton("更多")
+            menu = QMenu(self.more_btn)
+            menu.addAction("系统打开", self._open_current_image)
+            menu.addAction("定位文件", self._reveal_current_image)
+            self.more_btn.setMenu(menu)
+            action_row.addWidget(self.more_btn)
+            self.more_btn.hide()
+            self._inspector_viewport = insp_scroll.viewport()
+            self._inspector_viewport.installEventFilter(self)
+            self.table.viewport().installEventFilter(self)
             inspector_layout.addWidget(self._action_row_widget)
 
             # Error / Exclusion / Diagnostics Box (placed right below actions for visibility)
@@ -460,6 +491,8 @@ try:
             card_layout.addWidget(self.empty_hint)
 
             self.empty_browse_btn = QPushButton("选择照片文件夹…")
+            self.empty_browse_btn.setObjectName("browsePhotosButton")
+            self.empty_browse_btn.setDefault(True)
             self.empty_browse_btn.setFixedWidth(180)
             self.empty_browse_btn.clicked.connect(self.browse_requested.emit)
             card_layout.addWidget(self.empty_browse_btn, 0, Qt.AlignCenter)
@@ -533,6 +566,7 @@ try:
             self._reset_inspector()
 
         def _reset_inspector(self) -> None:
+            self._thumbnail.invalidate()
             self._current_output_path = ""
             self._current_pixmap = None
             self.preview_stage.show()
@@ -654,6 +688,7 @@ try:
                             self.table.selectRow(r)
                             break
             else:
+                self.table.clearSelection()
                 self._reset_inspector()
 
         def _status_color(self, raw_status: str) -> str:
@@ -674,6 +709,20 @@ try:
                     item.setForeground(QColor(self._status_color(raw)))
 
         def add_result(self, result: Any) -> None:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            self._fill_row(row, result)
+            self._show_results()
+            self._apply_filter()
+            self._refresh_batch_actions()
+
+        def _show_results(self):
+            self.empty_container.hide()
+            self.splitter.show()
+            self.table.show()
+            self.inspector.show()
+
+        def _fill_row(self, row, result):
             self._all_results.append(result)
 
             images = _extract_image_names(result)
@@ -684,16 +733,8 @@ try:
                 range_text = "—"
             self._result_ranges.append(range_text)
 
-            self.empty_container.hide()
-            self.splitter.show()
-            self.table.show()
-            self.inspector.show()
-
             group = _get(result, "group", default=result)
             analysis = _get(result, "analysis", default=None) or group
-            row = self.table.rowCount()
-            self.table.insertRow(row)
-
             gid = _get(result, "group_id", default=_get(group, "group_id", "id", default=""))
             all_count = _get(analysis, "image_count", default=_get(group, "image_count", default=""))
             archive = _get(result, "archive_result", default=None)
@@ -757,24 +798,65 @@ try:
                     item.setForeground(QColor(self._status_color(raw_status)))
                 self.table.setItem(row, col, item)
 
-            self._apply_filter()
-            self._refresh_batch_actions()
-
-            if self.table.rowCount() == 1:
-                self.table.selectRow(0)
-
         def update_results(self, results: Iterable[Any]) -> None:
-            self.clear()
-            for result in results:
-                self.add_result(result)
-            self._refresh_batch_actions()
+            values = list(results)
+            self.table.setUpdatesEnabled(False)
+            try:
+                with QSignalBlocker(self.table):
+                    self.clear()
+                    self.table.setRowCount(len(values))
+                    for row, result in enumerate(values):
+                        self._fill_row(row, result)
+                    if values:
+                        self._show_results()
+                    self._apply_filter()
+                if values:
+                    self._on_selection_changed()
+                self._refresh_batch_actions()
+            finally:
+                self.table.setUpdatesEnabled(True)
+
+        def eventFilter(self, watched, event):
+            if event.type() == QEvent.Resize:
+                if watched is getattr(self, "_inspector_viewport", None):
+                    required = sum(b.sizeHint().width() for b in
+                                   (self.zoom_btn, self.open_file_btn, self.reveal_file_btn)) + 32
+                    compact = event.size().width() < required
+                    self.open_file_btn.setVisible(not compact)
+                    self.reveal_file_btn.setVisible(not compact)
+                    self.more_btn.setVisible(compact)
+                    # Keep file actions above the photo in the compact inspector.
+                    layout = self._action_row_widget.parentWidget().layout()
+                    position = 1 if compact else 2
+                    if layout.indexOf(self._action_row_widget) != position:
+                        layout.insertWidget(position, self._action_row_widget)
+                    self._render_preview_pixmap()
+                elif hasattr(self, "table") and watched is self.table.viewport():
+                    compact = event.size().width() < 375
+                    self.table.setColumnHidden(3, compact)
+                    self.table.setColumnHidden(5, compact)
+            return super().eventFilter(watched, event)
+
+        def _show_thumbnail(self, value, error):
+            if error:
+                self.preview_image.setText("无法解码图片预览")
+                self.preview_image.setToolTip(error)
+                return
+            image, size, byte_count = value
+            self._current_pixmap = QPixmap.fromImage(image)
+            self._current_pixmap.setDevicePixelRatio(self.devicePixelRatioF())
+            self._render_preview_pixmap()
+            self.preview_meta.setText(
+                f"{Path(self._current_output_path).name}\n{size.width()} × {size.height()} px · {byte_count / 1024**2:.2f} MB · 双击放大")
+            self.preview_meta.show()
+            self.zoom_btn.setEnabled(True)
 
         def _render_preview_pixmap(self) -> None:
             if self._current_pixmap is None or self._current_pixmap.isNull():
                 return
             w = max(120, self.preview_image.width() - 6)
             h = max(72, self.preview_image.height() - 6)
-            scaled = self._current_pixmap.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            scaled = self._current_pixmap.scaled(round(w * self.devicePixelRatioF()), round(h * self.devicePixelRatioF()), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.preview_image.setPixmap(scaled)
 
         def resizeEvent(self, event: Any) -> None:
@@ -783,7 +865,7 @@ try:
 
         def _on_selection_changed(self) -> None:
             selected_rows = self.table.selectionModel().selectedRows()
-            if not selected_rows:
+            if not selected_rows or self.table.isRowHidden(selected_rows[0].row()):
                 self._reset_inspector()
                 return
             row = selected_rows[0].row()
@@ -935,35 +1017,22 @@ try:
             else:
                 self.reason_frame.hide()
 
-            # Load output thumbnail preview
-            if self._current_output_path and os.path.exists(self._current_output_path):
-                pixmap = QPixmap(self._current_output_path)
-                if not pixmap.isNull():
-                    self.preview_stage.show()
-                    self._action_row_widget.show()
-                    self.preview_image.setFixedHeight(168)
-                    self._current_pixmap = pixmap
-                    self._render_preview_pixmap()
-                    try:
-                        size_mb = Path(self._current_output_path).stat().st_size / (1024 * 1024)
-                        self.preview_meta.setText(f"{pixmap.width()} × {pixmap.height()} px · {size_mb:.2f} MB · 双击放大")
-                    except OSError:
-                        self.preview_meta.setText(f"{pixmap.width()} × {pixmap.height()} px · 双击放大")
-                    self.preview_meta.show()
-                    self.zoom_btn.setEnabled(True)
-                    self.open_file_btn.setEnabled(True)
-                    self.reveal_file_btn.setEnabled(True)
-                else:
-                    self.preview_stage.show()
-                    self._action_row_widget.show()
-                    self.preview_image.setFixedHeight(78)
-                    self._current_pixmap = None
-                    self.preview_image.clear()
-                    self.preview_image.setText("无法解码图片预览")
-                    self.preview_meta.hide()
-                    self.zoom_btn.setEnabled(False)
-                    self.open_file_btn.setEnabled(True)
-                    self.reveal_file_btn.setEnabled(True)
+            self._thumbnail.invalidate()
+            self._current_pixmap = None
+            self.preview_image.clear()
+            self.preview_image.setToolTip(output_path)
+            self.preview_meta.hide()
+            self.zoom_btn.setEnabled(False)
+            if output_path and os.path.isfile(output_path):
+                self.preview_stage.show()
+                self._action_row_widget.show()
+                self.preview_image.setFixedHeight(168)
+                self.preview_image.setText("正在载入预览…")
+                self.open_file_btn.setEnabled(True)
+                self.reveal_file_btn.setEnabled(True)
+                scale = self.devicePixelRatioF()
+                target = QSize(round(max(120, self.preview_image.width()) * scale), round(168 * scale))
+                self._thumbnail.submit(_read_thumbnail, output_path, target)
             else:
                 self._current_pixmap = None
                 self.preview_image.clear()

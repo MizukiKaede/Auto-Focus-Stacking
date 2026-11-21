@@ -100,7 +100,10 @@ def _normalise_row(row: ManifestRow | Mapping[str, Any] | Any) -> dict[str, Any]
     for old, new in aliases.items():
         if new not in source and old in source:
             source[new] = source[old]
-    result = {key: source.get(key, "") for key in MANIFEST_FIELDS}
+    result = {}
+    for key in MANIFEST_FIELDS:
+        value = source.get(key, "")
+        result[key] = os.fspath(value) if isinstance(value, os.PathLike) else value
     if isinstance(result["selected"], bool):
         result["selected"] = "true" if result["selected"] else "false"
     elif result["selected"] is None:
@@ -109,7 +112,7 @@ def _normalise_row(row: ManifestRow | Mapping[str, Any] | Any) -> dict[str, Any]
         result["fallback_used"] = "true" if result["fallback_used"] else "false"
     for name in ("capture_order", "alignment_order", "actual_hugin_input_order", "diagnostics"):
         if isinstance(result.get(name), (list, tuple, dict)):
-            result[name] = json.dumps(result[name], ensure_ascii=False, separators=(",", ":"))
+            result[name] = json.dumps(result[name], ensure_ascii=False, separators=(",", ":"), default=os.fspath)
     return result
 
 
@@ -122,10 +125,64 @@ def _atomic_path(path: Path) -> tuple[Path, int]:
 class ManifestWriter:
     """Write stack rows atomically and keep output easy to inspect."""
 
-    def __init__(self, path: os.PathLike[str] | str | None = None):
+    def __init__(self, path: os.PathLike[str] | str | None = None, *, journal=None, source_root=None,
+                 flush_interval_seconds=0.0):
         self.path = Path(path) if path is not None else None
         self._rows: dict[tuple[str, str], dict[str, Any]] = {}
         self._lock = threading.RLock()
+
+        self._journal = journal
+        self._scope = str(source_root)
+        self._interval = float(flush_interval_seconds)
+        self._timer = None
+        self._dirty = False
+        self._generation = 0
+        self._write_error = None
+        if self._interval and (journal is None or source_root is None or self.path is None):
+            raise ValueError("Deferred manifests require a durable journal, source root and output path")
+
+    def recover(self, *, resume):
+        """Republish a complete interrupted snapshot before accepting new results."""
+        with self._lock:
+            rows = self._journal.pending_manifest_rows(self._scope)
+            if not rows and not resume:
+                # A fresh empty batch sharing a destination must publish its own header.
+                self._dirty = True
+            if rows:
+                self._merge_rows(rows)
+                self._write_rows(self._rows.values(), self.path)
+                if not resume:
+                    self._journal.clear_manifest_groups(self._scope)
+                    self._rows.clear()
+
+    def _merge_rows(self, rows):
+        for row in rows:
+            self._rows[str(row["group_id"]), str(row["image"])] = row
+
+    def _scheduled_flush(self, generation):
+        with self._lock:
+            if generation != self._generation:
+                return
+            self._timer = None
+            try:
+                self.flush()
+            except OSError as exc:
+                self._write_error = exc
+
+    def flush(self, *, finished=False):
+        with self._lock:
+            if self._timer is not None:
+                self._generation += 1
+                self._timer.cancel()
+                self._timer = None
+            if self._dirty:
+                self._write_rows(self._rows.values(), self.path)
+                self._dirty = False
+            if finished and self._journal is not None:
+                self._journal.clear_manifest_groups(self._scope)
+            if self._write_error is not None:
+                error, self._write_error = self._write_error, None
+                raise OSError(f"清单定时写入失败：{error}") from error
 
     def rows_from_groups(self, groups: Iterable[Any]) -> list[dict[str, Any]]:
         """Expand group/image objects into manifest rows.
@@ -256,6 +313,10 @@ class ManifestWriter:
         fallback_used = bool(_first_value(result, "fallback_used", default=False))
         diagnostics = _first_value(result, "diagnostics", default=_first_value(analysis, "alignment_order_diagnostics", default=""))
 
+        if _first_value(result, "error", default=None):
+            error = str(_first_value(result, "error"))
+            diagnostics = [*diagnostics, error] if isinstance(diagnostics, (list, tuple)) else error
+
         # Use an archive record's source path as the authoritative identity;
         # records can include a failed/missing source not present in the
         # analysis result, so append those paths while retaining one row each.
@@ -327,10 +388,18 @@ class ManifestWriter:
         if target is None:
             raise ValueError("Manifest path is required")
         with self._lock:
-            for row in rows:
-                key = (str(row.get("group_id", "")), str(row.get("image", "")))
-                self._rows[key] = row
-            return self.write_csv(list(self._rows.values()), target)
+            if self._journal is not None and rows:
+                self._journal.stage_manifest_group(self._scope, str(rows[0]["group_id"]), rows)
+            self._merge_rows(rows)
+            if not self._interval or target != self.path:
+                return self._write_rows(self._rows.values(), target)
+            self._dirty = True
+            if self._timer is None:
+                self._generation += 1
+                self._timer = threading.Timer(self._interval, self._scheduled_flush, (self._generation,))
+                self._timer.daemon = True
+                self._timer.start()
+            return target
 
     append_result = update_result
     update = update_result
@@ -348,19 +417,23 @@ class ManifestWriter:
             target = Path(path) if path is not None else self.path
             if target is None:
                 raise ValueError("Manifest path is required")
-            return self.write_csv(list(self._rows.values()), target)
+            return self._write_rows(self._rows.values(), target)
 
     def write_csv(self, rows: Iterable[ManifestRow | Mapping[str, Any] | Any], path: os.PathLike[str] | str | None = None) -> Path:
         target = Path(path) if path is not None else self.path
         if target is None:
             raise ValueError("Manifest path is required")
+        return self._write_rows((_normalise_row(row) for row in rows), target)
+
+    @staticmethod
+    def _write_rows(rows, target):
         temp, fd = _atomic_path(target)
         try:
             with os.fdopen(fd, "w", encoding="utf-8-sig", newline="") as stream:
                 writer = csv.DictWriter(stream, fieldnames=list(MANIFEST_FIELDS), extrasaction="ignore")
                 writer.writeheader()
                 for row in rows:
-                    writer.writerow(_normalise_row(row))
+                    writer.writerow(row)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temp, target)

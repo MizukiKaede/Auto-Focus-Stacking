@@ -333,11 +333,13 @@ class JobRecord:
     attempt: int = 0
     created_at: str | None = None
     updated_at: str | None = None
+    source_root: str | None = None
 
     def to_mapping(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "group_id": self.group_id,
+            "source_root": self.source_root,
             "stage": _value(self.stage),
             "progress": float(self.progress),
             "status": _value(self.status),
@@ -354,6 +356,7 @@ class JobRecord:
         names = {
             "id",
             "group_id",
+            "source_root",
             "stage",
             "progress",
             "status",

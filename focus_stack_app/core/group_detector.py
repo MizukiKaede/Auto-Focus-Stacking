@@ -3,10 +3,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import os
+import threading
 
 import cv2
 import numpy as np
 
+from ..utils.concurrency import bounded_image_map
 from ..utils.image_io import load_rgb
 from .registration import resolve_image_path
 from .types import SceneGroup
@@ -33,8 +36,11 @@ def subject_feature(rgb):
     """
     h, w = rgb.shape[:2]
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    neutral = np.ptp(rgb.astype(np.int16), axis=2) < 45
-    if np.mean((gray > 160) & neutral) < 0.55:
+    bright = gray > 160
+    if np.count_nonzero(bright) < 0.55 * gray.size:
+        return None
+    neutral = (rgb.max(axis=2) - rgb.min(axis=2)) < 45
+    if np.count_nonzero(bright & neutral) < 0.55 * gray.size:
         return None
     mask = (cv2.GaussianBlur(gray, (0, 0), 1) < 145).astype(np.uint8)
     count, _, stats, _ = cv2.connectedComponentsWithStats(mask)
@@ -46,7 +52,7 @@ def subject_feature(rgb):
     if not candidates:
         return None
     x, y, width, height, _ = stats[max(candidates, key=lambda i: stats[i, 4])]
-    preview = cv2.GaussianBlur(rgb, (0, 0), 2).astype(np.float32) / 255
+    preview = cv2.GaussianBlur(rgb, (0, 0), 2)
     return preview, (float(x), float(y), float(width), float(height))
 
 
@@ -66,9 +72,19 @@ def subject_changed(left, right):
     region = left[0][y:end_y, x:end_x]
     if not region.size:
         return False
-    difference = min(float(np.abs(region - right[0][y + dy:end_y + dy, x + dx:end_x + dx]).mean())
-                     for dy in (-tolerance, 0, tolerance)
-                     for dx in (-tolerance, 0, tolerance))
+    if left[0].dtype == np.uint8 and right[0].dtype == np.uint8:
+        scale = 1.0 / (region.size * 255.0)
+        difference = min(
+            cv2.norm(region, right[0][y + dy:end_y + dy, x + dx:end_x + dx], cv2.NORM_L1) * scale
+            for dy in (-tolerance, 0, tolerance)
+            for dx in (-tolerance, 0, tolerance)
+        )
+    else:
+        left_f = region.astype(np.float32) / 255.0 if left[0].dtype == np.uint8 else region
+        right_arr = right[0].astype(np.float32) / 255.0 if right[0].dtype == np.uint8 else right[0]
+        difference = min(float(np.abs(left_f - right_arr[y + dy:end_y + dy, x + dx:end_x + dx]).mean())
+                         for dy in (-tolerance, 0, tolerance)
+                         for dx in (-tolerance, 0, tolerance))
     return difference > 0.09
 
 
@@ -96,21 +112,58 @@ def _capture_time(record):
 class StackGroupDetector:
     """Split a capture sequence when composition, dimensions, or time change."""
 
-    def __init__(self, config=None, loader=None):
+    def __init__(self, config=None, loader=None, *, workers=None, cancel_event=None):
         self.config = config or StackGroupDetectorConfig()
         self.loader = loader or load_rgb
+        self.workers = workers
+        self.cancel_event = cancel_event or threading.Event()
 
-    def iter_groups(self, records):
-        current = []
-        previous = previous_time = previous_shape = previous_subject = None
-        start, group_id = 0, 0
-        for index, record in enumerate(records):
-            rgb = self.loader(resolve_image_path(record), 640)
+    def _extract_frame(self, record):
+        path = resolve_image_path(record)
+        try:
+            rgb = self.loader(path, 640)
             subject = subject_feature(rgb)
             # Preserve the original whole-frame score's two-stage resampling.
             ratio = min(1.0, 320 / max(rgb.shape[:2]))
-            small = cv2.resize(rgb, (round(rgb.shape[1] * ratio), round(rgb.shape[0] * ratio)), interpolation=cv2.INTER_AREA) if ratio < 1 else rgb
+            small = (
+                cv2.resize(rgb, (round(rgb.shape[1] * ratio), round(rgb.shape[0] * ratio)),
+                           interpolation=cv2.INTER_AREA)
+                if ratio < 1 else rgb
+            )
             preview = stack_preview(small)
+            return record, rgb.shape, subject, preview, None
+        except (OSError, ValueError, RuntimeError, cv2.error) as exc:
+            return record, None, None, None, f"预览读取失败：{path}（{exc}）"
+
+    def _effective_workers(self):
+        if self.loader is not load_rgb:
+            return 1
+        if self.workers is not None:
+            return max(1, int(self.workers))
+        return max(1, min(4, os.cpu_count() or 1))
+
+    def iter_groups(self, records):
+        workers = self._effective_workers()
+        with bounded_image_map(
+            self._extract_frame, records, workers=workers, cancel_event=self.cancel_event
+        ) as extracted:
+            yield from self._group_extracted(extracted)
+
+    def _group_extracted(self, extracted):
+        current = []
+        previous = previous_time = previous_shape = previous_subject = None
+        start, group_id = 0, 0
+        for index, (record, rgb_shape, subject, preview, error) in enumerate(extracted):
+            if error is not None:
+                if current:
+                    group_id += 1
+                    yield SceneGroup(group_id, current, start, index - 1, confidence=1.0)
+                    current = []
+                group_id += 1
+                yield SceneGroup(group_id, [record], index, index, confidence=0.0,
+                                 excluded_reason=error)
+                previous = previous_time = previous_shape = previous_subject = None
+                continue
             moment = _capture_time(record)
             try:
                 gap = (moment - previous_time).total_seconds() if moment and previous_time else 0
@@ -118,7 +171,7 @@ class StackGroupDetector:
                 gap = 0
             change = composition_change(previous, preview) if previous is not None else 0
             boundary = (
-                rgb.shape != previous_shape
+                rgb_shape != previous_shape
                 or gap < 0
                 or gap > max(self.config.long_pause_seconds, self.config.pause_seconds)
                 or change > self.config.composition_change
@@ -132,7 +185,7 @@ class StackGroupDetector:
             if not current:
                 start = index
             current.append(record)
-            previous, previous_time, previous_shape = preview, moment, rgb.shape
+            previous, previous_time, previous_shape = preview, moment, rgb_shape
             previous_subject = subject
         if current:
             yield SceneGroup(group_id + 1, current, start, start + len(current) - 1, confidence=1.0)

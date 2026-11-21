@@ -43,9 +43,13 @@ def load_quality_rgb(path: str | Path, *, pass_index: int | None = None) -> Any:
     with stage("image_decode", path=str(path), decoder="opencv_imdecode", pass_index=pass_index):
         bgr = cv2.imdecode(np.frombuffer(encoded, np.uint8),
                            cv2.IMREAD_COLOR | cv2.IMREAD_IGNORE_ORIENTATION)
+        del encoded
         if bgr is None:
             raise ImageIOError(f"unable to decode JPEG {path}")
-        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        try:
+            return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB, dst=bgr)
+        except TypeError:
+            return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,14 +76,56 @@ _SOF_MARKERS = {
 }
 
 
+def _parse_jpeg_size_from_buffer(data: bytes) -> ImageSize | None:
+    """Fast in-memory scan of a JPEG header chunk for an SOF marker."""
+    length_data = len(data)
+    if length_data < 4 or data[:2] != b"\xff\xd8":
+        return None
+    pos = 2
+    while pos < length_data:
+        pos = data.find(b"\xff", pos)
+        if pos < 0 or pos + 1 >= length_data:
+            return None
+        while pos + 1 < length_data and data[pos + 1] == 0xFF:
+            pos += 1
+        if pos + 1 >= length_data:
+            return None
+        marker = data[pos + 1]
+        pos += 2
+        if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+            if marker == 0xD9:
+                return None
+            continue
+        if pos + 2 > length_data:
+            return None
+        seg_len = int.from_bytes(data[pos : pos + 2], "big")
+        if seg_len < 2 or marker == 0xDA:
+            return None
+        if marker in _SOF_MARKERS:
+            if pos + 7 > length_data:
+                return None
+            height = int.from_bytes(data[pos + 3 : pos + 5], "big")
+            width = int.from_bytes(data[pos + 5 : pos + 7], "big")
+            if width and height:
+                return ImageSize(width=width, height=height)
+        pos += seg_len
+    return None
+
+
 def read_jpeg_size(path: str | Path) -> ImageSize:
     """Read dimensions from a JPEG SOF marker without decoding pixels."""
 
     path = Path(path)
     try:
         with path.open("rb") as stream:
-            if stream.read(2) != b"\xff\xd8":
+            head = stream.read(65536)
+            if len(head) < 2 or head[:2] != b"\xff\xd8":
                 raise ImageIOError(f"not a JPEG file: {path}")
+            parsed = _parse_jpeg_size_from_buffer(head)
+            if parsed is not None:
+                return parsed
+            # Fall back to seeking across segments > 64 KiB (e.g. huge ICC/XMP).
+            stream.seek(2)
             while True:
                 byte = stream.read(1)
                 if not byte:
@@ -92,7 +138,6 @@ def read_jpeg_size(path: str | Path) -> ImageSize:
                 if not marker_byte:
                     break
                 marker = marker_byte[0]
-                # Standalone markers do not have a length field.
                 if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
                     if marker == 0xD9:
                         break
@@ -103,10 +148,6 @@ def read_jpeg_size(path: str | Path) -> ImageSize:
                 length = int.from_bytes(length_bytes, "big")
                 if length < 2:
                     break
-                # After Start Of Scan the remainder is entropy-coded data;
-                # searching it for marker-like bytes can mistake payload for
-                # another segment, so dimensions must have been found before
-                # this point.
                 if marker == 0xDA:
                     break
                 if marker in _SOF_MARKERS:
@@ -116,7 +157,6 @@ def read_jpeg_size(path: str | Path) -> ImageSize:
                         width = int.from_bytes(sof[3:5], "big")
                         if width and height:
                             return ImageSize(width=width, height=height)
-                    # malformed SOF: skip any remainder and continue
                     stream.seek(max(length - 2 - len(sof), 0), os.SEEK_CUR)
                 else:
                     stream.seek(length - 2, os.SEEK_CUR)
@@ -164,6 +204,22 @@ def _resize_dimensions(width: int, height: int, long_edge: int | None) -> tuple[
     return max(1, round(width * scale)), max(1, round(height * scale))
 
 
+def _opencv_reduced_mode(cv2: Any, path: Path, long_edge: int | None, grayscale: bool) -> int:
+    if long_edge and long_edge > 0 and path.suffix.lower() in {".jpg", ".jpeg"}:
+        try:
+            size = read_jpeg_size(path)
+            ratio = max(size.width, size.height) / long_edge
+            if ratio >= 8:
+                return cv2.IMREAD_REDUCED_GRAYSCALE_8 if grayscale else cv2.IMREAD_REDUCED_COLOR_8
+            if ratio >= 4:
+                return cv2.IMREAD_REDUCED_GRAYSCALE_4 if grayscale else cv2.IMREAD_REDUCED_COLOR_4
+            if ratio >= 2:
+                return cv2.IMREAD_REDUCED_GRAYSCALE_2 if grayscale else cv2.IMREAD_REDUCED_COLOR_2
+        except ImageIOError:
+            pass
+    return cv2.IMREAD_GRAYSCALE if grayscale else cv2.IMREAD_COLOR
+
+
 def load_image(
     path: str | Path,
     *,
@@ -189,8 +245,15 @@ def load_image(
     except ImportError:
         cv2 = None
     if cv2 is not None:
-        mode = cv2.IMREAD_GRAYSCALE if grayscale else cv2.IMREAD_COLOR
+        mode = _opencv_reduced_mode(cv2, path, long_edge, grayscale)
         image = cv2.imread(str(path), mode)
+        if image is None:
+            try:
+                import numpy as np
+                encoded = np.fromfile(str(path), dtype=np.uint8)
+                image = cv2.imdecode(encoded, mode)
+            except (OSError, ValueError):
+                image = None
         if image is None:
             raise ImageIOError(f"unable to decode image: {path}")
         if long_edge and max(image.shape[:2]) > long_edge:
@@ -209,10 +272,11 @@ def load_image(
         ) from exc
     try:
         with Image.open(path) as image:
-            if grayscale:
-                image = image.convert("L")
-            else:
-                image = image.convert("RGB")
+            target_mode = "L" if grayscale else "RGB"
+            if long_edge:
+                image.draft(target_mode, (long_edge, long_edge))
+            if image.mode != target_mode:
+                image = image.convert(target_mode)
             if long_edge and max(image.size) > long_edge:
                 target = _resize_dimensions(image.width, image.height, long_edge)
                 image = image.resize(target, Image.Resampling.LANCZOS)
@@ -270,8 +334,12 @@ def load_rgb(path: str | Path, long_edge: int | None = None) -> Any:
                path=str(path)), Image.open(source) as image:
         if long_edge and long_edge <= 320:
             image.draft("RGB", (long_edge, long_edge))
-        image = image.convert("RGB")
+        if image.mode != "RGB":
+            image = image.convert("RGB")
         if long_edge:
+            # convert("RGB") previously forced decode here. Keep thumbnail()
+            # from implicitly selecting a different JPEG DCT scale.
+            image.load()
             image.thumbnail((long_edge, long_edge))
         return np.asarray(image)
 
@@ -282,9 +350,8 @@ def load_rgb_with_previews(
 ) -> tuple[Any, dict[int, Any]]:
     """Decode RGB once and make each preview independently from the source.
 
-    ``thumbnail`` is applied to a fresh copy for every requested edge, keeping
-    the same Pillow conversion and resize behavior as separate ``load_rgb``
-    calls while avoiding repeated TIFF/JPEG decoding.
+    Avoids redundant full-resolution copies while matching Pillow's Lanczos
+    downsampling behavior.
     """
     try:
         from PIL import Image  # type: ignore[import-not-found]
@@ -294,14 +361,17 @@ def load_rgb_with_previews(
 
     from .performance import stage
     with stage("tiff_validation_read_decode", path=str(path)), Image.open(path) as image:
-        source = image.convert("RGB")
+        source = image if image.mode == "RGB" else image.convert("RGB")
         full_resolution = np.asarray(source)
         previews: dict[int, Any] = {}
+        width, height = source.size
         for edge in dict.fromkeys(int(value) for value in long_edges):
-            preview = source.copy()
-            if edge:
-                preview.thumbnail((edge, edge))
-            previews[edge] = np.asarray(preview)
+            if edge and max(width, height) > edge:
+                target = _resize_dimensions(width, height, edge)
+                preview = source.resize(target, Image.Resampling.LANCZOS, reducing_gap=2.0)
+                previews[edge] = np.asarray(preview)
+            else:
+                previews[edge] = full_resolution.copy()
         return full_resolution, previews
 
 

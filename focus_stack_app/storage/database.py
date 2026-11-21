@@ -70,7 +70,7 @@ class Database:
     half-updated group.
     """
 
-    SCHEMA_VERSION = 4
+    SCHEMA_VERSION = 5
 
     def __init__(self, path: str | Path, *, timeout: float = 30.0, initialize: bool = True) -> None:
         self.path = Path(path)
@@ -124,14 +124,13 @@ class Database:
         """
 
         with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
             try:
-                self._connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
                 yield self._connection
-            except Exception:
+                self._connection.commit()
+            except BaseException:
                 self._connection.rollback()
                 raise
-            else:
-                self._connection.commit()
 
     def create_schema(self) -> None:
         with self._lock:
@@ -256,6 +255,14 @@ class Database:
                         PRIMARY KEY(kind, cache_key)
                     );
 
+                    CREATE TABLE IF NOT EXISTS manifest_groups (
+                        source_root TEXT NOT NULL,
+                        group_key TEXT NOT NULL,
+                        rows_json TEXT NOT NULL,
+                        UNIQUE(source_root, group_key)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_images_current_path ON images(current_path);
+                    CREATE INDEX IF NOT EXISTS idx_jobs_group ON jobs(group_id);
                     CREATE INDEX IF NOT EXISTS idx_images_sequence ON images(sequence_index);
                     CREATE INDEX IF NOT EXISTS idx_images_group ON images(group_id, sequence_index);
                     CREATE INDEX IF NOT EXISTS idx_images_status ON images(status);
@@ -338,6 +345,8 @@ class Database:
                     self._connection.execute("ALTER TABLE analysis ADD COLUMN transform TEXT")
                 if "transform_json" not in columns:
                     self._connection.execute("ALTER TABLE analysis ADD COLUMN transform_json TEXT")
+                if "source_root" not in {r["name"] for r in self._connection.execute("PRAGMA table_info(jobs)")}:
+                    self._connection.execute("ALTER TABLE jobs ADD COLUMN source_root TEXT")
                 group_columns = {
                     row["name"] for row in self._connection.execute("PRAGMA table_info(groups)").fetchall()
                 }
@@ -388,6 +397,21 @@ class Database:
                 raise DatabaseError(str(exc)) from exc
 
     # ---- lightweight grouping/selection plans -----------------------------
+
+    def stage_manifest_group(self, source_root, group_key, rows):
+        self._run(
+            "INSERT INTO manifest_groups(source_root, group_key, rows_json) VALUES (?, ?, ?) "
+            "ON CONFLICT(source_root, group_key) DO UPDATE SET rows_json=excluded.rows_json",
+            (source_root, group_key, json.dumps(rows, ensure_ascii=False)),
+        )
+
+    def pending_manifest_rows(self, source_root):
+        groups = self._fetchall(
+            "SELECT rows_json FROM manifest_groups WHERE source_root=? ORDER BY rowid", (source_root,))
+        return [row for group in groups for row in json.loads(group["rows_json"])]
+
+    def clear_manifest_groups(self, source_root):
+        self._run("DELETE FROM manifest_groups WHERE source_root=?", (source_root,))
 
     def get_cached_plan(
         self, kind: str, cache_key: str, *, algorithm_version: str | None = None,
@@ -472,7 +496,8 @@ class Database:
         current = _path_string(image.current_path or path)
         with self._lock:
             try:
-                self._connection.execute(
+                returning = sqlite3.sqlite_version_info >= (3, 35, 0)
+                cursor = self._connection.execute(
                     """
                     INSERT INTO images (
                         original_path, current_path, filename, stem, extension,
@@ -493,7 +518,7 @@ class Database:
                         lens=excluded.lens,
                         sequence_index=excluded.sequence_index,
                         updated_at=excluded.updated_at
-                    """,
+                    """ + (" RETURNING *" if returning else ""),
                     (
                         path,
                         current,
@@ -515,7 +540,7 @@ class Database:
                         now,
                     ),
                 )
-                row = self._connection.execute(
+                row = cursor.fetchone() if returning else self._connection.execute(
                     "SELECT * FROM images WHERE original_path = ?", (path,)
                 ).fetchone()
                 assert row is not None
@@ -816,6 +841,7 @@ class Database:
     # ---- analysis ----------------------------------------------------------
 
     def upsert_analysis(self, analysis: AnalysisRecord) -> None:
+        transform = _json_value(analysis.transform)
         self._run(
             """
             INSERT INTO analysis (
@@ -842,8 +868,8 @@ class Database:
                 analysis.scene_score,
                 analysis.sharpness_score,
                 analysis.focus_map_path,
-                _json_value(analysis.transform),
-                _json_value(analysis.transform),
+                transform,
+                transform,
                 int(bool(analysis.selected)),
                 analysis.selection_reason,
                 analysis.coverage_gain,
@@ -931,8 +957,8 @@ class Database:
             """
             INSERT INTO jobs (
                 group_id, stage, progress, status, error, started_at, finished_at,
-                attempt, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                attempt, created_at, updated_at, source_root
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job.group_id,
@@ -945,6 +971,7 @@ class Database:
                 int(job.attempt),
                 created,
                 now,
+                job.source_root,
             ),
         )
         job.id = int(cursor.lastrowid)
@@ -1319,7 +1346,7 @@ class Database:
             ),
         )
 
-    def recover_incomplete_jobs(self) -> list[JobRecord]:
+    def recover_incomplete_jobs(self, *, source_root: Path | None = None) -> list[JobRecord]:
         """Reset RUNNING jobs to PENDING after an unclean shutdown.
 
         The old error is retained as an audit hint and a new attempt can
@@ -1331,6 +1358,14 @@ class Database:
                 "SELECT * FROM jobs WHERE status = 'RUNNING' ORDER BY id"
             ).fetchall()
             for row in rows:
+                if source_root is not None:
+                    if row["source_root"]:
+                        if Path(row["source_root"]) != source_root:
+                            continue
+                    else:
+                        images = self.get_group_images(row["group_id"])
+                        if not images or any(Path(i.original_path).parent != source_root for i in images):
+                            continue
                 note = row["error"] or ""
                 marker = "recovered after interrupted run"
                 error = f"{note}; {marker}" if note else marker
@@ -1343,7 +1378,7 @@ class Database:
                 )
         return self.list_jobs(status="PENDING")
 
-    def recover_archived_images(self, destination_root: str | Path | None = None) -> list[ImageRecord]:
+    def recover_archived_images(self, destination_root: str | Path | None = None, *, source_root: Path | None = None) -> list[ImageRecord]:
         """Reconcile archive operations without touching the filesystem.
 
         New operations have a journal row and an ``images.pending_path`` that
@@ -1361,6 +1396,13 @@ class Database:
         """
 
         candidates = self.list_images()
+        if source_root is not None:
+            owners = {job.group_id: job.source_root for job in self.list_jobs() if job.source_root}
+            candidates = [
+                image for image in candidates
+                if (Path(owners[image.group_id]) == source_root if image.group_id in owners
+                    else Path(image.original_path).parent == source_root)
+            ]
         by_id = {int(image.id): image for image in candidates if image.id is not None}
         recovered: list[ImageRecord] = []
         touched: set[int] = set()
@@ -1528,6 +1570,9 @@ class Database:
         # A single image can have multiple retries.  Only the newest journal
         # row is authoritative; older rows remain available for audit queries.
         operations = self.list_archive_operations()
+        if source_root is not None:
+            operations = [op for op in operations if op.image_id in by_id or (
+                op.image_id is None and Path(op.source_path).parent == source_root)]
         latest_by_image: dict[int, ArchiveOperationRecord] = {}
         for operation in operations:
             if operation.image_id is not None:

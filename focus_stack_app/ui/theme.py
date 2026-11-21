@@ -346,7 +346,7 @@ QLabel[role="countPill"] {{
     font-weight: 600;
 }}
 
-QLineEdit, QSpinBox, QComboBox {{
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
     background: {t.bg_input};
     color: {t.text_primary};
     border: 1px solid {t.border_strong};
@@ -357,17 +357,17 @@ QLineEdit, QSpinBox, QComboBox {{
     selection-color: #FFFFFF;
 }}
 
-QLineEdit:hover, QSpinBox:hover, QComboBox:hover {{
+QLineEdit:hover, QSpinBox:hover, QDoubleSpinBox:hover, QComboBox:hover {{
     background: {t.bg_input_hover};
     border-color: {t.accent};
 }}
 
-QLineEdit:focus, QSpinBox:focus, QComboBox:focus {{
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{
     background: {t.bg_input};
     border: 1.5px solid {t.accent};
 }}
 
-QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled {{
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled {{
     color: {t.text_disabled};
     border-color: {t.border};
     background: {t.bg_input_disabled};
@@ -394,28 +394,28 @@ QComboBox::down-arrow {{
     height: 11px;
 }}
 
-QSpinBox::up-button, QSpinBox::down-button {{
+QSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
     subcontrol-origin: border;
     width: 20px;
     border: none;
     background: transparent;
 }}
 
-QSpinBox::up-button {{
+QSpinBox::up-button, QDoubleSpinBox::up-button {{
     subcontrol-position: top right;
 }}
 
-QSpinBox::down-button {{
+QSpinBox::down-button, QDoubleSpinBox::down-button {{
     subcontrol-position: bottom right;
 }}
 
-QSpinBox::up-arrow {{
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{
     image: url({assets}/chevron-up.svg);
     width: 10px;
     height: 10px;
 }}
 
-QSpinBox::down-arrow {{
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
     image: url({assets}/chevron-down.svg);
     width: 10px;
     height: 10px;
@@ -450,7 +450,7 @@ QPushButton:disabled {{
     border-color: {t.border};
 }}
 
-QPushButton#startButton {{
+QPushButton#browsePhotosButton:default, QPushButton#startButton {{
     background: {t.accent};
     color: #FFFFFF;
     border: 1px solid {t.accent};
@@ -460,12 +460,12 @@ QPushButton#startButton {{
     font-size: 13px;
 }}
 
-QPushButton#startButton:hover {{
+QPushButton#browsePhotosButton:default:hover, QPushButton#startButton:hover {{
     background: {t.accent_hover};
     border-color: {t.accent_hover};
 }}
 
-QPushButton#startButton:pressed {{
+QPushButton#browsePhotosButton:default:pressed, QPushButton#startButton:pressed {{
     background: {t.accent_pressed};
 }}
 

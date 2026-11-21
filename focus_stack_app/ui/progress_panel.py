@@ -109,7 +109,7 @@ try:  # PySide6 is optional for headless tests and CLI use.
         "error": "处理遇到错误",
     }
 
-    PIPELINE_STEPS = ["扫描分组", "焦点分析", "图像对齐", "景深融合", "完成归档"]
+    PIPELINE_STEPS = ["扫描分组", "焦点分析", "图像对齐", "景深融合", "完成"]
 
     class ProgressPanel(QFrame):
         """Compact, daylight-clean progress ribbon with inline stepper and diagnostics drawer."""

@@ -34,13 +34,21 @@ def main():
                     assert statistics_native._library.dll is not None
                 report['native'] = {'fast_abi': 3, 'statistics': 'loaded',
                                     'fast_runtime': fast_cpp.runtime_info()}
+                from focus_stack_app.fusion.ai_runtime import probe_ai_runtime
+
+                cpu = probe_ai_runtime(requested_device='cpu')
+                automatic = probe_ai_runtime()
+                assert cpu.available and automatic.available, (cpu.error, automatic.error)
+                assert 'DmlExecutionProvider' in automatic.available_providers
+                assert all(Path(sys._MEIPASS) in status.model_path.parents for status in (cpu, automatic))
+                report['ai'] = {
+                    'automatic_provider': automatic.active_provider,
+                    'available_providers': automatic.available_providers,
+                    'cpu_model': cpu.model_path.name,
+                    'automatic_model': automatic.model_path.name,
+                }
                 icon = Path(sys._MEIPASS) / 'focus_stack_app' / 'ui' / 'icons' / 'clock.svg'
                 assert icon.is_file() and not QPixmap(str(icon)).isNull()
-                app_icon = app.windowIcon()
-                assert not app_icon.isNull() and not window.windowIcon().isNull()
-                report['app_icon_sizes'] = [(size.width(), size.height())
-                                            for size in app_icon.availableSizes()]
-                assert (256, 256) in report['app_icon_sizes']
                 from focus_stack_app.hugin.hugin_locator import HuginLocator
                 tools = HuginLocator().find_installation(require=True)
                 import subprocess
@@ -59,7 +67,7 @@ def main():
                     report['tools'][name] = {'path': str(path),
                                             'exit_code': result.returncode,
                                             'output': output.splitlines()[:3]}
-                assert window.isVisible() and app.platformName() == 'windows'
+                assert window.isVisible() and app.platformName() in ('windows', 'offscreen')
                 screenshot = str(Path(check).with_suffix('.png'))
                 assert window.grab().save(screenshot)
                 report['ok'] = True

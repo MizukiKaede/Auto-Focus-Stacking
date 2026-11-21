@@ -20,12 +20,16 @@ class PipelineConfig:
     queue_size: int = 3
     merge_workers: int = 3
     parallel: bool = True
+    auto_merge_workers: bool = False
+    auto_merge_worker_bytes: int = 0
 
     def __post_init__(self) -> None:
         if int(self.queue_size) < 1:
             raise ValueError("queue_size must be at least one")
         if not 1 <= int(self.merge_workers) <= 6:
             raise ValueError("merge_workers must be between 1 and 6")
+        if int(self.auto_merge_worker_bytes) < 0:
+            raise ValueError("auto_merge_worker_bytes cannot be negative")
 
 
 @dataclass
@@ -45,6 +49,7 @@ class PipelineSummary:
     # group's required archive work.  Kept last for positional compatibility
     # with the original summary constructor.
     merge_finished: int | None = None
+    diagnostics: list[str] = field(default_factory=list)
 
     @property
     def succeeded(self) -> int:
@@ -98,6 +103,8 @@ class PipelineCoordinator:
                 queue_size=getattr(config, "queue_size", getattr(config, "merge_queue_size", 3)) if queue_size is None else queue_size,
                 merge_workers=getattr(config, "merge_workers", getattr(config, "max_hugin_workers", 3)) if merge_workers is None else merge_workers,
                 parallel=getattr(config, "parallel", getattr(config, "parallel_pipeline", True)) if parallel is None else parallel,
+                auto_merge_workers=bool(getattr(config, "auto_merge_workers", False)),
+                auto_merge_worker_bytes=int(getattr(config, "auto_merge_worker_bytes", 0) or 0),
             )
         self.config = config
         self.effective_workers = config.merge_workers
@@ -116,6 +123,7 @@ class PipelineCoordinator:
         self.memory_guard = memory_guard
         self.measured_worker_peak_bytes = max(0, int(measured_worker_peak_bytes))
         self.job_state = job_state
+        self._manifest_errors: list[str] = []
         self._manifest_lock = threading.RLock()
         self.logger = logger or logging.getLogger(__name__)
         self.cancel_event = threading.Event()
@@ -197,9 +205,20 @@ class PipelineCoordinator:
             if self._started_at <= 0:
                 self._started_at = time.monotonic()
         summary = PipelineSummary(groups_total=len(group_values))
-        from ..utils.fusion_budget import quality_worker_budget
-        budget = quality_worker_budget(
-            self.config.merge_workers, self.measured_worker_peak_bytes,
+        self._manifest_errors.clear()
+        from ..utils.fusion_budget import (
+            DEFAULT_AUTO_MERGE_WORKER_BYTES,
+            resolve_merge_worker_budget,
+        )
+        budget = resolve_merge_worker_budget(
+            self.config.merge_workers,
+            self.measured_worker_peak_bytes,
+            auto_reduce=bool(self.config.auto_merge_workers),
+            per_worker_bytes=(
+                int(self.config.auto_merge_worker_bytes)
+                if int(self.config.auto_merge_worker_bytes) > 0
+                else DEFAULT_AUTO_MERGE_WORKER_BYTES
+            ),
             minimum_bytes=getattr(self.memory_guard, "minimum_bytes", 2 * 1024**3),
             minimum_fraction=getattr(self.memory_guard, "minimum_fraction", 0.10),
         )
@@ -271,7 +290,11 @@ class PipelineCoordinator:
             summary.results = [result for _, result in sorted(indexed_results, key=lambda item: item[0])]
             summary.elapsed_seconds = time.monotonic() - self._started_at
             self._summary = summary
-            self._ensure_manifest()
+            self._flush_manifest(finished=not summary.cancelled and not summary.failed_merge and not summary.failed_analysis)
+            if not self._manifest_errors:
+                self._ensure_manifest()
+            summary.diagnostics.extend(self._manifest_errors)
+            summary.errors += len(self._manifest_errors)
             self._on_worker_event(
                 PipelineEvent(
                     stage=PipelineStage.CANCELLED if summary.cancelled else PipelineStage.COMPLETE,
@@ -294,6 +317,9 @@ class PipelineCoordinator:
                 except Exception:
                     self.logger.debug("Pipeline completion callback failed", exc_info=True)
             return summary
+        except BaseException:
+            self._flush_manifest(finished=False)
+            raise
         finally:
             # Release deferred merge workers even if an unexpected producer or
             # shutdown exception reaches this scope.
@@ -320,25 +346,25 @@ class PipelineCoordinator:
 
     stop = cancel
 
-    def _on_merge_result(self, result: Any) -> None:
-        """Persist one completed/failed group without affecting workers."""
+    def _on_merge_result(self, result: Any) -> bool:
+        """Return whether the group's result was saved for the manifest."""
 
         writer = self.manifest_writer
         if writer is None:
             merger = self.merger
             writer = getattr(merger, "manifest_writer", None) if merger is not None else None
         if writer is None:
-            return
+            return True
         try:
             with self._manifest_lock:
                 update = getattr(writer, "update_result", None)
                 if callable(update):
                     update(result)
-                    return
+                    return True
                 append = getattr(writer, "append_result", None)
                 if callable(append):
                     append(result)
-                    return
+                    return True
                 # Minimal adapter fallback for early manifest writers.  This
                 # writes a valid per-result file even when no stateful upsert
                 # API is available.
@@ -346,8 +372,20 @@ class PipelineCoordinator:
                 write_csv = getattr(writer, "write_csv", None)
                 if callable(rows) and callable(write_csv):
                     write_csv(rows(result))
-        except Exception:
-            self.logger.debug("Manifest update failed", exc_info=True)
+        except Exception as exc:
+            self._manifest_errors.append(f"清单更新失败：{exc}")
+            self.logger.exception("Manifest update failed")
+            return False
+        return True
+
+    def _flush_manifest(self, *, finished):
+        flush = getattr(self.manifest_writer, "flush", None)
+        if callable(flush):
+            try:
+                flush(finished=finished and not self._manifest_errors)
+            except Exception as exc:
+                self._manifest_errors.append(f"清单写入失败：{exc}")
+                self.logger.exception("Manifest flush failed")
 
     def _ensure_manifest(self) -> None:
         """Create an empty/header manifest for an empty or cancelled batch."""
@@ -368,8 +406,9 @@ class PipelineCoordinator:
                 with self._manifest_lock:
                     if not target.exists():
                         write_csv([], target)
-        except Exception:
-            self.logger.debug("Unable to finalize manifest", exc_info=True)
+        except Exception as exc:
+            self._manifest_errors.append(f"清单创建失败：{exc}")
+            self.logger.exception("Unable to finalize manifest")
 
     def _on_worker_event(self, event: PipelineEvent) -> None:
         if self.event_callback is None:

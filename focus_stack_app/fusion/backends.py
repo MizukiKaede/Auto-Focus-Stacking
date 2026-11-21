@@ -249,7 +249,11 @@ class HuginEnfuseBackend(FusionBackend):
                 DEFAULT_ALIGNED_TIFF_CACHE_BYTES,
             )),
             shared_budget=process_global_cache_budget(
-                int(_value(self.runtime_config, "fusion_cache_budget_bytes", 3 * 1024**3))),
+                int(_value(self.runtime_config, "fusion_cache_budget_bytes", 4 * 1024**3))),
+            minimum_available_bytes=int(_value(
+                self.runtime_config, "min_available_memory_bytes", 2 * 1024**3)),
+            minimum_available_fraction=float(_value(
+                self.runtime_config, "min_available_memory_fraction", 0.10)),
         )
         diagnostics: list[str] = []
         if preset == "reference_first":
@@ -404,6 +408,30 @@ class HuginEnfuseBackend(FusionBackend):
         )
 
 
+def _quality_metadata(reference_image):
+    """Copy descriptive capture tags, leaving source thumbnails and geometry behind."""
+    from PIL import Image
+    source = reference_image.getexif()
+    tags = Image.Exif()
+    for key in (271, 272, 306):
+        if key in source:
+            tags[key] = source[key]
+    try:
+        details = source.get_ifd(0x8769) if 0x8769 in source else {}
+    except (OSError, ValueError, TypeError, SyntaxError):
+        details = {}
+    capture = {key: details.get(key, source.get(key)) for key in
+               (36867, 36868, 36880, 36881, 36882, 37521, 37522, 42035, 42036)}
+    capture = {key: value for key, value in capture.items() if value is not None}
+    if capture:
+        tags[0x8769] = capture
+    orientation = source.get(274, 1)
+    profile = reference_image.info.get("icc_profile")
+    if not isinstance(profile, bytes) or profile[16:20] != b"RGB " or reference_image.mode != "RGB":
+        profile = None
+    return tags, orientation, profile
+
+
 class QualityFusionBackend(FusionBackend):
     """Full-resolution, in-memory focus fusion with coherent neutral edges."""
 
@@ -494,6 +522,7 @@ class QualityFusionBackend(FusionBackend):
 
         with Image.open(reference_path) as reference_image:
             width, height = reference_image.size
+            tags, orientation, icc = _quality_metadata(reference_image)
         execution = _value(self.runtime_config, "quality_execution", "cached")
         decoder = _value(self.runtime_config, "quality_jpeg_decoder", "pillow")
         if execution not in {"cached", "memory", "streaming"}:
@@ -560,10 +589,15 @@ class QualityFusionBackend(FusionBackend):
         residuals = None
         if _value(self.runtime_config, "registration_diagnostics", False):
             from .registration_diagnostics import RegistrationResiduals
-            residuals = RegistrationResiduals(
-                raw_reference if raw_reference is not None and _same_path(paths[fusion_reference], reference_path)
-                else load_source(reference_path)
-            )
+            if raw_reference is not None and _same_path(paths[fusion_reference], reference_path):
+                residual_ref = raw_reference
+            elif _same_path(paths[fusion_reference], reference_path):
+                residual_ref = load_source(reference_path)
+                seeded_source[fusion_reference] = residual_ref
+            else:
+                residual_ref = load_source(reference_path)
+            residuals = RegistrationResiduals(residual_ref)
+            del residual_ref
         if use_gain:
             from .exposure_gain import ExposureGain
             global_index = indices[fusion_reference]
@@ -573,6 +607,7 @@ class QualityFusionBackend(FusionBackend):
         del raw_reference
         diagnostic("quality_variant", variant=variant, fusion_reference_index=fusion_reference)
         pass_number = 1
+        identity_matrix = np.eye(3, dtype=np.float32)
 
         def load_aligned(local):
             index, path = indices[local], paths[local]
@@ -593,10 +628,14 @@ class QualityFusionBackend(FusionBackend):
                     raise RuntimeError("second Quality pass lacks the first pass brightness gain")
                 source = gain_model.apply(local, source, full_matrix)
             with stage("warp", frame=local, pass_index=pass_number):
-                aligned = cv2.warpPerspective(
-                    source, full_matrix, (width, height), flags=cv2.INTER_LANCZOS4,
-                    borderMode=cv2.BORDER_REFLECT_101,
-                )
+                if (source.shape[0] == height and source.shape[1] == width
+                        and np.array_equal(full_matrix, identity_matrix)):
+                    aligned = source
+                else:
+                    aligned = cv2.warpPerspective(
+                        source, full_matrix, (width, height), flags=cv2.INTER_LANCZOS4,
+                        borderMode=cv2.BORDER_REFLECT_101,
+                    )
             if residuals is not None and pass_number == 1:
                 try:
                     residuals.measure(aligned, local, full_matrix, source.shape[:2])
@@ -613,7 +652,11 @@ class QualityFusionBackend(FusionBackend):
                 load_aligned, max_bytes=0 if execution == "streaming" else self.aligned_cache_bytes,
                 working_bytes=width * height * 80,
                 shared_budget=process_global_cache_budget(
-                    int(_value(self.runtime_config, "fusion_cache_budget_bytes", 3 * 1024**3))),
+                    int(_value(self.runtime_config, "fusion_cache_budget_bytes", 4 * 1024**3))),
+                minimum_available_bytes=int(_value(
+                    self.runtime_config, "min_available_memory_bytes", 2 * 1024**3)),
+                minimum_available_fraction=float(_value(
+                    self.runtime_config, "min_available_memory_fraction", 0.10)),
             )
         try:
             texture = None
@@ -628,18 +671,23 @@ class QualityFusionBackend(FusionBackend):
             def observe_frame(index, rgb, gray, score):
                 nonlocal compatibility_mask
                 from .frame_features import FrameFeatures
-                features = FrameFeatures(rgb)
+                features = FrameFeatures(rgb, score=score)
                 valid = None
                 if valid_sources is not None:
-                    valid = valid_sources.observe(index, score)
-                    neutral_edges.observe(index, rgb, valid, features)
+                    with stage("quality_valid_sources", frame=index):
+                        valid = valid_sources.observe(index, score)
+                    with stage("quality_neutral_edge_observation", frame=index):
+                        neutral_edges.observe(index, rgb, valid, features)
                 if printed_guard is not None:
-                    printed_guard.observe(index, rgb, gray, score, features=features)
+                    with stage("quality_print_observation", frame=index):
+                        printed_guard.observe(index, rgb, gray, score, features=features)
                 if surface_tone is not None:
                     surface_tone.observe(index, rgb, features=features)
-                    surface_boundary.observe(index, rgb, score, valid=valid, features=features)
+                    with stage("quality_surface_boundary_observation", frame=index):
+                        surface_boundary.observe(index, rgb, score, valid=valid, features=features)
                 if texture is not None:
-                    texture.observe(index, rgb, gray, score, features=features)
+                    with stage("quality_texture_observation", frame=index):
+                        texture.observe(index, rgb, gray, score, features=features)
                 elif execution == "streaming" and index == 0:
                     from .quality_fusion import neutral_mask
                     compatibility_mask = neutral_mask(rgb, gray)
@@ -662,6 +710,8 @@ class QualityFusionBackend(FusionBackend):
                 )
             if cancel_event.is_set():
                 raise RuntimeError("Quality fusion cancelled")
+            if valid_sources is not None:
+                valid_sources.release_best()
             if texture is None:
                 if execution == "streaming":
                     from .quality_fusion import stabilize_neutral_mask
@@ -688,6 +738,11 @@ class QualityFusionBackend(FusionBackend):
             # These observers are finished. Release their large maps before
             # the cache's next memory check and the RGB blending allocations.
             surface_boundary = neutral_edges = printed_guard = valid_sources = None
+            frame_counts = np.bincount(labels.ravel(), minlength=len(paths))
+            if hasattr(cache, "discard"):
+                for unused_index in range(len(paths)):
+                    if frame_counts[unused_index] == 0:
+                        cache.discard(unused_index)
             pass_number = 2
             blend_prefetch = bool(_value(self.runtime_config, "quality_blend_prefetch", True))
 
@@ -697,7 +752,7 @@ class QualityFusionBackend(FusionBackend):
                 # turns it into sharp contours. Pure reference cores and
                 # continuous confidence avoid the old per-frame hard gates.
                 if surface_tone is not None:
-                    rgb = surface_tone.correct(rgb, index)
+                    rgb = surface_tone.correct(rgb, index, strip_rows=256)
                 return rgb
             with stage("quality_pass_2", second_decode=execution == "streaming",
                        second_warp=execution == "streaming",
@@ -716,6 +771,16 @@ class QualityFusionBackend(FusionBackend):
         if cancel_event.is_set():
             raise RuntimeError("Quality fusion cancelled")
         with stage("encoding"), Image.fromarray(result) as image:
+            from PIL import ImageOps
+            if orientation in range(2, 9):
+                image.getexif()[274] = orientation
+                ImageOps.exif_transpose(image, in_place=True)
+            if tags or orientation != 1:
+                tags[274] = 1
+                image.info["exif"] = tags.tobytes()
+                image.info["tiff_capture_tags"] = tags
+            if icc:
+                image.info["icc_profile"] = icc
             final = encode_image_output(image, output_path, config=output_config, original_path=reference_path)
         diagnostics = ("FULL_RESOLUTION_PREVIEW_ALIGNMENT", "NEUTRAL_EDGE_COHERENCE",
                        "CONVEX_FOCUS_BLEND", f"ALIGNED_CACHE_HITS:{cache.hits}/{len(paths)}",

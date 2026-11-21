@@ -232,7 +232,8 @@ class DatabaseTests(unittest.TestCase):
                     for row in database.connection.execute("PRAGMA table_info(images)")
                 }
                 self.assertTrue({"pending_path", "archive_operation_id", "archive_error"}.issubset(image_columns))
-                self.assertEqual(database.connection.execute("PRAGMA user_version").fetchone()[0], 4)
+                self.assertEqual(database.connection.execute("PRAGMA user_version").fetchone()[0], 5)
+                self.assertIn("source_root", {r["name"] for r in database.connection.execute("PRAGMA table_info(jobs)")})
                 group_columns = {
                     row["name"] for row in database.connection.execute("PRAGMA table_info(groups)")
                 }

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass
 import os
 import threading
-from typing import Any, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 from .memory import MemorySnapshot, memory_snapshot
 
@@ -14,6 +16,74 @@ from .memory import MemorySnapshot, memory_snapshot
 AUTO_FOCUS_ANALYSIS_WORKERS = 4
 MAX_FOCUS_ANALYSIS_WORKERS = 10
 FOCUS_ANALYSIS_WORKER_BYTES = 256 * 1024**2
+
+
+@contextmanager
+def bounded_image_map(
+    function: Callable[[Any], Any],
+    values: Iterable[Any],
+    *,
+    workers: int,
+    cancel_event: threading.Event,
+    ordered: bool = True,
+) -> Iterator[Iterator[Any]]:
+    """Yield results with at most ``workers`` futures alive.
+
+    Submitting the complete group at once would let completed futures retain a
+    full decoded frame or focus map while an earlier item is still running.
+    This sliding window keeps transient memory proportional to concurrency.
+    """
+
+    iterator = iter(values)
+    if workers <= 1:
+        def serial() -> Iterator[Any]:
+            for value in iterator:
+                if cancel_event.is_set():
+                    raise RuntimeError("selection cancelled")
+                yield function(value)
+
+        yield serial()
+        return
+
+    executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="focus-analysis")
+    pending: deque[Future[Any]] = deque()
+
+    def submit_one() -> bool:
+        if cancel_event.is_set():
+            raise RuntimeError("selection cancelled")
+        try:
+            value = next(iterator)
+        except StopIteration:
+            return False
+        pending.append(executor.submit(function, value))
+        return True
+
+    try:
+        for _ in range(workers):
+            if not submit_one():
+                break
+
+        def parallel() -> Iterator[Any]:
+            while pending:
+                if ordered:
+                    future = pending.popleft()
+                else:
+                    done, remaining = wait(pending, return_when=FIRST_COMPLETED)
+                    future = next(iter(done))
+                    pending.remove(future)
+                    del done, remaining
+                result = future.result()
+                if cancel_event.is_set():
+                    raise RuntimeError("selection cancelled")
+                yield result
+                del result, future
+                submit_one()
+
+        yield parallel()
+    finally:
+        for future in pending:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
 
 
 @dataclass(frozen=True, slots=True)

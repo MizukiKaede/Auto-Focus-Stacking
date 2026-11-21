@@ -7,6 +7,7 @@ from pathlib import Path
 import time
 from typing import Any, Callable, Iterable
 
+from ..config import LOW_MEMORY_PRESET, NORMAL_MEMORY_PRESET
 from ..pipeline.application_controller import ApplicationController
 from ..pipeline.coordinator import PipelineCoordinator, PipelineSummary
 from ..pipeline.events import PipelineEvent
@@ -24,6 +25,7 @@ try:  # PySide6 remains optional for headless tests and package imports.
         QApplication,
         QCheckBox,
         QComboBox,
+        QDoubleSpinBox,
         QFileDialog,
         QFormLayout,
         QFrame,
@@ -46,6 +48,47 @@ try:  # PySide6 remains optional for headless tests and package imports.
 
     _SUPPORTED_EXTENSIONS = {".jpg", ".jpeg"}
     _OTHER_PHOTO_EXTENSIONS = {".tif", ".tiff", ".png", ".arw", ".cr2", ".cr3", ".nef", ".dng", ".orf", ".rw2"}
+
+    from .background import LatestRead
+
+    def _folder_summary(path, recursive, hidden, excluded, *, cancelled):
+        excluded = {folder.resolve() for folder in excluded}
+        stack = [path]
+        jpg = other = size = seen = 0
+        while stack and seen < 15000:
+            with os.scandir(stack.pop()) as entries:
+                for entry in entries:
+                    if cancelled.is_set():
+                        return None
+                    if not hidden and entry.name.startswith("."):
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        if recursive and entry.name != ".stack_cache":
+                            child = Path(entry.path)
+                            attributes = getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
+                            if child.resolve() not in excluded and not attributes & 0x400:
+                                stack.append(child)
+                        continue
+                    seen += 1
+                    extension = os.path.splitext(entry.name)[1].lower()
+                    if extension in _SUPPORTED_EXTENSIONS and entry.is_file():
+                        jpg += 1
+                        size += entry.stat().st_size
+                    elif extension in _OTHER_PHOTO_EXTENSIONS:
+                        other += 1
+                    if seen >= 15000:
+                        break
+        if jpg:
+            message = f"发现 {jpg} 张 JPG · 约 {size / 1024**2:.1f} MB"
+            if other:
+                message += f"（另 {other} 个非 JPG）"
+        elif other:
+            message = f"检测到 {other} 个非 JPG 文件（当前仅扫描 JPG/JPEG）"
+        else:
+            message = "未检测到 JPG 照片" + ("" if recursive else "（可尝试递归扫描）")
+        if seen >= 15000:
+            message += " · 已达预检上限"
+        return message, (path / "stack_groups.json").is_file(), jpg
 
     class _SignalBridge(QObject):
         event = Signal(object)
@@ -74,6 +117,15 @@ try:  # PySide6 remains optional for headless tests and package imports.
             self._theme_name = "light"
             self._tokens: ThemeTokens = apply_theme(self, self._theme_name)
 
+            self._last_output = None
+            self._run_output = None
+            self._source_valid = False
+            self._folder_read = LatestRead(self)
+            self._folder_read.ready.connect(self._show_folder_summary)
+            self._inspect_timer = QTimer(self)
+            self._inspect_timer.setSingleShot(True)
+            self._inspect_timer.setInterval(180)
+            self._inspect_timer.timeout.connect(self._read_source_folder)
             self._stopping = False
             self._elapsed_timer = QTimer(self)
             self._elapsed_timer.setSingleShot(True)
@@ -82,6 +134,7 @@ try:  # PySide6 remains optional for headless tests and package imports.
             self._start_timestamp: float | None = None
             self._last_displayed_second: int = -1
             self._hugin_probed = False
+            self._ai_probed = False
 
             self.controller = controller
             self._controller_was_injected = controller is not None
@@ -372,13 +425,24 @@ try:  # PySide6 remains optional for headless tests and package imports.
 
             self.backend_combo = QComboBox()
             self.backend_combo.setObjectName("fusionBackend")
-            self.backend_combo.addItem("高质量合成引擎（全分辨率内存融合·推荐）", "quality")
-            self.backend_combo.addItem("Fast 快速合成（C++）", "fast")
+            self.backend_combo.addItem("AI 智能合成（StackMFF-V3·推荐）", "ai")
+            self.backend_combo.addItem("高质量合成引擎（全分辨率内存融合）", "quality")
             self.backend_combo.addItem("实验模式（Hugin 对齐 / Enfuse 合成）", "hugin_enfuse")
-            self.backend_combo.setToolTip("高质量：全分辨率对齐与边缘一致性融合；Fast：快速焦点融合；实验：Hugin/Enfuse")
+            self.backend_combo.setToolTip(
+                "AI：StackMFF-V3 多尺度神经网络融合（默认推荐，基于 onnxruntime-directml，"
+                "如已安装 onnxruntime-gpu 且本机带 CUDA 12 则自动优先 CUDAExecutionProvider）；"
+                "高质量：全分辨率对齐与边缘一致性融合；实验：Hugin/Enfuse"
+            )
             self.backend_combo.setCurrentIndex(0)
             self.backend_combo.currentIndexChanged.connect(self._on_backend_changed)
             advanced_form.addRow("合成引擎", self.backend_combo)
+
+            self.ai_status_label = QLabel()
+            self.ai_status_label.setObjectName("aiRuntimeStatus")
+            self.ai_status_label.setProperty("role", "hint")
+            self.ai_status_label.setWordWrap(True)
+            self.ai_status_label.hide()
+            advanced_form.addRow("", self.ai_status_label)
 
             # Optional Hugin binary locator / override
             self.hugin_container = QWidget()
@@ -403,18 +467,62 @@ try:  # PySide6 remains optional for headless tests and package imports.
             hugin_layout.addLayout(hugin_row)
             advanced_form.addRow("Hugin 工具目录（可选）", self.hugin_container)
 
+            self.low_memory_check = QCheckBox("低内存模式（安全红线 1.0 GiB）")
+            self.low_memory_check.setObjectName("lowMemoryMode")
+            self.low_memory_check.setChecked(False)
+            self.low_memory_check.setToolTip(
+                "勾选后自动应用低内存默认设置（单组融合、关闭流水线并行、全局缓存 1.0 GiB、单组缓存 0.5 GiB、安全内存红线 1.0 GiB）；取消勾选恢复正常内存默认设置"
+            )
+            advanced_form.addRow("内存模式", self.low_memory_check)
+
+            self.memory_redline_label = QLabel()
+            self.memory_redline_label.setObjectName("memoryRedlineHint")
+            self.memory_redline_label.setProperty("role", "hint")
+            self.memory_redline_label.setWordWrap(True)
+            advanced_form.addRow("", self.memory_redline_label)
+
             self.merge_workers_spin = QSpinBox()
             self.merge_workers_spin.setObjectName("mergeWorkers")
             self.merge_workers_spin.setRange(1, 6)
-            self.merge_workers_spin.setValue(3)
-            self.merge_workers_spin.setToolTip("同时处理的合成组数；组数越多，占用内存与磁盘带宽越高")
+            self.merge_workers_spin.setValue(int(NORMAL_MEMORY_PRESET["merge_workers"]))
+            self.merge_workers_spin.setToolTip("同时处理的合成组数上限；组数越多，占用内存与磁盘带宽越高")
             advanced_form.addRow("并发合成组数", self.merge_workers_spin)
+
+            self.auto_merge_workers_check = QCheckBox("按可用内存自动降并发")
+            self.auto_merge_workers_check.setObjectName("autoMergeWorkers")
+            self.auto_merge_workers_check.setChecked(bool(NORMAL_MEMORY_PRESET["auto_merge_workers"]))
+            self.auto_merge_workers_check.setToolTip(
+                "开启后，当系统可用内存不足以支撑所设并发合成组数时自动向下收敛（最低 1 组），所设组数作为上限"
+            )
+            advanced_form.addRow("", self.auto_merge_workers_check)
+
+            self.global_cache_spin = QDoubleSpinBox()
+            self.global_cache_spin.setObjectName("globalAlignedCacheGiB")
+            self.global_cache_spin.setRange(0.0, 64.0)
+            self.global_cache_spin.setDecimals(2)
+            self.global_cache_spin.setSingleStep(0.5)
+            self.global_cache_spin.setSuffix(" GiB")
+            self.global_cache_spin.setSpecialValueText("关闭（流式重载）")
+            self.global_cache_spin.setValue(NORMAL_MEMORY_PRESET["fusion_cache_budget_bytes"] / 1024**3)
+            self.global_cache_spin.setToolTip("进程内所有并发融合组共享的对齐帧总缓存上限（0 表示关闭缓存）")
+            advanced_form.addRow("全局共享对齐缓存", self.global_cache_spin)
+
+            self.group_cache_spin = QDoubleSpinBox()
+            self.group_cache_spin.setObjectName("groupAlignedCacheGiB")
+            self.group_cache_spin.setRange(0.0, 32.0)
+            self.group_cache_spin.setDecimals(2)
+            self.group_cache_spin.setSingleStep(0.25)
+            self.group_cache_spin.setSuffix(" GiB")
+            self.group_cache_spin.setSpecialValueText("关闭（流式重载）")
+            self.group_cache_spin.setValue(NORMAL_MEMORY_PRESET["opencv_aligned_cache_bytes"] / 1024**3)
+            self.group_cache_spin.setToolTip("单个堆栈组在融合期间最多保留的对齐帧缓存上限（0 表示关闭缓存）")
+            advanced_form.addRow("单组对齐缓存上限", self.group_cache_spin)
 
             self.focus_analysis_workers_spin = QSpinBox()
             self.focus_analysis_workers_spin.setObjectName("focusAnalysisWorkers")
             self.focus_analysis_workers_spin.setRange(0, 10)
             self.focus_analysis_workers_spin.setSpecialValueText("自动推荐")
-            self.focus_analysis_workers_spin.setValue(0)
+            self.focus_analysis_workers_spin.setValue(int(NORMAL_MEMORY_PRESET["focus_analysis_workers"]))
             self.focus_analysis_workers_spin.setSuffix(" 张")
             self.focus_analysis_workers_spin.setToolTip("同时进行焦点分析的最大图片数；0 表示按 CPU 与可用内存自动分配")
             advanced_form.addRow("并发焦点分析", self.focus_analysis_workers_spin)
@@ -464,12 +572,18 @@ try:  # PySide6 remains optional for headless tests and package imports.
                 self.minimum_group_spin,
                 self.grouping_pause_spin,
                 self.merge_workers_spin,
+                self.global_cache_spin,
+                self.group_cache_spin,
                 self.focus_analysis_workers_spin,
             ):
                 spin.setMinimumWidth(0)
                 spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            self.low_memory_check.toggled.connect(self._on_low_memory_toggled)
+            self._update_memory_redline_hint()
             self.source_edit.textChanged.connect(self._inspect_source_folder)
-            self.output_edit.textChanged.connect(lambda _: self._sync_output_dir())
+            self.output_edit.textChanged.connect(lambda _: self._inspect_source_folder(self.source_edit.text()))
+            self.archive_edit.textChanged.connect(lambda _: self._inspect_source_folder(self.source_edit.text()))
+            self.archive_check.toggled.connect(self._update_archive_step)
             self.hugin_bin_edit.textChanged.connect(lambda _: self._probe_hugin_status())
 
             # Pinned Action Footer on Left Rail
@@ -482,6 +596,7 @@ try:  # PySide6 remains optional for headless tests and package imports.
             self.start_button = QPushButton("开始处理")
             self.start_button.setObjectName("startButton")
             self.start_button.clicked.connect(self.start_processing)
+            self.start_button.setEnabled(False)
 
             self.stop_button = QPushButton("停止")
             self.stop_button.setObjectName("stopButton")
@@ -562,10 +677,37 @@ try:  # PySide6 remains optional for headless tests and package imports.
             self.advanced_toggle.setText("高级与性能设置 · 收起" if checked else "高级与性能设置 · 展开")
             if checked and not self._hugin_probed:
                 self._probe_hugin_status()
+            if checked and self.backend_combo.currentData() == "ai":
+                self._probe_ai_status()
 
         def _on_backend_changed(self) -> None:
-            if self.backend_combo.currentData() == "hugin_enfuse":
+            current = self.backend_combo.currentData()
+            if current == "hugin_enfuse":
                 self._probe_hugin_status()
+            if current == "ai":
+                self._probe_ai_status()
+            else:
+                self.ai_status_label.hide()
+
+        def _probe_ai_status(self) -> None:
+            self._ai_probed = True
+            t = self._tokens
+            self.ai_status_label.show()
+            try:
+                from ..fusion.ai_runtime import probe_ai_runtime
+
+                status = probe_ai_runtime()
+                self.ai_status_label.setText(status.status_text)
+                if not status.available:
+                    color = t.warning
+                elif status.active_provider in {"CUDA", "DIRECTML"}:
+                    color = t.success
+                else:
+                    color = t.text_muted
+                self.ai_status_label.setStyleSheet(f"color: {color}; font-size: 11px;")
+            except Exception:
+                self.ai_status_label.setText("AI 推理引擎状态检测不可用")
+                self.ai_status_label.setStyleSheet(f"color: {t.text_muted}; font-size: 11px;")
 
         def _probe_hugin_status(self) -> None:
             self._hugin_probed = True
@@ -586,111 +728,51 @@ try:  # PySide6 remains optional for headless tests and package imports.
                 self.hugin_status_label.setText("Hugin 工具检测不可用")
                 self.hugin_status_label.setStyleSheet(f"color: {t.text_muted}; font-size: 11px;")
 
+        def _update_archive_step(self, enabled):
+            self.progress_panel.step_labels[-1].setText("5. 原图归档" if enabled else "5. 完成")
+
         def _sync_output_dir(self) -> None:
+            if self._run_output is not None or self._last_output is not None:
+                return
             if self.source_edit.text().strip() or self.output_edit.text().strip():
                 self.group_list.set_output_directory(self.output_directory)
             else:
                 self.group_list.set_output_directory(None)
 
         def _inspect_source_folder(self, text: str) -> None:
-            t = self._tokens
-            path_str = text.strip()
+            self._inspect_timer.stop()
+            self._folder_read.invalidate()
             self._sync_output_dir()
-            if not path_str:
-                self.folder_stats_label.setText("支持将照片文件夹直接拖入窗口")
-                self.folder_stats_label.setStyleSheet(f"color: {t.text_muted}; font-size: 11px;")
-                self.manual_groups_label.hide()
-                return
-            path = Path(path_str)
-            if not path.is_dir():
-                self.folder_stats_label.setText("目录不存在或无法访问")
-                self.folder_stats_label.setStyleSheet(f"color: {t.danger}; font-size: 11px;")
-                self.manual_groups_label.hide()
-                return
-
-            manual_file = path / "stack_groups.json"
-            if manual_file.is_file():
-                self.manual_groups_label.setText("已检测到手动分组文件 stack_groups.json")
-                self.manual_groups_label.setStyleSheet(f"color: {t.accent_text}; font-size: 11px; font-weight: 600;")
-                self.manual_groups_label.show()
+            self.manual_groups_label.hide()
+            self._source_valid = False
+            self.group_list.empty_browse_btn.setDefault(True)
+            self.start_button.setEnabled(False)
+            if text.strip():
+                self.folder_stats_label.setText("正在检查照片目录…")
+                self._inspect_timer.start()
             else:
-                self.manual_groups_label.hide()
+                self.folder_stats_label.setText("支持将照片文件夹直接拖入窗口")
+            self.folder_stats_label.setStyleSheet(f"color: {self._tokens.text_muted};")
 
-            recursive = self.recursive_check.isChecked()
-            include_hidden = self.include_hidden_check.isChecked()
-            excluded_dirs = {".stack_cache"}
-            for d in (self.output_directory, self.archive_directory):
-                try:
-                    excluded_dirs.add(str(d.resolve(strict=False)).casefold())
-                except Exception:
-                    pass
+        def _read_source_folder(self):
+            self._folder_read.submit(
+                _folder_summary, self.source_directory, self.recursive_check.isChecked(),
+                self.include_hidden_check.isChecked(), (self.output_directory, self.archive_directory),
+            )
 
-            jpg_count = 0
-            other_photo_count = 0
-            total_bytes = 0
-            scanned_cap = 15000
-            seen_entries = 0
-
-            try:
-                if recursive:
-                    for base, dirs, files in os.walk(path):
-                        dirs[:] = [
-                            d for d in dirs
-                            if d != ".stack_cache"
-                            and (include_hidden or not d.startswith("."))
-                            and str((Path(base) / d).resolve(strict=False)).casefold() not in excluded_dirs
-                        ]
-                        for name in files:
-                            seen_entries += 1
-                            if seen_entries > scanned_cap:
-                                break
-                            if not include_hidden and name.startswith("."):
-                                continue
-                            ext = os.path.splitext(name)[1].lower()
-                            if ext in _SUPPORTED_EXTENSIONS:
-                                jpg_count += 1
-                                try:
-                                    total_bytes += (Path(base) / name).stat().st_size
-                                except OSError:
-                                    pass
-                            elif ext in _OTHER_PHOTO_EXTENSIONS:
-                                other_photo_count += 1
-                        if seen_entries > scanned_cap:
-                            break
-                else:
-                    for entry in os.scandir(path):
-                        if entry.is_file():
-                            if not include_hidden and entry.name.startswith("."):
-                                continue
-                            ext = os.path.splitext(entry.name)[1].lower()
-                            if ext in _SUPPORTED_EXTENSIONS:
-                                jpg_count += 1
-                                try:
-                                    total_bytes += entry.stat().st_size
-                                except OSError:
-                                    pass
-                            elif ext in _OTHER_PHOTO_EXTENSIONS:
-                                other_photo_count += 1
-
-                if jpg_count > 0:
-                    size_mb = total_bytes / (1024 * 1024)
-                    msg = f"发现 {jpg_count} 张 JPG · 约 {size_mb:.1f} MB"
-                    if other_photo_count > 0:
-                        msg += f"（另 {other_photo_count} 个非 JPG）"
-                    if seen_entries > scanned_cap:
-                        msg += " · 已达预检上限"
-                    self.folder_stats_label.setText(msg)
-                    self.folder_stats_label.setStyleSheet(f"color: {t.accent_text}; font-size: 11px; font-weight: 600;")
-                elif other_photo_count > 0:
-                    self.folder_stats_label.setText(f"检测到 {other_photo_count} 个非 JPG 文件（当前仅扫描 JPG/JPEG）")
-                    self.folder_stats_label.setStyleSheet(f"color: {t.warning}; font-size: 11px;")
-                else:
-                    hint = "未检测到 JPG 照片" + ("" if recursive else "（可尝试勾选“包含子文件夹”）")
-                    self.folder_stats_label.setText(hint)
-                    self.folder_stats_label.setStyleSheet(f"color: {t.text_muted}; font-size: 11px;")
-            except Exception:
-                self.folder_stats_label.setText("目录已就绪")
-                self.folder_stats_label.setStyleSheet(f"color: {t.text_muted}; font-size: 11px;")
+        def _show_folder_summary(self, result, error):
+            if error:
+                self.folder_stats_label.setText(f"目录预检失败：{error}")
+                return
+            self._source_valid = True
+            self.group_list.empty_browse_btn.setDefault(False)
+            self.start_button.setEnabled(self._run_output is None)
+            message, manual, jpg_count = result
+            self.folder_stats_label.setText(message)
+            color = self._tokens.accent_text if jpg_count else self._tokens.text_muted
+            self.folder_stats_label.setStyleSheet(f"color: {color};")
+            self.manual_groups_label.setText("已检测到手动分组文件 stack_groups.json")
+            self.manual_groups_label.setVisible(manual)
 
         def _open_source_folder(self) -> None:
             path_str = self.source_edit.text().strip()
@@ -703,6 +785,9 @@ try:  # PySide6 remains optional for headless tests and package imports.
                 QDesktopServices.openUrl(QUrl.fromLocalFile(str(out_dir)))
 
         def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+            if self._run_output is not None:
+                event.ignore()
+                return
             if event.mimeData().hasUrls():
                 for url in event.mimeData().urls():
                     if Path(url.toLocalFile()).is_dir():
@@ -716,6 +801,9 @@ try:  # PySide6 remains optional for headless tests and package imports.
             super().dragLeaveEvent(event)
 
         def dropEvent(self, event: QDropEvent) -> None:
+            if self._run_output is not None:
+                event.ignore()
+                return
             self.group_list.set_drag_active(False)
             for url in event.mimeData().urls():
                 local_path = url.toLocalFile()
@@ -725,6 +813,8 @@ try:  # PySide6 remains optional for headless tests and package imports.
                     return
 
         def _set_source_path(self, value: str) -> None:
+            if self._run_output is not None:
+                return
             previous_source = self.source_edit.text().strip()
             output_value = self.output_edit.text().strip()
             archive_value = self.archive_edit.text().strip()
@@ -756,16 +846,22 @@ try:  # PySide6 remains optional for headless tests and package imports.
             return Path(value) if value else self.source_directory / "归档"
 
         def choose_source(self) -> None:
+            if self._run_output is not None:
+                return
             value = QFileDialog.getExistingDirectory(self, "选择源文件夹", self.source_edit.text())
             if value:
                 self._set_source_path(value)
 
         def choose_output(self) -> None:
+            if self._run_output is not None:
+                return
             value = QFileDialog.getExistingDirectory(self, "选择合成结果目录", self.output_edit.text())
             if value:
                 self.output_edit.setText(value)
 
         def choose_archive(self) -> None:
+            if self._run_output is not None:
+                return
             value = QFileDialog.getExistingDirectory(self, "选择原图归档目录", self.archive_edit.text())
             if value:
                 self.archive_edit.setText(value)
@@ -778,6 +874,29 @@ try:  # PySide6 remains optional for headless tests and package imports.
         def set_groups(self, groups: Iterable[Any]) -> None:
             self._groups = list(groups)
 
+        def _apply_memory_preset(self, low_memory: bool) -> None:
+            preset = LOW_MEMORY_PRESET if low_memory else NORMAL_MEMORY_PRESET
+            self.merge_workers_spin.setValue(int(preset["merge_workers"]))
+            self.auto_merge_workers_check.setChecked(bool(preset["auto_merge_workers"]))
+            self.parallel_check.setChecked(bool(preset["parallel"]))
+            self.focus_analysis_workers_spin.setValue(int(preset["focus_analysis_workers"]))
+            self.global_cache_spin.setValue(float(preset["fusion_cache_budget_bytes"]) / 1024**3)
+            self.group_cache_spin.setValue(float(preset["opencv_aligned_cache_bytes"]) / 1024**3)
+            self._update_memory_redline_hint()
+
+        def _update_memory_redline_hint(self) -> None:
+            if self.low_memory_check.isChecked():
+                self.memory_redline_label.setText(
+                    "当前安全内存红线：1.0 GiB（低内存预设，下方参数仍可微调）"
+                )
+            else:
+                self.memory_redline_label.setText(
+                    "当前安全内存红线：2.0 GiB / 10%（正常内存预设）"
+                )
+
+        def _on_low_memory_toggled(self, checked: bool) -> None:
+            self._apply_memory_preset(bool(checked))
+
         def _reset_defaults(self) -> None:
             self.recursive_check.setChecked(False)
             self.include_hidden_check.setChecked(False)
@@ -788,9 +907,10 @@ try:  # PySide6 remains optional for headless tests and package imports.
             self.format_combo.setCurrentIndex(0)
             self.backend_combo.setCurrentIndex(0)
             self.hugin_bin_edit.clear()
-            self.merge_workers_spin.setValue(3)
-            self.focus_analysis_workers_spin.setValue(0)
-            self.parallel_check.setChecked(True)
+            self.low_memory_check.blockSignals(True)
+            self.low_memory_check.setChecked(False)
+            self.low_memory_check.blockSignals(False)
+            self._apply_memory_preset(False)
             self.cache_check.setChecked(False)
             self.notify_check.setChecked(True)
             self._save_settings()
@@ -809,6 +929,10 @@ try:  # PySide6 remains optional for headless tests and package imports.
                 "output_format": self.format_combo.currentData(),
                 "parallel": self.parallel_check.isChecked(),
                 "merge_workers": self.merge_workers_spin.value(),
+                "auto_merge_workers": self.auto_merge_workers_check.isChecked(),
+                "fusion_cache_budget_bytes": int(round(self.global_cache_spin.value() * 1024**3)),
+                "opencv_aligned_cache_bytes": int(round(self.group_cache_spin.value() * 1024**3)),
+                "low_memory_mode": self.low_memory_check.isChecked(),
                 "focus_analysis_workers": self.focus_analysis_workers_spin.value(),
                 "preserve_cache": self.cache_check.isChecked(),
                 "recursive": self.recursive_check.isChecked(),
@@ -852,7 +976,12 @@ try:  # PySide6 remains optional for headless tests and package imports.
             if idx >= 0:
                 self.format_combo.setCurrentIndex(idx)
 
-            backend = str(store.value("runtime/fusion_backend", "quality"))
+            from ..fusion_modes import normalize_fusion_backend
+
+            try:
+                backend = normalize_fusion_backend(str(store.value("runtime/fusion_backend", "ai")))
+            except ValueError:
+                backend = "ai"
             idx = self.backend_combo.findData(backend)
             if idx >= 0:
                 self.backend_combo.setCurrentIndex(idx)
@@ -862,9 +991,27 @@ try:  # PySide6 remains optional for headless tests and package imports.
             if idx >= 0:
                 self.archive_combo.setCurrentIndex(idx)
 
-            self.merge_workers_spin.setValue(int(store.value("runtime/merge_workers", 3)))
-            self.focus_analysis_workers_spin.setValue(int(store.value("runtime/focus_analysis_workers", 0)))
-            self.parallel_check.setChecked(self._as_bool(store.value("runtime/parallel", True)))
+            low_memory = self._as_bool(store.value("runtime/low_memory_mode", False))
+            self.low_memory_check.blockSignals(True)
+            self.low_memory_check.setChecked(low_memory)
+            self.low_memory_check.blockSignals(False)
+            preset = LOW_MEMORY_PRESET if low_memory else NORMAL_MEMORY_PRESET
+
+            self.merge_workers_spin.setValue(int(store.value("runtime/merge_workers", preset["merge_workers"])))
+            self.auto_merge_workers_check.setChecked(
+                self._as_bool(store.value("runtime/auto_merge_workers", preset["auto_merge_workers"]))
+            )
+            self.global_cache_spin.setValue(
+                float(store.value("runtime/fusion_cache_budget_gib", preset["fusion_cache_budget_bytes"] / 1024**3))
+            )
+            self.group_cache_spin.setValue(
+                float(store.value("runtime/opencv_aligned_cache_gib", preset["opencv_aligned_cache_bytes"] / 1024**3))
+            )
+            self.focus_analysis_workers_spin.setValue(
+                int(store.value("runtime/focus_analysis_workers", preset["focus_analysis_workers"]))
+            )
+            self.parallel_check.setChecked(self._as_bool(store.value("runtime/parallel", preset["parallel"])))
+            self._update_memory_redline_hint()
             self.cache_check.setChecked(self._as_bool(store.value("runtime/preserve_cache", False)))
             self.notify_check.setChecked(self._as_bool(store.value("ui/notify_on_complete", True)))
 
@@ -884,7 +1031,11 @@ try:  # PySide6 remains optional for headless tests and package imports.
             store.setValue("stack/output_format", self.format_combo.currentData())
             store.setValue("runtime/fusion_backend", self.backend_combo.currentData())
             store.setValue("archive/mode", self.archive_combo.currentData())
+            store.setValue("runtime/low_memory_mode", self.low_memory_check.isChecked())
             store.setValue("runtime/merge_workers", self.merge_workers_spin.value())
+            store.setValue("runtime/auto_merge_workers", self.auto_merge_workers_check.isChecked())
+            store.setValue("runtime/fusion_cache_budget_gib", self.global_cache_spin.value())
+            store.setValue("runtime/opencv_aligned_cache_gib", self.group_cache_spin.value())
             store.setValue("runtime/focus_analysis_workers", self.focus_analysis_workers_spin.value())
             store.setValue("runtime/parallel", self.parallel_check.isChecked())
             store.setValue("runtime/preserve_cache", self.cache_check.isChecked())
@@ -935,10 +1086,13 @@ try:  # PySide6 remains optional for headless tests and package imports.
 
         @Slot()
         def start_processing(self) -> None:
+            if self._run_output is not None:
+                return
             if not self.source_edit.text().strip():
                 QMessageBox.warning(self, "缺少目录", "请先选择原照片文件夹。")
                 return
             self._save_settings()
+            self._run_output = self.output_directory.absolute()
             try:
                 if self.controller_factory is not None:
                     self._retire_worker(self.controller)
@@ -958,6 +1112,7 @@ try:  # PySide6 remains optional for headless tests and package imports.
                     self.coordinator.complete_callback = self._bridge.completed.emit
                     self.coordinator.start(self._groups)
             except Exception as exc:
+                self._run_output = None
                 self._set_run_status("无法开始", tone="error")
                 self.statusBar().showMessage("无法开始处理，请检查目录和参数设置")
                 QMessageBox.critical(self, "无法开始", str(exc))
@@ -1022,7 +1177,7 @@ try:  # PySide6 remains optional for headless tests and package imports.
             self.timer_label.setText(self._format_hms(elapsed, round_final=True))
 
             self.settings_content.setEnabled(True)
-            self.start_button.setEnabled(True)
+            self.start_button.setEnabled(self._source_valid)
             self.start_button.setText("开始处理")
             self.stop_button.setEnabled(False)
             self.stop_button.setIcon(themed_icon("stop.svg", self._tokens.text_disabled, 13))
@@ -1031,13 +1186,18 @@ try:  # PySide6 remains optional for headless tests and package imports.
             if callable(complete):
                 complete(summary)
 
-            self.group_list.set_output_directory(self.output_directory)
+            self._last_output = self._run_output or self.output_directory
+            self.group_list.set_output_directory(self._last_output)
+            self._run_output = None
             self.group_list.update_results(summary.results)
             if not summary.results:
                 self.group_list.set_empty_message("已取消，本次没有结果" if summary.cancelled else "本次没有可显示的结果")
 
             if summary.cancelled:
                 self._set_run_status("已取消", tone="cancelled")
+                diagnostics = list(getattr(summary, "diagnostics", ()) or ())
+                if diagnostics:
+                    self.progress_panel.set_message("\n".join(map(str, diagnostics)))
                 self.statusBar().showMessage("已取消")
             elif int(getattr(summary, "errors", 0) or 0) > 0:
                 count = int(getattr(summary, "errors", 0) or 0)
@@ -1056,6 +1216,8 @@ try:  # PySide6 remains optional for headless tests and package imports.
 
         def closeEvent(self, event: Any) -> None:
             self._elapsed_timer.stop()
+            self._inspect_timer.stop()
+            self._folder_read.invalidate()
             self._save_settings()
             if self.controller is not None and self.controller.running:
                 self.controller.cancel()

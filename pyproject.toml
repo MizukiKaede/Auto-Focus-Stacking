@@ -15,10 +15,13 @@ dependencies = [
   "Pillow>=10.0",
   "psutil>=5.9",
   "PySide6>=6.6",
+  "onnxruntime-directml>=1.20; sys_platform == 'win32' and platform_machine == 'AMD64'",
+  "onnxruntime>=1.20; sys_platform != 'win32' or platform_machine != 'AMD64'",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.4", "pytest-cov>=4.1"]
+cuda = ["onnxruntime-gpu>=1.20"]
 
 [project.scripts]
 focus-stack = "focus_stack_app.app:main"
@@ -27,8 +30,8 @@ focus-stack = "focus_stack_app.app:main"
 include = ["focus_stack_app*"]
 
 [tool.setuptools.package-data]
-"focus_stack_app.ui" = ["icons/*.svg", "icons/*.ico"]
-"focus_stack_app.fusion" = ["*.dll", "*.cpp", "*.h", "build_manifest.json", "native_runtime_licenses/*"]
+"focus_stack_app.ui" = ["icons/*.svg"]
+"focus_stack_app.fusion" = ["*.dll", "*.cpp", "*.h", "build_manifest.json", "native_runtime_licenses/*", "weights/*.onnx"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

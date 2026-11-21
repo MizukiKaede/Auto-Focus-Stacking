@@ -10,11 +10,13 @@ import logging
 import os
 from pathlib import Path
 import shutil
+import stat
 import threading
 from typing import Any, Callable, Iterable, Mapping, Sequence
 import uuid
 
-from ..files.archiver import ArchiveResult, FileArchiver
+from ..files.archiver import ArchiveError, ArchiveMode, ArchiveResult, FileArchiver
+from ..files.collision import resolve_destination
 from ..hugin.align import AlignImageStack, AlignmentError
 from ..hugin.enfuse import Enfuser, EnfuseError
 from ..hugin.hugin_locator import HuginToolNotFound
@@ -42,7 +44,7 @@ class MergeResult:
     all_paths: tuple[Path, ...] = ()
     selected_source_paths: tuple[Path, ...] = ()
     first_original: Path | None = None
-    requested_backend: str = "quality"
+    requested_backend: str = "ai"
     actual_backend: str | None = None
     fallback_used: bool = False
     alignment_level: int | None = None
@@ -247,6 +249,8 @@ def extract_image_paths(group: Any, analysis: Any = None) -> tuple[list[Path], l
 
 
 def _set_group_state(repository: Any, group: Any, status: str, **values: Any) -> None:
+    if isinstance(group, Mapping) and group.get("_published_output") and status not in {"DONE", "FAILED_ARCHIVE"}:
+        return
     if repository is None:
         return
     gid = _group_id(group)
@@ -321,7 +325,7 @@ class StackMergeService:
         enfuse_path: os.PathLike[str] | str | None = None,
         manifest_writer: Any | None = None,
         publish_manifest: bool = True,
-        fusion_backend: str | FusionBackend = "quality",
+        fusion_backend: str | FusionBackend = "ai",
         minimum_stack_group_size: int = 4,
         logger: logging.Logger | None = None,
     ):
@@ -397,21 +401,21 @@ class StackMergeService:
             self.requested_backend = fusion_backend.name
         else:
             self.requested_backend = requested
-            if self.requested_backend == "quality":
+            if self.requested_backend == "ai":
+                from ..fusion.ai_backend import AiFusionBackend
+                self.backend = AiFusionBackend(runtime_config=runtime, logger=self.logger)
+            elif self.requested_backend == "quality":
                 self.backend = QualityFusionBackend(
                     aligned_cache_bytes=runtime_value("opencv_aligned_cache_bytes"),
                     runtime_config=(runtime.get("runtime", runtime) if isinstance(runtime, Mapping)
                                     else getattr(runtime, "runtime", runtime)),
                 )
-            elif self.requested_backend == "fast":
-                from ..fusion.fast_backend import FastFusionBackend
-                self.backend = FastFusionBackend(runtime_config=runtime)
             elif self.requested_backend == "hugin_enfuse":
                 self.backend = HuginEnfuseBackend(
                     self.aligner, self.enfuser, runtime_config=runtime, logger=self.logger,
                 )
             else:
-                raise ValueError("fusion_backend must be quality, fast or hugin_enfuse")
+                raise ValueError("fusion_backend must be ai, quality or hugin_enfuse")
         self.repository = repository
         self.cache_dir = Path(cache_dir) if cache_dir is not None else self.output_dir / ".stack_cache"
         self.temp_root = self.cache_dir / "temp"
@@ -443,6 +447,38 @@ class StackMergeService:
             manifest_writer = ManifestWriter(manifest_writer)
         self.manifest_writer = manifest_writer if publish_manifest else None
 
+    def _check_hardlink_archive(self, paths: list[Path]) -> None:
+        archiver = self.archiver
+        if (self.requested_backend not in {"ai", "quality"} or not isinstance(archiver, FileArchiver)
+                or archiver.mode is not ArchiveMode.HARDLINK):
+            return
+
+        archive_dir = archiver.destination_dir.absolute()
+        for parent in (archive_dir, *archive_dir.parents):
+            try:
+                archive_device = parent.stat().st_dev
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return
+            break
+        else:
+            return
+
+        for path in paths:
+            try:
+                source_stat = path.lstat()
+            except OSError:
+                continue
+            if not stat.S_ISREG(source_stat.st_mode) or source_stat.st_dev == archive_device:
+                continue
+            # A matching archive or a no-overwrite collision needs no new link.
+            destination, collision = resolve_destination(path, archive_dir, policy=archiver.collision_policy)
+            if collision is not None and destination == collision.destination:
+                continue
+            raise ArchiveError(f"硬链接归档要求原图和归档目录位于同一卷。原图：{path}，归档目录：{archive_dir}。"
+                               "请改用复制或移动归档，或选择同卷归档目录。")
+
     def _archive_map(self, all_objects: list[Any], all_paths: list[Path]) -> tuple[ArchiveResult, dict[str, Path]]:
         if self.archiver is None:
             raise RuntimeError("archiver is unavailable while archival is disabled")
@@ -467,6 +503,19 @@ class StackMergeService:
                 except OSError:
                     pass
         return archive, mapping
+
+    def _archive_fused_group(self, group, all_objects, all_paths):
+        archive, destinations = self._archive_map(all_objects, all_paths)
+        if archive.failed or archive.conflicts and any(
+            os.path.normcase(os.path.abspath(record.source_path)) not in destinations for record in archive.records
+        ):
+            detail = "; ".join(
+                record.error or record.source_path
+                for record in archive.records
+                if record.status in {"failed", "conflict"}
+            )
+            raise RuntimeError(f"Unable to archive group {_group_id(group)!r} after fusion: {detail}")
+        return archive
 
     def _publish_manifest(self, result: MergeResult) -> None:
         writer = self.manifest_writer
@@ -560,6 +609,26 @@ class StackMergeService:
                 except TypeError:
                     self.logger.debug("Unable to resolve first original path for group %s", _group_id(group), exc_info=True)
                 break
+        published = _value(group, "_published_output") if _value(group, "_recovery") else None
+        if published and Path(published).is_file():
+            archive = None
+            if self.archive_enabled and _value(group, "status") != "DONE":
+                self._check_hardlink_archive(all_paths)
+                archive = self._archive_fused_group(group, all_objects, all_paths)
+            _set_group_state(self.repository, group, "DONE", output_path=str(published))
+            original_paths = [Path(_value(item, "original_path", default=path))
+                              for item, path in zip(all_objects, all_paths)]
+            result = MergeResult(
+                group, "DONE", Path(published), archive_result=archive, analysis=analysis,
+                all_paths=tuple(original_paths), first_original=first_original_for_name,
+                selected_source_paths=tuple(original_paths[i] for i in _value(analysis, "selected_indices", default=())),
+                requested_backend=_value(group, "requested_backend") or self.requested_backend,
+                actual_backend=_value(group, "actual_backend"), alignment_level=_value(group, "alignment_level"),
+                alignment_status=_value(group, "alignment_status"), crop_ratio=_value(group, "crop_ratio"),
+                diagnostics=tuple(_value(group, "diagnostics") or ()),
+            )
+            self._publish_manifest(result)
+            return result
         if archive_only:
             # Classification/focus-analysis failures and successful no-merge
             # decisions leave every source in place. Only a real fused output
@@ -613,6 +682,7 @@ class StackMergeService:
             self._publish_manifest(result)
             return result
 
+        self._check_hardlink_archive(all_paths)
         work = self.temp_root / f"{_group_id(group) or 'group'}_{uuid.uuid4().hex}"
         work.mkdir(parents=True, exist_ok=True)
         self.logger.info(
@@ -663,16 +733,7 @@ class StackMergeService:
             # exists. Selected paths drive fusion; all_paths is the complete
             # source set.
             _set_group_state(self.repository, group, "ARCHIVING", output_path=str(fused_path))
-            archive, destinations = self._archive_map(all_objects, all_paths)
-            if archive.failed or archive.conflicts and any(
-                os.path.normcase(os.path.abspath(record.source_path)) not in destinations for record in archive.records
-            ):
-                detail = "; ".join(
-                    record.error or record.source_path
-                    for record in archive.records
-                    if record.status in {"failed", "conflict"}
-                )
-                raise RuntimeError(f"Unable to archive group {_group_id(group)!r} after fusion: {detail}")
+            archive = self._archive_fused_group(group, all_objects, all_paths)
 
         _set_group_state(
             self.repository, group, "DONE", output_path=str(fused_path), selected_count=len(selected_paths),
@@ -806,15 +867,16 @@ class MergeWorker(threading.Thread):
         except Exception:
             self.logger.debug("Progress callback failed", exc_info=True)
 
-    def _notify_result(self, result: Any) -> None:
+    def _notify_result(self, result: Any) -> bool:
+        """A callback can request a durable retry by explicitly returning False."""
         if self.result_callback is None:
-            return
+            return True
         try:
-            self.result_callback(result)
+            return self.result_callback(result) is not False
         except Exception:
-            # Manifest/UI callbacks are observability concerns and must not
-            # turn a successfully completed group into a merge failure.
+            # Keep legacy observers best-effort.
             self.logger.debug("Merge result callback failed", exc_info=True)
+            return True
 
     @staticmethod
     def _status(result: Any, default: str = "DONE") -> str:
@@ -840,7 +902,7 @@ class MergeWorker(threading.Thread):
         self._emit(job, message="进入合成队列")
         try:
             result = _invoke(self.merger, job, cancel_event=self.cancel_event)
-            self._notify_result(result)
+            manifest_saved = self._notify_result(result)
             # A classification failure is intentionally consumed by the
             # archive-only path so every source can be relocated, but it is
             # already represented in ``analysis.errors``.  Keep it out of the
@@ -850,11 +912,14 @@ class MergeWorker(threading.Thread):
                 self.results.append(result)
                 self.indexed_results.append((job.sequence_index, result))
                 self.completed += 1
+            retry_analysis = job.error is not None and not _value(job.group, "excluded_reason")
+            # A published group with missing CSV rows is recoverable from its
+            # durable output record, even when all originals were moved.
             self._update_job(
                 job.group,
-                stage="EXPORT",
-                status="DONE",
-                progress=1.0,
+                stage="FOCUS_ANALYSIS" if retry_analysis else "EXPORT",
+                status="DONE" if manifest_saved and not retry_analysis else "FAILED",
+                progress=0.0 if retry_analysis else 1.0,
                 error=job.error,
             )
             self._emit(job, message=f"合成完成：{self._status(result)}")
@@ -876,7 +941,7 @@ class MergeWorker(threading.Thread):
                 # Missing Hugin is a distinct, actionable failure.  It must
                 # never be presented as a successful ``DONE`` fusion.
                 failure_state = "FAILED_HUGIN"
-            elif "archive" in str(exc).casefold():
+            elif isinstance(exc, ArchiveError) or "archive" in str(exc).casefold():
                 failure_state = "FAILED_ARCHIVE"
             else:
                 failure_state = "FAILED_FUSION"

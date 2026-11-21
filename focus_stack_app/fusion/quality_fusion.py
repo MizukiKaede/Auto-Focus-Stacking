@@ -29,10 +29,7 @@ def stabilize_neutral_labels(labels: np.ndarray, reference: np.ndarray) -> np.nd
         return labels
 
     gray = cv2.cvtColor(reference, cv2.COLOR_RGB2GRAY)
-    red, green, blue = cv2.split(reference)
-    chroma = cv2.subtract(cv2.max(red, cv2.max(green, blue)),
-                          cv2.min(red, cv2.min(green, blue)))
-    del red, green, blue
+    chroma = chroma_map(reference)
     neutral = (gray < 235) & (chroma < 65)
     spatial_median = cv2.medianBlur(labels.astype(np.uint8), 15)
     stable = labels.copy()
@@ -75,7 +72,7 @@ class FlatTextureStatistics:
         self.maximum_pixels = int(maximum_pixels)
         self.edge_radius = int(edge_radius)
         self.size = None
-        self.max_response = self.max_variance = self.max_gradient = self.max_chroma = None
+        self.max_chroma = None
         self.focus_evidence = self.texture_evidence = self.edge_evidence = None
         self.reference_gray = self.neutral = None
         self.focus_floor = np.zeros(16, np.float32)
@@ -83,6 +80,23 @@ class FlatTextureStatistics:
         self.gradient_floor = np.zeros(16, np.float32)
         self.samples = np.zeros(16, np.int64)
         self.noise_fallback_counts = np.zeros(16, np.int64)
+
+    def _shape_placeholder(self):
+        if self.size is None:
+            return None
+        return np.broadcast_to(np.float32(0.0), (self.size[1], self.size[0]))
+
+    @property
+    def max_response(self):
+        return self._shape_placeholder()
+
+    @property
+    def max_variance(self):
+        return self._shape_placeholder()
+
+    @property
+    def max_gradient(self):
+        return self._shape_placeholder()
 
     @staticmethod
     def _noise_upper(values):
@@ -97,36 +111,35 @@ class FlatTextureStatistics:
             self.scale = scale
             self.size = (max(1, int(w * scale)), max(1, int(h * scale)))
         small = cv2.resize(gray, self.size, interpolation=cv2.INTER_AREA)
-        luma = small.astype(np.float32) / 255.0
+        luma = np.empty(small.shape, np.float32)
+        np.divide(small, np.float32(255.0), out=luma)
         mean = cv2.GaussianBlur(luma, (0, 0), 2.0)
-        contrast_mean = cv2.GaussianBlur(mean, (0, 0), 2.0)
+        detail = cv2.GaussianBlur(mean, (0, 0), 2.0)
         # Remove the local illumination slope from the texture measurement.
         # A gradual shadow/white-paper gradient is not a physical detail edge.
-        detail = mean - contrast_mean
-        variance = cv2.GaussianBlur(detail * detail, (0, 0), 2.0)
+        np.subtract(mean, detail, out=detail)
+        np.multiply(detail, detail, out=detail)
+        variance = cv2.GaussianBlur(detail, (0, 0), 2.0)
+        del detail
         np.maximum(variance, 0, out=variance)
         # A coherent, smoothed gradient protects a physical edge. A single
         # noisy pixel must not grow into a 33-pixel exclusion region.
         gradient = cv2.magnitude(cv2.Sobel(mean, cv2.CV_32F, 1, 0), cv2.Sobel(mean, cv2.CV_32F, 0, 1))
-        response = cv2.resize(score, self.size, interpolation=cv2.INTER_AREA)
-        small_rgb = (cv2.resize(rgb, self.size, interpolation=cv2.INTER_AREA)
-                     if features is None else features.rgb(self.size))
-        chroma = chroma_map(small_rgb) if features is None else features.chroma(self.size)
-        if self.max_response is None:
-            self.max_response, self.max_variance, self.max_gradient = response, variance, gradient
-            self.max_chroma = chroma
+        del mean
+        response = (cv2.resize(score, self.size, interpolation=cv2.INTER_AREA)
+                    if features is None else features.score(self.size, score))
+        chroma = (chroma_map(cv2.resize(rgb, self.size, interpolation=cv2.INTER_AREA))
+                  if features is None else features.chroma(self.size))
+        if self.max_chroma is None:
+            self.max_chroma = chroma.copy()
         else:
-            np.maximum(self.max_response, response, out=self.max_response)
-            np.maximum(self.max_variance, variance, out=self.max_variance)
-            np.maximum(self.max_gradient, gradient, out=self.max_gradient)
             np.maximum(self.max_chroma, chroma, out=self.max_chroma)
         if index == self.reference_index:
             self.reference_gray = small.copy()
         # The compatibility rule historically uses selected frame zero,
         # independently of the geometric/exposure reference.
         if index == 0:
-            r, g, b = cv2.split(rgb)
-            full_chroma = cv2.max(r, cv2.max(g, b)) - cv2.min(r, cv2.min(g, b))
+            full_chroma = chroma_map(rgb)
             self.neutral = (gray < 235) & (full_chroma < 65)
         # Sample compact maps, with a separate noise distribution per luma bin.
         frame_focus, frame_variance, frame_gradient = flat_noise(
@@ -241,14 +254,38 @@ def _nearest_edge_support(strength, edge, radius):
     return nearest_support(strength, edge, radius)
 
 
+def _nearest_edge_support_pair(first, second, edge, radius):
+    """Extend two edge strength fields sharing one distanceTransform."""
+    from .fast_cpp import nearest_support_pair
+    return nearest_support_pair(first, second, edge, radius)
+
+
 class SurfaceBoundaryOwnership:
     """Keep a coloured silhouette and its defocus fringe on a sharp source."""
 
     def __init__(self, *, maximum_pixels=3_000_000, support_radius=64):
         self.maximum_pixels = int(maximum_pixels)
         self.support_radius = int(support_radius)
-        self.best = self.confidence = self.owner = self.band = self.texture = self.interior = None
+        self.best = self.confidence = self.owner = self.texture = self.interior = None
         self.owner_focus = self.neutral_focus = None
+        self._edge_union = self._band_cache = None
+        self._cached_texture_protection = None
+        self._cached_interior = None
+        self._cached_owner = None
+
+    @property
+    def band(self):
+        if self._band_cache is None and self._edge_union is not None:
+            band_radius = max(1, int(np.ceil(self.support_radius * self.scale)))
+            self._band_cache = cv2.dilate(
+                self._edge_union,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * band_radius + 1,) * 2),
+            )
+        return self._band_cache
+
+    @band.setter
+    def band(self, value):
+        self._band_cache = value
 
     def observe(self, index, rgb, score=None, *, features=None):
         from .focus_masks import _filled_chromatic_silhouette
@@ -256,6 +293,11 @@ class SurfaceBoundaryOwnership:
         if score is None:
             from .focus_masks import focus_response
             score = focus_response(rgb, cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY), support_radius=7)
+
+        self._band_cache = None
+        self._cached_texture_protection = None
+        self._cached_interior = None
+        self._cached_owner = None
 
         height, width = rgb.shape[:2]
         scale = min(0.5, (self.maximum_pixels / (height * width)) ** 0.5)
@@ -277,25 +319,83 @@ class SurfaceBoundaryOwnership:
         # the material, rather than protecting that colour fringe as texture.
         clearance = int(np.ceil(3 * low_sigma))
         core = cv2.erode(np.uint8(chroma >= 65), np.ones((2 * clearance + 1,) * 2, np.uint8))
-        fine_rgb = small.astype(np.float32)
-        low = cv2.GaussianBlur(fine_rgb, (0, 0), low_sigma)
-        np.subtract(fine_rgb, low, out=fine_rgb)
-        np.square(fine_rgb, out=fine_rgb)
-        fine = np.mean(fine_rgb, axis=2)
-        del fine_rgb, low
-        density = cv2.GaussianBlur(core.astype(np.float32), (0, 0), 3.0)
-        texture = cv2.GaussianBlur(fine * core, (0, 0), 3.0)
-        texture = (texture / np.maximum(density, 1e-6) > 144) & (density > 0.4)
-        signal = cv2.GaussianBlur(chroma.astype(np.float32) / 255.0, (0, 0), 1.0)
-        gx = cv2.Sobel(signal, cv2.CV_32F, 1, 0)
-        gy = cv2.Sobel(signal, cv2.CV_32F, 0, 1)
-        colour_strength = gx * gx + gy * gy
-        radius = max(1, int(np.ceil(self.support_radius * scale)))
-        confidence = _nearest_edge_support(colour_strength, edge, radius)
-        # A darker or more saturated defocused rim may have a larger colour
-        # step than a sharp one. Rank evidence at the physical edge using the
-        # existing high-frequency focus score, before extending it to fringes.
-        focus = cv2.resize(score, size, interpolation=cv2.INTER_AREA)
+        sh, sw = chroma.shape
+        small_area = sh * sw
+        if np.any(core):
+            r_tex = (int(round(3.0 * 8.0 + 1.0)) | 1) // 2
+            r_low = (int(round(low_sigma * 8.0 + 1.0)) | 1) // 2
+            cy_r = np.flatnonzero(np.any(core, axis=1))
+            cx_c = np.flatnonzero(np.any(core, axis=0))
+            oy0, oy1 = max(0, int(cy_r[0]) - r_tex), min(sh, int(cy_r[-1]) + r_tex + 1)
+            ox0, ox1 = max(0, int(cx_c[0]) - r_tex), min(sw, int(cx_c[-1]) + r_tex + 1)
+            iy0, iy1 = max(0, oy0 - r_tex - r_low), min(sh, oy1 + r_tex + r_low)
+            ix0, ix1 = max(0, ox0 - r_tex - r_low), min(sw, ox1 + r_tex + r_low)
+            if (iy1 - iy0) * (ix1 - ix0) < small_area * 0.85:
+                fine_rgb = small[iy0:iy1, ix0:ix1].astype(np.float32)
+                low = cv2.GaussianBlur(fine_rgb, (0, 0), low_sigma)
+                np.subtract(fine_rgb, low, out=fine_rgb)
+                np.square(fine_rgb, out=fine_rgb)
+                fine = np.mean(fine_rgb, axis=2)
+                del fine_rgb, low
+                s_core = core[iy0:iy1, ix0:ix1]
+                density = cv2.GaussianBlur(s_core.astype(np.float32), (0, 0), 3.0)
+                s_tex = cv2.GaussianBlur(fine * s_core, (0, 0), 3.0)
+                s_tex = (s_tex / np.maximum(density, 1e-6) > 144) & (density > 0.4)
+                texture = np.zeros((sh, sw), bool)
+                texture[oy0:oy1, ox0:ox1] = s_tex[oy0 - iy0 : oy1 - iy0, ox0 - ix0 : ox1 - ix0]
+            else:
+                fine_rgb = small.astype(np.float32)
+                low = cv2.GaussianBlur(fine_rgb, (0, 0), low_sigma)
+                np.subtract(fine_rgb, low, out=fine_rgb)
+                np.square(fine_rgb, out=fine_rgb)
+                fine = np.mean(fine_rgb, axis=2)
+                del fine_rgb, low
+                density = cv2.GaussianBlur(core.astype(np.float32), (0, 0), 3.0)
+                texture = cv2.GaussianBlur(fine * core, (0, 0), 3.0)
+                texture = (texture / np.maximum(density, 1e-6) > 144) & (density > 0.4)
+        else:
+            texture = np.zeros((sh, sw), bool)
+        focus = (cv2.resize(score, size, interpolation=cv2.INTER_AREA)
+                 if features is None else features.score(size, score))
+        if np.any(edge):
+            radius = max(1, int(np.ceil(self.support_radius * scale)))
+            ey_r = np.flatnonzero(np.any(edge, axis=1))
+            ex_c = np.flatnonzero(np.any(edge, axis=0))
+            pad_out = radius + 2
+            oy0, oy1 = max(0, int(ey_r[0]) - pad_out), min(sh, int(ey_r[-1]) + pad_out + 1)
+            ox0, ox1 = max(0, int(ex_c[0]) - pad_out), min(sw, int(ex_c[-1]) + pad_out + 1)
+            iy0, iy1 = max(0, oy0 - 16), min(sh, oy1 + 16)
+            ix0, ix1 = max(0, ox0 - 16), min(sw, ox1 + 16)
+            if (iy1 - iy0) * (ix1 - ix0) < small_area * 0.85:
+                s_signal = cv2.GaussianBlur(
+                    chroma[iy0:iy1, ix0:ix1].astype(np.float32) / 255.0, (0, 0), 1.0
+                )
+                gx = cv2.Sobel(s_signal, cv2.CV_32F, 1, 0)
+                gy = cv2.Sobel(s_signal, cv2.CV_32F, 0, 1)
+                s_cs = gx * gx + gy * gy
+                s_focus = focus[iy0:iy1, ix0:ix1]
+                s_edge = edge[iy0:iy1, ix0:ix1]
+                sc_sub, ss_sub = _nearest_edge_support_pair(
+                    s_cs, s_cs * np.sqrt(np.maximum(s_focus, 0)), s_edge, radius
+                )
+                confidence = np.zeros((sh, sw), np.float32)
+                strength = np.zeros((sh, sw), np.float32)
+                confidence[oy0:oy1, ox0:ox1] = sc_sub[oy0 - iy0 : oy1 - iy0, ox0 - ix0 : ox1 - ix0]
+                strength[oy0:oy1, ox0:ox1] = ss_sub[oy0 - iy0 : oy1 - iy0, ox0 - ix0 : ox1 - ix0]
+            else:
+                signal = cv2.GaussianBlur(chroma.astype(np.float32) / 255.0, (0, 0), 1.0)
+                gx = cv2.Sobel(signal, cv2.CV_32F, 1, 0)
+                gy = cv2.Sobel(signal, cv2.CV_32F, 0, 1)
+                colour_strength = gx * gx + gy * gy
+                # A darker or more saturated defocused rim may have a larger colour
+                # step than a sharp one. Rank evidence at the physical edge using the
+                # existing high-frequency focus score, before extending it to fringes.
+                confidence, strength = _nearest_edge_support_pair(
+                    colour_strength, colour_strength * np.sqrt(np.maximum(focus, 0)), edge, radius
+                )
+        else:
+            confidence = np.zeros((sh, sw), np.float32)
+            strength = np.zeros((sh, sw), np.float32)
         # A nearby painted rim may focus at a different depth from neutral
         # metal or engraving. Its propagated owner must not replace sharper
         # detail at the target itself. Keep this short core local to this
@@ -306,16 +406,11 @@ class SurfaceBoundaryOwnership:
         neutral = cv2.erode(np.uint8((chroma < 45) & (luma > 30) & (luma < 235)),
                             np.ones((2 * clearance + 1,) * 2, np.uint8)) != 0
         neutral_focus = np.where(neutral, focus, 0)
-        strength = _nearest_edge_support(
-            colour_strength * np.sqrt(np.maximum(focus, 0)), edge, radius)
-        band_radius = radius
-        band = cv2.dilate(edge, cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (2 * band_radius + 1,) * 2))
         if self.best is None:
             self.best = strength
             self.confidence = confidence
             self.owner = np.full(strength.shape, index, np.uint16)
-            self.band = band
+            self._edge_union = edge
             self.texture = texture
             self.interior = silhouette
             self.scale = scale
@@ -328,9 +423,26 @@ class SurfaceBoundaryOwnership:
             self.owner[better] = index
             self.owner_focus[better] = focus[better]
             np.maximum(self.neutral_focus, neutral_focus, out=self.neutral_focus)
-            self.band |= band
+            self._edge_union |= edge
             self.texture |= texture
             self.interior |= silhouette
+
+    def _dilated_interior(self):
+        if self._cached_interior is None:
+            clearance = max(1, int(np.ceil(8 * self.scale)))
+            self._cached_interior = cv2.dilate(
+                self.interior, np.ones((2 * clearance + 1,) * 2, np.uint8)
+            ) != 0
+        return self._cached_interior
+
+    def _upsampled_owner(self, shape):
+        shape = (shape[0], shape[1])
+        if self._cached_owner is None or self._cached_owner[0] != shape:
+            owner = cv2.resize(
+                self.owner, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST
+            )
+            self._cached_owner = (shape, owner)
+        return self._cached_owner[1]
 
     def apply(self, labels):
         from ..utils.performance import diagnostic
@@ -339,15 +451,14 @@ class SurfaceBoundaryOwnership:
             return labels
         texture = self.texture_protection(labels.shape)
         size = (labels.shape[1], labels.shape[0])
-        clearance = max(1, int(np.ceil(8 * self.scale)))
-        interior = cv2.dilate(self.interior, np.ones((2 * clearance + 1,) * 2, np.uint8)) != 0
+        interior = self._dilated_interior()
         neutral_detail = ((self.neutral_focus > 0)
                           & (self.owner_focus < 0.7 * self.neutral_focus))
         active = cv2.resize(np.uint8((self.band != 0) & (self.confidence > 0.002)
                                     & (self.best > 0) & interior & ~neutral_detail), size,
                             interpolation=cv2.INTER_NEAREST) != 0
         active &= ~texture
-        owner = cv2.resize(self.owner, size, interpolation=cv2.INTER_NEAREST)
+        owner = self._upsampled_owner(labels.shape)
         result = labels.copy()
         changed = active & (result != owner)
         result[active] = owner[active]
@@ -359,10 +470,18 @@ class SurfaceBoundaryOwnership:
         return result
 
     def texture_protection(self, shape):
-        radius = max(1, int(np.ceil(self.support_radius * self.scale)))
-        texture = cv2.dilate(np.uint8(self.texture), cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (2 * radius + 1,) * 2)) != 0
-        return cv2.resize(np.uint8(texture), (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST) != 0
+        shape = (shape[0], shape[1])
+        if self._cached_texture_protection is not None and self._cached_texture_protection[0] == shape:
+            return self._cached_texture_protection[1]
+        if not np.any(self.texture):
+            result = np.zeros(shape, bool)
+        else:
+            radius = max(1, int(np.ceil(self.support_radius * self.scale)))
+            texture = cv2.dilate(np.uint8(self.texture), cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (2 * radius + 1,) * 2)) != 0
+            result = cv2.resize(np.uint8(texture), (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST) != 0
+        self._cached_texture_protection = (shape, result)
+        return result
 
 
 class PrintedEdgeOwnership:
@@ -428,12 +547,17 @@ class PrintedEdgeOwnership:
         printing = retained[parts]
         edge = cv2.morphologyEx(printing, cv2.MORPH_GRADIENT,
                                 np.ones((3, 3), np.uint8))
-        signal = cv2.GaussianBlur(luma.astype(np.float32) / 255.0, (0, 0), 0.6)
-        gx = cv2.Sobel(signal, cv2.CV_32F, 1, 0)
-        gy = cv2.Sobel(signal, cv2.CV_32F, 0, 1)
-        strength = gx * gx + gy * gy
-        strength *= np.sqrt(np.maximum(cv2.resize(score, size, interpolation=cv2.INTER_AREA), 0))
-        strength *= edge
+        if np.any(edge):
+            signal = cv2.GaussianBlur(luma.astype(np.float32) / 255.0, (0, 0), 0.6)
+            gx = cv2.Sobel(signal, cv2.CV_32F, 1, 0)
+            gy = cv2.Sobel(signal, cv2.CV_32F, 0, 1)
+            strength = gx * gx + gy * gy
+            small_score = (cv2.resize(score, size, interpolation=cv2.INTER_AREA)
+                           if features is None else features.score(size, score))
+            strength *= np.sqrt(np.maximum(small_score, 0))
+            strength *= edge
+        else:
+            strength = np.zeros(luma.shape, np.float32)
         if self.best is None:
             self.best = strength
             self.owner = np.full(strength.shape, index, np.uint16)

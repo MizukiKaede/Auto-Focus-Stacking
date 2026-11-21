@@ -80,15 +80,55 @@ def _read_jpeg_app1(path: str | Path) -> bytes | None:
                 length = int.from_bytes(raw_length, "big")
                 if length < 2:
                     return None
+                if marker == 0xDA:
+                    return None
+                if marker != 0xE1:
+                    stream.seek(length - 2, 1)
+                    continue
                 payload = stream.read(length - 2)
                 if len(payload) != length - 2:
                     return None
-                if marker == 0xE1 and payload.startswith(b"Exif\x00\x00"):
+                if payload.startswith(b"Exif\x00\x00"):
                     return payload[6:]
-                if marker == 0xDA:  # compressed scan: no more APP metadata
-                    return None
     except (OSError, ValueError):
         return None
+
+
+def append_capture_ifd(path: Path, tags: dict) -> None:
+    """Attach the EXIF subdirectory to our freshly encoded single-page TIFF.
+
+    Pillow's libtiff compression writer cannot encode a nested EXIF directory.
+    Copy the small primary directory verbatim so strip and ICC offsets remain
+    absolute, then point the header to its augmented copy before validation.
+    """
+    from PIL.TiffImagePlugin import ImageFileDirectory_v2
+
+    with path.open("r+b") as stream:
+        header = stream.read(8)
+        endian = "<" if header[:2] == b"II" else ">"
+        magic, primary = struct.unpack(endian + "HI", header[2:])
+        if magic != 42:
+            raise ValueError("Expected a classic TIFF from the output encoder")
+        stream.seek(primary)
+        count, = struct.unpack(endian + "H", stream.read(2))
+        entries = [stream.read(12) for _ in range(count)]
+        following = stream.read(4)
+        stream.seek(0, 2)
+        if stream.tell() % 2:
+            stream.write(bytes(1))
+        capture_offset = stream.tell()
+        capture = ImageFileDirectory_v2(header, group=34665)
+        for tag, value in tags.items():
+            capture[tag] = value
+        stream.write(capture.tobytes(capture_offset))
+        new_primary = stream.tell()
+        entries.append(struct.pack(endian + "HHII", 34665, 4, 1, capture_offset))
+        entries.sort(key=lambda entry: struct.unpack_from(endian + "H", entry)[0])
+        stream.write(struct.pack(endian + "H", len(entries)))
+        stream.writelines(entries)
+        stream.write(following)
+        stream.seek(4)
+        stream.write(struct.pack(endian + "I", new_primary))
 
 
 def _read_scalar(data: bytes, offset: int, type_id: int, count: int, endian: str) -> Any:
@@ -107,10 +147,10 @@ def _read_scalar(data: bytes, offset: int, type_id: int, count: int, endian: str
         if type_id == 2:  # ASCII
             return chunk.rstrip(b"\x00").decode("utf-8", errors="replace")
         if type_id == 3:  # SHORT
-            values = struct.unpack(fmt + "H", chunk) if count == 1 else struct.unpack(fmt + "H" * count, chunk)
+            values = struct.unpack(fmt + "H", chunk)
             return values[0] if count == 1 else list(values)
         if type_id == 4:  # LONG
-            values = struct.unpack(fmt + "I", chunk) if count == 1 else struct.unpack(fmt + "I" * count, chunk)
+            values = struct.unpack(fmt + "I", chunk)
             return values[0] if count == 1 else list(values)
         if type_id == 5:  # RATIONAL, retain a useful float representation
             values: list[float] = []
@@ -121,7 +161,7 @@ def _read_scalar(data: bytes, offset: int, type_id: int, count: int, endian: str
         if type_id == 7:  # UNDEFINED
             return chunk
         if type_id == 9:  # SLONG
-            values = struct.unpack(fmt + "i", chunk) if count == 1 else struct.unpack(fmt + "i" * count, chunk)
+            values = struct.unpack(fmt + "i", chunk)
             return values[0] if count == 1 else list(values)
         if type_id == 10:  # SRATIONAL
             values = []

@@ -601,61 +601,6 @@ def test_render_accumulator_cleanup_on_exception_repeated_close_and_construct_fa
     assert destroyed == [12345, 23456, 34567], f"seam query construction failure release mismatch: {destroyed}"
 
 
-def test_cancelled_fast_render_releases_native_accumulator_once(monkeypatch):
-    assert fast_cpp._library.available, fast_cpp.runtime_info()
-    from focus_stack_app.fusion import fast_fusion
-
-    destroyed = []
-    monkeypatch.setattr(fast_cpp, "_create", lambda *args: 45678)
-    monkeypatch.setattr(fast_cpp, "_seams", lambda handle: 0)
-    monkeypatch.setattr(fast_cpp, "_destroy", lambda handle: destroyed.append(handle))
-    event = __import__("threading").Event()
-    event.set()
-    with pytest.raises(RuntimeError, match="cancelled"):
-        fast_fusion.render_fast_stream(
-            [Path("unused.jpg")], [0], [np.eye(3, dtype=np.float32)], [(2, 2)],
-            (2, 2), 0, (2, 2), np.zeros((2, 2), np.uint16),
-            encoded_sources={}, cancel_event=event,
-        )
-    assert destroyed == [45678], f"cancelled render handle release count={len(destroyed)}"
-
-
-@pytest.mark.parametrize("failure_point", ["decode", "tone"])
-def test_fast_stream_propagates_render_exceptions_and_releases_once(monkeypatch, failure_point):
-    assert fast_cpp._library.available, fast_cpp.runtime_info()
-    from focus_stack_app.fusion import fast_fusion
-
-    handle = 58001 if failure_point == "decode" else 58002
-    destroyed = []
-    monkeypatch.setattr(fast_cpp, "_create", lambda *args: handle)
-    monkeypatch.setattr(fast_cpp, "_seams", lambda _handle: 0)
-    monkeypatch.setattr(fast_cpp, "_destroy", lambda value: destroyed.append(value))
-    monkeypatch.setattr(fast_cpp, "_owner", lambda _handle, _index, _mask_ptr: 12)
-    expected = RuntimeError(f"deliberate {failure_point} failure")
-    if failure_point == "decode":
-        monkeypatch.setattr(fast_fusion, "_read_rgb_image", lambda _encoded: (_ for _ in ()).throw(expected))
-        tone = None
-    else:
-        monkeypatch.setattr(fast_fusion, "_read_rgb_image", lambda _encoded: np.full((3, 4, 3), 90, np.uint8))
-
-        class FailingToneModel:
-            def correct(self, _aligned, _index):
-                raise expected
-
-        tone = FailingToneModel()
-
-    kwargs = dict(
-        paths=[Path("fixture.jpg")], indices=[0], transforms=[np.eye(3, dtype=np.float32)],
-        analysis_shapes=[(3, 4)], reference_analysis_shape=(3, 4), reference_index=0,
-        full_shape=(3, 4), proxy_labels=np.zeros((3, 4), np.uint16),
-        encoded_sources={0: b"encoded fixture"}, tone_model=tone,
-    )
-    with pytest.raises(RuntimeError) as caught:
-        fast_fusion.render_fast_stream(**kwargs)
-    assert caught.value is expected, f"original {failure_point} exception was not propagated"
-    assert destroyed == [handle], f"{failure_point} exception released handle {len(destroyed)} times: {destroyed}"
-
-
 def _publish_fixture(tmp_path):
     import build_cpp
 
@@ -728,11 +673,11 @@ def test_app_config_native_thread_default_legacy_and_round_trip(tmp_path):
     assert loaded.to_mapping() == configured.to_mapping()
 
 
-def test_stack_merge_service_passes_native_threads_to_quality_and_fast_backends(tmp_path):
+def test_stack_merge_service_passes_native_threads_to_quality_and_ai_backends(tmp_path):
     from focus_stack_app.config import RuntimeConfig
     from focus_stack_app.pipeline.merge_worker import StackMergeService
 
-    for backend_name in ("quality", "fast"):
+    for backend_name in ("quality", "ai"):
         service = StackMergeService(
             tmp_path / backend_name,
             archive_enabled=False,
