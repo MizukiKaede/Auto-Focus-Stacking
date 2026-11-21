@@ -114,7 +114,7 @@ density_weight = clip(Gaussian(common) / 0.2, 0, 1)
 
 - 当前实现：`focus_stack_app/fusion/surface_tone.py`、`quality_fusion.py`、`backends.py`；默认设置在 `focus_stack_app/config.py`。
 - 定向检查：`tests/test_surface_tone.py`、`tests/test_printed_edge_ownership.py`；V18新增检查仅在隔离目录中。
-- 实现说明：`docs/材质颜色一致性修复.md`。
+- 当时的实现见[材质颜色一致性修复记录](https://github.com/MizukiKaede/Auto-Focus-Stacking/blob/bab997bcc05922abd86d0ac06efc9dd5b3ec843c/docs/%E6%9D%90%E8%B4%A8%E9%A2%9C%E8%89%B2%E4%B8%80%E8%87%B4%E6%80%A7%E4%BF%AE%E5%A4%8D.md)。
 - 首批正式结果与历史撤回：`diagnostics/colour_surface_repair_20260930/修复结果.md`，旧报告 `diagnostics/white_background_20260930/有效测试结果.md`。
 - 本轮基线及阶段证据：`diagnostics/colour_surface_repair_20261001_03003/baseline_v16/03003/`。
 - 本轮实际分析、runner、结果：同目录 `provenance/`、`run_targeted.py`、`run_next.py`、`run_next_tests.py`、`修复结果.md`。

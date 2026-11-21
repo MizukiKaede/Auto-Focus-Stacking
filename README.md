@@ -262,8 +262,6 @@ pip install -e ".[cuda]"
 python build_cpp.py --compiler auto --openmp on
 ```
 
-详见 [原生内核构建与降级说明](docs/native_kernels.md) 与 [Hugin 原生算子说明](docs/hugin_native.md)。
-
 ### Windows 便携版打包
 
 仓库提供基于 PyInstaller 的独立便携版打包脚本 [portable-packaging/build_portable.py](portable-packaging/build_portable.py)，会自动收拢 `focus_stack_app` 子模块、SVG 图标、原生 C++ DLL、StackMFF-V3 ONNX 权重、内置 Hugin/Enfuse 运行时与第三方许可声明。
@@ -301,7 +299,6 @@ python build_cpp.py --compiler auto --openmp on
 │   ├── ui/                         PySide6 浅色/暗房工作台、进度驾驶舱、图组检查器与 1:1 灯箱
 │   └── utils/                      图像 I/O、EXIF、自然排序、内存预算与性能诊断工具
 ├── portable-packaging/             PyInstaller Windows 便携包构建脚本
-├── docs/                           系统架构、技术文档、原生内核与阶段验收文档
 └── tests/                          51 个自动化测试模块（核心算法、融合后端、并发恢复与 UI）
 ```
 
@@ -318,14 +315,6 @@ pytest -q tests/test_fusion_backends.py tests/test_quality_fusion.py tests/test_
 pytest -q tests/test_pipeline_app.py tests/test_pipeline_recovery.py tests/test_parallel_batch_safety.py
 pytest -q tests/test_studio_ui_features.py tests/test_memory_presets_and_ui.py
 ```
-
-### 延伸文档
-
-- [系统技术架构](docs/技术架构.md)
-- [完整技术文档](docs/技术文档.md)
-- [Windows x64 原生算子说明](docs/native_kernels.md)
-- [Hugin 原生算子与并发说明](docs/hugin_native.md)
-- [UI 重构与交互说明](docs/重构ui.md)
 
 ---
 

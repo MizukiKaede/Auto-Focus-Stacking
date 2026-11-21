@@ -43,7 +43,7 @@ Unlike single-stack interactive GUI tools or CLI scripts, Auto-stack combines no
 ## Evidence on Hand
 
 - `README.md`, `focus_stack_app/pipeline/application_controller.py`, `focus_stack_app/pipeline/merge_worker.py`, `focus_stack_app/pipeline/events.py`, `focus_stack_app/ui/*`.
-- Legacy UI screenshots in `docs/images/redesigned_ready.png` and `docs/images/redesigned_with_results.png` documenting previous visual issues (neon dark cards, overlapping inspector text, cramped preview, truncated table columns).
+- Earlier UI screenshots document neon dark cards, overlapping inspector text, a cramped preview, and truncated table columns. [Historical screenshots](https://github.com/MizukiKaede/Auto-Focus-Stacking/tree/bab997bcc05922abd86d0ac06efc9dd5b3ec843c/docs/images)
 
 ## Product Principles
 
